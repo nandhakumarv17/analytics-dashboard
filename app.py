@@ -1,24 +1,12 @@
 import os
 import io
 import json
-import random
-from functools import wraps
 from datetime import datetime, timedelta
-from flask import Flask, request, render_template_string, send_file, jsonify, session, redirect, url_for
+from flask import Flask, request, render_template_string, send_file, jsonify, redirect, url_for
 import pandas as pd
 import numpy as np
 
 app = Flask(__name__)
-app.secret_key = os.environ.get('SECRET_KEY', 'liquid_glass_super_secret_key_2026')
-
-# --- AUTHENTICATION MIDDLEWARE ---
-def login_required(f):
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        if not session.get('authenticated'):
-            return redirect(url_for('login'))
-        return f(*args, **kwargs)
-    return decorated_function
 
 UPLOAD_DIR = "/tmp/dashboard_uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -37,6 +25,13 @@ GLOBAL_HEAD = """
         --shadow-glass: 0 20px 40px rgba(0, 0, 0, 0.06), 0 1px 3px rgba(0, 0, 0, 0.04);
         --blue-apple: #0071e3;
         --blue-hover: #0077ed;
+        
+        /* Apple IDE Syntax Colors for Headers */
+        --code-pink: #ff375f;
+        --code-purple: #bf5af2;
+        --code-blue: #5ac8fa;
+        --code-orange: #ff9f0a;
+        --code-green: #32d74b;
     }
     
     body { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: var(--bg-main); margin: 0; padding: 0; color: var(--text-primary); -webkit-font-smoothing: antialiased; }
@@ -44,8 +39,6 @@ GLOBAL_HEAD = """
     .nav { background: rgba(255, 255, 255, 0.85); backdrop-filter: saturate(200%) blur(30px); border-bottom: 1px solid rgba(0, 0, 0, 0.08); padding: 0 24px; height: 60px; display: flex; justify-content: space-between; align-items: center; font-size: 16px; font-weight: 600; color: var(--text-primary); position: fixed; top: 0; width: 100%; box-sizing: border-box; z-index: 1000; }
     .view-toggle { background: rgba(0,0,0,0.04); padding: 8px 14px; border-radius: 980px; font-size: 12px; font-weight: 500; cursor: pointer; display: flex; align-items: center; transition: 0.2s; border: none; color: var(--text-primary); flex-shrink: 0; }
     .view-toggle:hover { background: rgba(0,0,0,0.08); }
-    .logout-btn { color: var(--text-secondary); text-decoration: none; font-size: 13px; font-weight: 500; margin-left: 16px; transition: 0.2s; }
-    .logout-btn:hover { color: #ff3b30; }
     
     .upload-container { max-width: 520px; margin: 130px auto 40px auto; padding: 0 16px; box-sizing: border-box; }
     .title { font-size: 36px; font-weight: 700; letter-spacing: -0.015em; text-align: center; margin: 0 0 8px 0; }
@@ -89,36 +82,65 @@ GLOBAL_HEAD = """
     @keyframes fadeIn { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: translateY(0); } }
 
     .table-container { background: var(--glass-bg); backdrop-filter: blur(25px); border-radius: 20px; box-shadow: var(--shadow-glass); border: 1px solid var(--glass-border); overflow: hidden; width: 100%; box-sizing: border-box; display: flex; flex-direction: column; }
+    
+    /* Strict scroll container to prevent header overlapping navbar */
     .table-scroll { max-height: calc(100vh - 200px); overflow-y: auto; overflow-x: auto; -webkit-overflow-scrolling: touch; position: relative; }
+    
     .excel-table { width: 100%; table-layout: fixed; border-collapse: separate; border-spacing: 0; font-size: 13px; background: transparent; word-wrap: break-word; min-width: 550px; }
     .excel-table th, .excel-table td { padding: 14px 16px; text-align: left; border-bottom: 1px solid rgba(0,0,0,0.06); overflow: hidden; text-overflow: ellipsis; position: relative; }
     
-    .excel-table th { background-color: rgba(0, 113, 227, 0.08); color: var(--blue-apple); font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; position: sticky; top: 0; z-index: 100; border-bottom: 2px solid rgba(0, 113, 227, 0.2); user-select: none; }
-    .resizer { position: absolute; right: 0; top: 0; bottom: 0; width: 6px; cursor: col-resize; z-index: 101; }
-    .resizer:hover { background-color: rgba(0, 113, 227, 0.4); }
+    /* Developer IDE Glass Headers */
+    .excel-table th { 
+        background-color: rgba(30, 30, 34, 0.85); 
+        backdrop-filter: blur(20px) saturate(180%); 
+        font-family: 'SF Mono', ui-monospace, Menlo, Monaco, monospace;
+        font-size: 11px; 
+        font-weight: 600; 
+        text-transform: uppercase; 
+        letter-spacing: 0.05em; 
+        position: sticky; 
+        top: 0; 
+        z-index: 100; 
+        border-bottom: 1px solid rgba(255,255,255,0.1); 
+        user-select: none;
+        box-shadow: 0 4px 10px rgba(0,0,0,0.1);
+    }
+    
+    /* Syntax Highlight Colors for Headers */
+    .excel-table th:nth-child(5n+1) { color: var(--code-blue); }
+    .excel-table th:nth-child(5n+2) { color: var(--code-pink); }
+    .excel-table th:nth-child(5n+3) { color: var(--code-orange); }
+    .excel-table th:nth-child(5n+4) { color: var(--code-green); }
+    .excel-table th:nth-child(5n+5) { color: var(--code-purple); }
 
     .excel-table td { white-space: nowrap; }
-    .excel-table tr:hover td { background-color: rgba(0, 113, 227, 0.03); }
-    .excel-table th.total-col-header, .excel-table td.total-col-cell { background-color: rgba(0, 113, 227, 0.04); font-weight: 600; border-left: 1px solid rgba(0, 113, 227, 0.1); }
+    .excel-table tr:hover td { background-color: rgba(0, 113, 227, 0.04); }
+    
+    .excel-table th.total-col-header { color: #ffffff !important; background-color: rgba(20, 20, 24, 0.95); border-left: 1px solid rgba(255,255,255,0.1); }
+    .excel-table td.total-col-cell { background-color: rgba(0, 113, 227, 0.03); font-weight: 600; border-left: 1px solid rgba(0, 113, 227, 0.1); }
     .excel-table tbody tr:last-child td { font-weight: 700; background-color: rgba(0, 113, 227, 0.12); color: var(--blue-apple); border-top: 2px solid var(--blue-apple); border-bottom: none; box-shadow: inset 0 1px 0 rgba(255,255,255,0.6); }
     
     .number-cell { font-variant-numeric: tabular-nums; }
     .pct-positive { color: #34c759; font-weight: 600; }
     .pct-negative { color: #ff3b30; font-weight: 600; }
     .pct-neutral { color: var(--text-secondary); }
-    
-    .drag-handle { cursor: grab; color: #aeaeb2; margin-right: 8px; font-weight: bold; user-select: none; font-size: 14px; }
-    .drag-handle:active { cursor: grabbing; }
 
-    body.desktop-mode { overflow: auto; }
-    body.desktop-mode .app-layout { display: flex; flex-direction: row; min-height: 100vh; padding-top: 60px; box-sizing: border-box; }
-    body.desktop-mode .sidebar { width: 360px; background: var(--glass-sidebar); backdrop-filter: blur(40px) saturate(180%); border-right: 1px solid rgba(0,0,0,0.08); padding: 24px 20px; overflow-y: auto; flex-shrink: 0; box-sizing: border-box; height: calc(100vh - 60px); position: sticky; top: 60px; }
-    body.desktop-mode .main-content { flex: 1; padding: 24px 32px; overflow-x: auto; background: var(--bg-main); box-sizing: border-box; min-width: 0; }
+    /* Layout & Sidebar Resizer */
+    body.desktop-mode { overflow: hidden; }
+    body.desktop-mode .app-layout { display: flex; flex-direction: row; height: 100vh; padding-top: 60px; box-sizing: border-box; }
+    
+    body.desktop-mode .sidebar { width: 360px; background: var(--glass-sidebar); backdrop-filter: blur(40px) saturate(180%); padding: 24px 20px; overflow-y: auto; flex-shrink: 0; box-sizing: border-box; height: calc(100vh - 60px); }
+    
+    .sidebar-resizer { width: 5px; background: rgba(0,0,0,0.03); cursor: col-resize; z-index: 100; transition: background 0.2s; flex-shrink: 0; border-right: 1px solid rgba(0,0,0,0.06); }
+    .sidebar-resizer:hover, .sidebar-resizer.resizing { background: var(--blue-apple); }
+    
+    body.desktop-mode .main-content { flex: 1; padding: 24px 32px; overflow-y: auto; overflow-x: hidden; background: var(--bg-main); box-sizing: border-box; height: calc(100vh - 60px); }
     body.desktop-mode .header-actions { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; flex-wrap: wrap; gap: 10px; }
     
     body.mobile-mode { overflow: auto; }
     body.mobile-mode .app-layout { display: flex; flex-direction: column; padding-top: 60px; box-sizing: border-box; }
-    body.mobile-mode .sidebar { width: 100%; background: var(--glass-sidebar); border-right: none; border-bottom: 1px solid rgba(0,0,0,0.08); padding: 20px; box-sizing: border-box; }
+    body.mobile-mode .sidebar { width: 100% !important; background: var(--glass-sidebar); border-right: none; border-bottom: 1px solid rgba(0,0,0,0.08); padding: 20px; box-sizing: border-box; }
+    body.mobile-mode .sidebar-resizer { display: none; }
     body.mobile-mode .main-content { width: 100%; padding: 20px; box-sizing: border-box; background: var(--bg-main); }
     body.mobile-mode .header-actions { display: flex; flex-direction: column; align-items: stretch; gap: 12px; margin-bottom: 20px; }
     body.mobile-mode .header-actions .dropdown { width: 100%; }
@@ -128,7 +150,6 @@ GLOBAL_HEAD = """
     ::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.2); border-radius: 10px; }
 </style>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Sortable/1.15.0/Sortable.min.js"></script>
 <script>
     function toggleViewMode() {
         const body = document.body;
@@ -159,59 +180,6 @@ GLOBAL_HEAD = """
 </script>
 """
 
-LOGIN_HTML = """
-<!DOCTYPE html>
-<html>
-<head><title>Login - Analytics Pro</title><meta name="viewport" content="width=device-width, initial-scale=1.0">""" + GLOBAL_HEAD + """</head>
-<body>
-    <div class="nav">
-        <div>Analytics Pro</div>
-    </div>
-    <div class="upload-container">
-        <h1 class="title">Secure Access.</h1>
-        <p class="subtitle">Enter your email or phone to receive a One-Time Password.</p>
-        <div class="card">
-            <form action="/login" method="post">
-                <div class="form-group">
-                    <label class="form-label" style="margin-bottom: 8px;">Email or Phone Number</label>
-                    <input type="text" name="user_id" required class="form-input" placeholder="e.g. user@brand.com">
-                </div>
-                <button type="submit" class="btn-primary">Send OTP</button>
-            </form>
-        </div>
-    </div>
-</body>
-</html>
-"""
-
-VERIFY_HTML = """
-<!DOCTYPE html>
-<html>
-<head><title>Verify OTP - Analytics Pro</title><meta name="viewport" content="width=device-width, initial-scale=1.0">""" + GLOBAL_HEAD + """</head>
-<body>
-    <div class="nav">
-        <div>Analytics Pro</div>
-    </div>
-    <div class="upload-container">
-        <h1 class="title">Verify Identity.</h1>
-        <p class="subtitle">Enter the 6-digit code sent to your device.</p>
-        <div class="card">
-            {% if error %}
-            <div style="background: rgba(255,59,48,0.1); color: #ff3b30; padding: 12px; border-radius: 12px; margin-bottom: 16px; font-size: 13px; font-weight: 600; text-align: center;">{{ error }}</div>
-            {% endif %}
-            <form action="/verify" method="post">
-                <div class="form-group">
-                    <label class="form-label" style="margin-bottom: 8px;">Secure OTP</label>
-                    <input type="text" name="otp" required class="form-input" placeholder="● ● ● ● ● ●" maxlength="6" style="text-align: center; font-size: 20px; letter-spacing: 4px;">
-                </div>
-                <button type="submit" class="btn-primary">Authenticate</button>
-            </form>
-        </div>
-    </div>
-</body>
-</html>
-"""
-
 UPLOAD_HTML = """
 <!DOCTYPE html>
 <html>
@@ -221,7 +189,6 @@ UPLOAD_HTML = """
         <div>Analytics Pro</div>
         <div>
             <button class="view-toggle" onclick="toggleViewMode()" id="viewToggleBtn">💻 Desktop Site</button>
-            <a href="/logout" class="logout-btn">Logout</a>
         </div>
     </div>
     <div class="upload-container">
@@ -249,12 +216,11 @@ WORKSPACE_HTML = """
         <div>Analytics Pro</div>
         <div style="display: flex; align-items: center;">
             <button class="view-toggle" onclick="toggleViewMode()" id="viewToggleBtn">💻 Desktop Site</button>
-            <a href="/logout" class="logout-btn">Logout</a>
         </div>
     </div>
     
     <div class="app-layout">
-        <div class="sidebar">
+        <div class="sidebar" id="appSidebar">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; padding: 0 4px;">
                 <h2 style="font-size: 20px; font-weight: 700; margin: 0;">Workspace</h2>
                 <button type="button" onclick="clearAll()" style="background: none; border: none; color: var(--blue-apple); font-size: 13px; font-weight: 600; cursor: pointer; padding: 0;">Reset All</button>
@@ -375,7 +341,7 @@ WORKSPACE_HTML = """
                         </div>
                         <div class="checkbox-group" style="max-height: 80px;">
                             {% for status in unique_statuses %}
-                            <label class="checkbox-item"><input type="checkbox" name="status_filters" value="{{ status }}" {% if status|string|lower == 'ok' %}checked{% endif %}> <span style="overflow:hidden; text-overflow:ellipsis;">{{ status }}</span></label>
+                            <label class="checkbox-item"><input type="checkbox" name="status_filters" value="{{ status }}"> <span style="overflow:hidden; text-overflow:ellipsis;">{{ status }}</span></label>
                             {% endfor %}
                         </div>
                     </div>
@@ -396,11 +362,10 @@ WORKSPACE_HTML = """
                                 <button type="button" class="btn-micro" onclick="selectAll('index_cols', false)">Clear</button>
                             </div>
                         </div>
-                        <div class="checkbox-group sortable-list" id="row-grouping-container">
+                        <div class="checkbox-group" id="row-grouping-container">
                             {% for col in grouping_cols %}
                             <div class="checkbox-item">
-                                <span class="drag-handle">☰</span>
-                                <input type="checkbox" name="index_cols" value="{{ col }}" {% if col == 'Customized Sales Date' or col == 'SPC Name' %}checked{% endif %}> 
+                                <input type="checkbox" name="index_cols" value="{{ col }}"> 
                                 <span style="overflow: hidden; text-overflow: ellipsis;">{{ col }}</span>
                             </div>
                             {% endfor %}
@@ -415,10 +380,9 @@ WORKSPACE_HTML = """
                                 <button type="button" class="btn-micro" onclick="selectAll('columns_cols', false)">Clear</button>
                             </div>
                         </div>
-                        <div class="checkbox-group sortable-list" id="col-grouping-container">
+                        <div class="checkbox-group" id="col-grouping-container">
                             {% for col in grouping_cols %}
                             <div class="checkbox-item">
-                                <span class="drag-handle">☰</span>
                                 <input type="checkbox" name="columns_cols" value="{{ col }}"> 
                                 <span style="overflow: hidden; text-overflow: ellipsis;">{{ col }}</span>
                             </div>
@@ -454,7 +418,7 @@ WORKSPACE_HTML = """
                             <label class="form-label">VALUES</label>
                         </div>
                         <div class="checkbox-group" style="max-height: none;">
-                            <label class="checkbox-item"><input type="checkbox" name="agg_funcs" value="sum" checked> Sum Total</label>
+                            <label class="checkbox-item"><input type="checkbox" name="agg_funcs" value="sum"> Sum Total</label>
                             <label class="checkbox-item"><input type="checkbox" name="agg_funcs" value="count"> Count (Quantity)</label>
                             <label class="checkbox-item"><input type="checkbox" name="agg_funcs" value="mean"> Average Price</label>
                         </div>
@@ -472,7 +436,7 @@ WORKSPACE_HTML = """
 
                     <div class="form-group">
                         <div class="checkbox-group" style="max-height: none; background: transparent; border: none; padding: 0;">
-                            <label class="checkbox-item"><input type="checkbox" name="show_row_total" value="true" checked> <b>Show Grand Totals</b></label>
+                            <label class="checkbox-item"><input type="checkbox" name="show_row_total" value="true"> <b>Show Grand Totals</b></label>
                         </div>
                     </div>
                 </div>
@@ -482,6 +446,9 @@ WORKSPACE_HTML = """
                 <a href="/upload" style="color: #ff3b30; font-size: 13px; text-decoration: none; font-weight: 600; background: rgba(255,59,48,0.1); padding: 10px 20px; border-radius: 980px;">← Upload New File</a>
             </div>
         </div>
+        
+        <!-- Sidebar Resizer -->
+        <div class="sidebar-resizer" id="sidebarResizer"></div>
 
         <div class="main-content">
             <div class="header-actions">
@@ -497,8 +464,8 @@ WORKSPACE_HTML = """
             
             <div id="capture-area" class="table-container">
                 <div id="table-wrapper" class="table-scroll">
-                    <div style="padding: 60px 20px; text-align: center;">
-                        <p style="color: #86868b; font-size: 15px;">Configure your parameters on the left to view data.</p>
+                    <div style="padding: 100px 20px; text-align: center;">
+                        <p style="color: #86868b; font-size: 15px; font-weight: 500;">Configure your parameters on the left to view data.</p>
                     </div>
                 </div>
             </div>
@@ -510,6 +477,33 @@ WORKSPACE_HTML = """
     </script>
 
     <script>
+        // Sidebar Resizer Logic
+        const resizer = document.getElementById('sidebarResizer');
+        const sidebar = document.getElementById('appSidebar');
+        let isResizing = false;
+
+        resizer.addEventListener('mousedown', (e) => {
+            isResizing = true;
+            resizer.classList.add('resizing');
+            document.body.style.cursor = 'col-resize';
+        });
+
+        document.addEventListener('mousemove', (e) => {
+            if (!isResizing) return;
+            // Prevent sidebar from getting too small or too large
+            if(e.clientX > 200 && e.clientX < 600) {
+                sidebar.style.width = e.clientX + 'px';
+            }
+        });
+
+        document.addEventListener('mouseup', () => {
+            if (isResizing) {
+                isResizing = false;
+                resizer.classList.remove('resizing');
+                document.body.style.cursor = 'default';
+            }
+        });
+
         function selectAll(name, checked) {
             const checkboxes = document.querySelectorAll(`input[name="${name}"]`);
             checkboxes.forEach(cb => { cb.checked = checked; });
@@ -596,7 +590,7 @@ WORKSPACE_HTML = """
             const aggFuncs = formData.getAll('agg_funcs');
             
             if (indexCols.length === 0 || aggFuncs.length === 0) {
-                document.getElementById('table-wrapper').innerHTML = '<div style="padding: 60px 20px; text-align: center;"><p style="color: #86868b; font-size: 15px;">Select at least one Row Grouping and one Metric.</p></div>';
+                document.getElementById('table-wrapper').innerHTML = '<div style="padding: 100px 20px; text-align: center;"><p style="color: #86868b; font-size: 15px; font-weight: 500;">Select at least one Row Grouping and one Metric.</p></div>';
                 return;
             }
 
@@ -611,34 +605,12 @@ WORKSPACE_HTML = """
                     }
                     html += data.table_html;
                     document.getElementById('table-wrapper').innerHTML = html;
-                    makeTableResizable();
                 } else {
-                    document.getElementById('table-wrapper').innerHTML = `<div style="padding: 60px 20px; text-align: center;"><p style="color: #ff3b30;">${data.error}</p></div>`;
+                    document.getElementById('table-wrapper').innerHTML = `<div style="padding: 100px 20px; text-align: center;"><p style="color: #ff3b30; font-weight: 600;">${data.error}</p></div>`;
                 }
             } catch (err) {
                 console.error("Failed to update", err);
             }
-        }
-
-        function makeTableResizable() {
-            const table = document.querySelector('.excel-table');
-            if (!table) return;
-            const cols = table.querySelectorAll('th');
-            cols.forEach((col) => {
-                if (col.querySelector('.resizer')) return;
-                const resizer = document.createElement('div');
-                resizer.className = 'resizer';
-                col.appendChild(resizer);
-                let x = 0, w = 0;
-                resizer.addEventListener('mousedown', function (e) {
-                    x = e.clientX; w = col.offsetWidth;
-                    document.addEventListener('mousemove', mouseMoveHandler);
-                    document.addEventListener('mouseup', mouseUpHandler);
-                    e.stopPropagation();
-                });
-                function mouseMoveHandler(e) { col.style.width = `${w + (e.clientX - x)}px`; }
-                function mouseUpHandler() { document.removeEventListener('mousemove', mouseMoveHandler); document.removeEventListener('mouseup', mouseUpHandler); }
-            });
         }
 
         document.querySelectorAll('#config-form input').forEach(el => {
@@ -657,12 +629,76 @@ WORKSPACE_HTML = """
             const body = document.body;
             if (window.innerWidth <= 768) { body.classList.add('mobile-mode'); document.getElementById('viewToggleBtn').innerHTML = "📱 Mobile Site"; } 
             else { body.classList.add('desktop-mode'); document.getElementById('viewToggleBtn').innerHTML = "💻 Desktop Site"; }
-            
-            const sortableLists = document.querySelectorAll('.sortable-list');
-            sortableLists.forEach(el => { new Sortable(el, { animation: 150, handle: '.drag-handle', onUpdate: updateDashboard }); });
+            updateDashboard(); // Run once to show blank state gracefully
         });
         
-        window.onload = updateDashboard;
+        // JPEG Download Fix
+        function exportImage() {
+            const captureArea = document.getElementById('capture-area');
+            const scrollArea = document.getElementById('table-wrapper');
+            
+            const origMaxHeight = scrollArea.style.maxHeight;
+            const origOverflow = scrollArea.style.overflow;
+            
+            scrollArea.style.maxHeight = 'none';
+            scrollArea.style.overflow = 'visible';
+            
+            setTimeout(() => {
+                html2canvas(scrollArea, { scale: 2, backgroundColor: '#ffffff', useCORS: true }).then(canvas => {
+                    const imgData = canvas.toDataURL('image/jpeg', 1.0);
+                    
+                    if (/Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent)) {
+                        const modal = document.createElement('div');
+                        modal.style.position = 'fixed';
+                        modal.style.top = '0'; modal.style.left = '0'; 
+                        modal.style.width = '100%'; modal.style.height = '100%';
+                        modal.style.backgroundColor = 'rgba(0,0,0,0.95)'; 
+                        modal.style.zIndex = '99999';
+                        modal.style.display = 'flex'; 
+                        modal.style.flexDirection = 'column'; 
+                        modal.style.alignItems = 'center'; 
+                        modal.style.justifyContent = 'center';
+                        
+                        const closeBtn = document.createElement('button');
+                        closeBtn.innerText = 'Close Preview';
+                        closeBtn.style.padding = '12px 24px'; 
+                        closeBtn.style.marginBottom = '20px'; 
+                        closeBtn.style.borderRadius = '980px';
+                        closeBtn.style.border = 'none';
+                        closeBtn.style.backgroundColor = '#ffffff';
+                        closeBtn.style.color = '#1d1d1f';
+                        closeBtn.style.fontWeight = '600';
+                        closeBtn.onclick = () => document.body.removeChild(modal);
+                        
+                        const inst = document.createElement('p');
+                        inst.innerText = 'Long-press the image below to save it to your Photos.';
+                        inst.style.color = '#ffffff'; 
+                        inst.style.marginBottom = '20px';
+                        inst.style.fontSize = '14px';
+                        
+                        const img = document.createElement('img');
+                        img.src = imgData;
+                        img.style.maxWidth = '90%'; 
+                        img.style.maxHeight = '70%'; 
+                        img.style.borderRadius = '12px';
+                        img.style.boxShadow = '0 10px 30px rgba(0,0,0,0.5)';
+                        
+                        modal.appendChild(closeBtn);
+                        modal.appendChild(inst);
+                        modal.appendChild(img);
+                        document.body.appendChild(modal);
+                    } else {
+                        let link = document.createElement('a');
+                        link.download = 'Dashboard_Export.jpeg';
+                        link.href = imgData;
+                        link.click();
+                    }
+                    
+                    scrollArea.style.maxHeight = origMaxHeight;
+                    scrollArea.style.overflow = origOverflow;
+                });
+            }, 150);
+        }
     </script>
 </body>
 </html>
@@ -716,78 +752,36 @@ def get_date_bounds(df, date_col):
 
 # --- ROUTES ---
 
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    if request.method == 'POST':
-        user_id = request.form.get('user_id')
-        otp = str(random.randint(100000, 999999))
-        session['pending_user'] = user_id
-        session['expected_otp'] = otp
-        print(f"\n\n[SECURITY] 🔒 OTP generated for {user_id}: {otp}\n\n")
-        return redirect(url_for('verify'))
-    return render_template_string(LOGIN_HTML)
-
-@app.route("/verify", methods=["GET", "POST"])
-def verify():
-    error = None
-    if request.method == 'POST':
-        user_otp = request.form.get('otp')
-        if user_otp == session.get('expected_otp'):
-            session['authenticated'] = True
-            session.pop('expected_otp', None)
-            return redirect(url_for('home'))
-        else:
-            error = "Invalid or expired OTP. Please try again."
-    return render_template_string(VERIFY_HTML, error=error)
-
-@app.route("/logout")
-def logout():
-    session.clear()
-    return redirect(url_for('login'))
-
-@app.route("/", methods=["GET"])
-@login_required
+@app.route("/", methods=["GET", "POST"])
 def home():
     df = load_data()
     if df is not None:
-        return redirect(url_for('workspace'))
-    return redirect(url_for('upload_page'))
+        all_cols = df.columns.tolist()
+        default_date_col = 'Customized Sales Date' if 'Customized Sales Date' in all_cols else ('Sale Date' if 'Sale Date' in all_cols else next((c for c in all_cols if 'date' in str(c).lower()), ""))
+        
+        grouping_cols = df.select_dtypes(exclude=['number']).columns.tolist()
+        
+        spc_list, seg1_list, family_list, status_col, filter_mapping_json = get_filter_lists(df)
+        unique_statuses = df[status_col].dropna().unique().tolist() if status_col else []
+        upload_time = get_metadata()
+        min_sale_date, max_sale_date = get_date_bounds(df, default_date_col)
+
+        return render_template_string(WORKSPACE_HTML, all_cols=all_cols, grouping_cols=grouping_cols, default_date_col=default_date_col, status_col=status_col, unique_statuses=unique_statuses, spc_list=spc_list, seg1_list=seg1_list, family_list=family_list, upload_time=upload_time, min_sale_date=min_sale_date, max_sale_date=max_sale_date, filter_mapping_json=filter_mapping_json)
+    return render_template_string(UPLOAD_HTML)
 
 @app.route("/upload", methods=["GET"])
-@login_required
 def upload_page():
     return render_template_string(UPLOAD_HTML)
 
-@app.route("/workspace", methods=["GET"])
-@login_required
-def workspace():
-    df = load_data()
-    if df is None: return redirect(url_for('upload_page'))
-    
-    all_cols = df.columns.tolist()
-    default_date_col = 'Customized Sales Date' if 'Customized Sales Date' in all_cols else ('Sale Date' if 'Sale Date' in all_cols else next((c for c in all_cols if 'date' in str(c).lower()), ""))
-    
-    # Filter grouping columns to categorical/dates only (exclude raw numeric metrics)
-    grouping_cols = df.select_dtypes(exclude=['number']).columns.tolist()
-    
-    spc_list, seg1_list, family_list, status_col, filter_mapping_json = get_filter_lists(df)
-    unique_statuses = df[status_col].dropna().unique().tolist() if status_col else []
-    upload_time = get_metadata()
-    min_sale_date, max_sale_date = get_date_bounds(df, default_date_col)
-
-    return render_template_string(WORKSPACE_HTML, all_cols=all_cols, grouping_cols=grouping_cols, default_date_col=default_date_col, status_col=status_col, unique_statuses=unique_statuses, spc_list=spc_list, seg1_list=seg1_list, family_list=family_list, upload_time=upload_time, min_sale_date=min_sale_date, max_sale_date=max_sale_date, filter_mapping_json=filter_mapping_json)
-
 @app.route("/dashboard", methods=["POST"])
-@login_required
 def dashboard():
     if 'file' in request.files and request.files['file'].filename != '':
         file = request.files['file']
         df = pd.read_csv(file) if file.filename.endswith('.csv') else pd.read_excel(file)
         save_data(df)
-    return redirect(url_for('workspace'))
+    return redirect(url_for('home'))
 
 @app.route("/calculate", methods=["POST"])
-@login_required
 def calculate():
     df = load_data()
     if df is None: return jsonify({"error": "No data available."}), 400
@@ -810,8 +804,8 @@ def calculate():
     num_cols = df.select_dtypes(include='number').columns.tolist()
     value_cols = ['Tentative DP'] if 'Tentative DP' in num_cols else (num_cols[:1] if num_cols else [])
     
-    if not index_cols or not value_cols or not agg_funcs:
-        return jsonify({"error": "Missing parameters or numeric column."}), 400
+    if not index_cols or not agg_funcs:
+        return jsonify({"error": "Select at least one Row Grouping and one Metric."}), 400
 
     calc_contrib = 'contrib' in agg_funcs
     calc_growth = 'growth' in agg_funcs
@@ -901,7 +895,6 @@ def calculate():
         
         new_cols = []
         agg_map = {'sum': 'Value', 'count': 'Qty', 'mean': 'Avg'}
-        
         for col in pivot_df.columns:
             if isinstance(col, tuple):
                 if col[0] in index_cols and all(x == '' for x in col[1:]):
@@ -918,24 +911,20 @@ def calculate():
                         if len(item_str) >= 6 and any(char.isdigit() for char in item_str):
                             try: parts.append(pd.to_datetime(item_str, errors='raise').strftime('%d-%b-%y'))
                             except Exception: parts.append(item_str)
-                        else:
-                            parts.append(item_str)
+                        else: parts.append(item_str)
                 new_cols.append(" - ".join(parts) if parts else " - ".join(str(c) for c in col if str(c).strip()))
             else:
-                if col in index_cols:
-                    new_cols.append(str(col))
+                if col in index_cols: new_cols.append(str(col))
                 else:
                     col_str = str(col)
                     if len(col_str) >= 6 and any(char.isdigit() for char in col_str):
                         try: new_cols.append(pd.to_datetime(col_str, errors='raise').strftime('%d-%b-%y'))
                         except Exception: new_cols.append(col_str.replace('sum - ', '').replace('count - ', '').replace('mean - ', ''))
-                    else:
-                        new_cols.append(col_str.replace('sum - ', '').replace('count - ', '').replace('mean - ', ''))
+                    else: new_cols.append(col_str.replace('sum - ', '').replace('count - ', '').replace('mean - ', ''))
         
         pivot_df.columns = [str(c) for c in new_cols]
 
         metric_columns = [col for col in pivot_df.columns if col not in index_cols]
-        
         contrib_data = {}
         if calc_contrib:
             for c in metric_columns:
@@ -969,8 +958,7 @@ def calculate():
         if not pivot_df.empty:
             total_row = pd.DataFrame([{c: '' for c in pivot_df.columns}])
             total_row.iloc[0, 0] = 'GRAND TOTAL'
-            for c in metric_columns:
-                total_row.at[0, c] = pivot_df[c].sum()
+            for c in metric_columns: total_row.at[0, c] = pivot_df[c].sum()
             pivot_df = pd.concat([pivot_df, total_row], ignore_index=True)
             
         pivot_df.to_pickle(os.path.join(UPLOAD_DIR, "summary_data.pkl"))
@@ -994,7 +982,7 @@ def calculate():
                             s = s[:-2]
                         s = s + ',' + res
                     return '-' + s if num < 0 else s
-            except (ValueError, TypeError): return str(x)
+            except: return str(x)
                 
         for c in pivot_df.columns:
             if c not in index_cols:
@@ -1011,7 +999,6 @@ def calculate():
         return jsonify({"error": f"An error occurred: {str(e)}"}), 500
 
 @app.route("/download", methods=["GET"])
-@login_required
 def download():
     summary_path = os.path.join(UPLOAD_DIR, "summary_data.pkl")
     if not os.path.exists(summary_path): return "No data to download", 400
