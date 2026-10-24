@@ -1,10 +1,15 @@
 import os
-from flask import Flask, request, render_template_string, send_file, jsonify
-import pandas as pd
 import io
 from datetime import datetime, timedelta
+from flask import Flask, request, render_template_string, send_file, jsonify
+import pandas as pd
 
 app = Flask(__name__)
+
+# Persistent file storage path for cloud deployments
+UPLOAD_DIR = "/tmp/dashboard_uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+DATA_FILE_PATH = os.path.join(UPLOAD_DIR, "shared_data.pkl")
 
 # --- PREMIUM MAC-OS INSPIRED STYLING & RESPONSIVE ENGINE ---
 GLOBAL_HEAD = """
@@ -415,38 +420,60 @@ WORKSPACE_HTML = """
 </html>
 """
 
-temp_storage = {}
+def load_data():
+    if os.path.exists(DATA_FILE_PATH):
+        try:
+            return pd.read_pickle(DATA_FILE_PATH)
+        except Exception:
+            return None
+    return None
 
-@app.route("/", methods=["GET"])
+def save_data(df):
+    df.to_pickle(DATA_FILE_PATH)
+
+@app.route("/", methods=["GET", "POST"])
 def home():
-    return render_template_string(UPLOAD_HTML)
-
-@app.route("/dashboard", methods=["POST"])
-def dashboard():
-    if 'file' not in request.files: return "No file found", 400
-    file = request.files['file']
-    
-    if file:
-        df = pd.read_csv(file) if file.filename.endswith('.csv') else pd.read_excel(file)
-        temp_storage['raw_data'] = df
+    df = load_data()
+    if df is not None:
         all_cols = df.columns.tolist()
-        
         default_date_col = 'Sale Date' if 'Sale Date' in all_cols else next((c for c in all_cols if 'date' in str(c).lower()), "")
-        
         status_col = ""
         for candidate in ['FinalStatus', 'Final Record Status', 'Validation Remarks']:
             if candidate in all_cols:
                 status_col = candidate
                 break
-                
         unique_statuses = df[status_col].dropna().unique().tolist() if status_col else []
-        
         return render_template_string(WORKSPACE_HTML, all_cols=all_cols, default_date_col=default_date_col, status_col=status_col, unique_statuses=unique_statuses)
+    return render_template_string(UPLOAD_HTML)
 
-@app.route("/calculate", methods=["POST"])
+@app.route("/dashboard", methods=["GET", "POST"])
+def dashboard():
+    if 'file' in request.files and request.files['file'].filename != '':
+        file = request.files['file']
+        df = pd.read_csv(file) if file.filename.endswith('.csv') else pd.read_excel(file)
+        save_data(df)
+    
+    df = load_data()
+    if df is None:
+        return render_template_string(UPLOAD_HTML)
+        
+    all_cols = df.columns.tolist()
+    default_date_col = 'Sale Date' if 'Sale Date' in all_cols else next((c for c in all_cols if 'date' in str(c).lower()), "")
+    
+    status_col = ""
+    for candidate in ['FinalStatus', 'Final Record Status', 'Validation Remarks']:
+        if candidate in all_cols:
+            status_col = candidate
+            break
+            
+    unique_statuses = df[status_col].dropna().unique().tolist() if status_col else []
+    
+    return render_template_string(WORKSPACE_HTML, all_cols=all_cols, default_date_col=default_date_col, status_col=status_col, unique_statuses=unique_statuses)
+
+@app.route("/calculate", methods=["GET", "POST"])
 def calculate():
-    df = temp_storage.get('raw_data')
-    if df is None: return jsonify({"error": "Session expired."}), 400
+    df = load_data()
+    if df is None: return jsonify({"error": "No data available. Please upload a file."}), 400
         
     date_col = request.form.get('date_col')
     start_date = request.form.get('start_date')
@@ -528,7 +555,8 @@ def calculate():
                 total_row.at[0, c] = pivot_df[c].sum()
             pivot_df = pd.concat([pivot_df, total_row], ignore_index=True)
             
-        temp_storage['summary_data'] = pivot_df
+        # Store latest pivot calculation for file download
+        pivot_df.to_pickle(os.path.join(UPLOAD_DIR, "summary_data.pkl"))
         
         def format_indian_number(x):
             if pd.isna(x) or x == '': return ''
@@ -561,8 +589,9 @@ def calculate():
 
 @app.route("/download", methods=["GET"])
 def download():
-    df = temp_storage.get('summary_data')
-    if df is None: return "No data to download", 400
+    summary_path = os.path.join(UPLOAD_DIR, "summary_data.pkl")
+    if not os.path.exists(summary_path): return "No data to download", 400
+    df = pd.read_pickle(summary_path)
         
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -575,5 +604,6 @@ def download():
         download_name="Dynamic_Dashboard_Report.xlsx", 
         as_attachment=True
     )
-# ready for cloud
 
+if __name__ == '__main__':
+    app.run(debug=True)
