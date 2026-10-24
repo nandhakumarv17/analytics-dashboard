@@ -12,7 +12,7 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 DATA_FILE_PATH = os.path.join(UPLOAD_DIR, "shared_data.pkl")
 META_FILE_PATH = os.path.join(UPLOAD_DIR, "metadata.pkl")
 
-# --- APPLE iOS "LIQUID GLASS" THEME & RESPONSIVE ENGINE ---
+# --- APPLE iOS "LIQUID GLASS" THEME & STICKY MOBILE ENGINE ---
 GLOBAL_HEAD = """
 <style>
     :root {
@@ -40,7 +40,11 @@ GLOBAL_HEAD = """
     .card { background: var(--glass-bg); backdrop-filter: blur(25px) saturate(180%); border-radius: 24px; padding: 24px; box-shadow: var(--shadow-glass); border: 1px solid var(--glass-border); box-sizing: border-box; }
     
     .form-group { margin-bottom: 18px; }
-    .form-label { font-size: 13px; font-weight: 600; margin-bottom: 8px; display: block; color: var(--text-primary); }
+    .form-label-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+    .form-label { font-size: 13px; font-weight: 600; color: var(--text-primary); margin: 0; }
+    .section-clear { background: none; border: none; color: var(--blue-apple); font-size: 11px; font-weight: 500; cursor: pointer; padding: 0; }
+    .section-clear:hover { text-decoration: underline; }
+
     .form-input { width: 100%; padding: 12px 14px; font-size: 14px; border: 1px solid rgba(0,0,0,0.1); border-radius: 12px; background-color: rgba(255,255,255,0.9); color: var(--text-primary); box-sizing: border-box; transition: all 0.2s ease; }
     .form-input:focus { border-color: var(--blue-apple); outline: none; box-shadow: 0 0 0 4px rgba(0, 113, 227, 0.15); }
     
@@ -63,14 +67,17 @@ GLOBAL_HEAD = """
     .dropdown-item:hover { background-color: rgba(0,113,227,0.08); color: var(--blue-apple); }
     @keyframes fadeIn { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: translateY(0); } }
 
-    .table-container { background: var(--glass-bg); backdrop-filter: blur(25px); border-radius: 20px; box-shadow: var(--shadow-glass); border: 1px solid var(--glass-border); overflow: hidden; width: 100%; box-sizing: border-box; }
-    .table-scroll { max-height: calc(100vh - 200px); overflow-y: auto; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    .table-container { background: var(--glass-bg); backdrop-filter: blur(25px); border-radius: 20px; box-shadow: var(--shadow-glass); border: 1px solid var(--glass-border); overflow: hidden; width: 100%; box-sizing: border-box; display: flex; flex-direction: column; }
+    .table-scroll { max-height: calc(100vh - 200px); overflow-y: auto; overflow-x: auto; -webkit-overflow-scrolling: touch; position: relative; }
     .excel-table { width: 100%; table-layout: fixed; border-collapse: separate; border-spacing: 0; font-size: 13px; background: transparent; word-wrap: break-word; min-width: 550px; }
     .excel-table th, .excel-table td { padding: 12px 14px; text-align: left; border-bottom: 1px solid rgba(0,0,0,0.06); overflow: hidden; text-overflow: ellipsis; }
-    .excel-table th { background-color: rgba(255, 255, 255, 0.9); backdrop-filter: blur(20px); font-size: 11px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.03em; position: sticky; top: 0; z-index: 10; border-bottom: 1px solid rgba(0,0,0,0.08); }
+    
+    /* Sticky Header Fix for Mobile & Desktop */
+    .excel-table th { background-color: rgba(245, 245, 247, 0.98); backdrop-filter: blur(20px); font-size: 11px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.03em; position: sticky; top: 0; z-index: 100; border-bottom: 2px solid rgba(0,0,0,0.1); }
+    
     .excel-table td { white-space: nowrap; }
     .excel-table tr:hover td { background-color: rgba(0, 113, 227, 0.03); }
-    .excel-table tbody tr:last-child td { font-weight: 700; background-color: rgba(255,255,255,0.7); border-top: 2px solid rgba(0,0,0,0.1); border-bottom: none; }
+    .excel-table tbody tr:last-child td { font-weight: 700; background-color: rgba(255,255,255,0.85); border-top: 2px solid rgba(0,0,0,0.1); border-bottom: none; }
     .number-cell { font-variant-numeric: tabular-nums; }
     
     .drag-handle { cursor: grab; color: #aeaeb2; margin-right: 6px; font-weight: bold; user-select: none; }
@@ -205,7 +212,10 @@ WORKSPACE_HTML = """
 
                 {% if default_date_col %}
                 <div class="form-group" style="background: rgba(255,255,255,0.6); padding: 12px; border-radius: 14px; border: 1px solid rgba(0,0,0,0.06);">
-                    <label class="form-label" style="margin-bottom: 8px;">1. Date Filter ({{ default_date_col }})</label>
+                    <div class="form-label-header">
+                        <label class="form-label">1. Date Filter ({{ default_date_col }})</label>
+                        <button type="button" class="section-clear" onclick="clearSection('date')">Clear</button>
+                    </div>
                     <div style="display: flex; gap: 4px; margin-bottom: 10px; flex-wrap: wrap;">
                         <button type="button" class="btn-secondary" onclick="setDateRange('today')">Today</button>
                         <button type="button" class="btn-secondary" onclick="setDateRange('week')">Week</button>
@@ -226,7 +236,10 @@ WORKSPACE_HTML = """
 
                 {% if status_col %}
                 <div class="form-group">
-                    <label class="form-label">2. Filter by {{ status_col }}</label>
+                    <div class="form-label-header">
+                        <label class="form-label">2. Filter by {{ status_col }}</label>
+                        <button type="button" class="section-clear" onclick="clearSection('status')">Clear</button>
+                    </div>
                     <div class="checkbox-group" style="max-height: 100px;">
                         {% for status in unique_statuses %}
                         <label class="checkbox-item">
@@ -239,12 +252,15 @@ WORKSPACE_HTML = """
                 {% endif %}
 
                 <div class="form-group">
-                    <label class="form-label">3. Row Grouping (Drag ☰ to Reorder)</label>
+                    <div class="form-label-header">
+                        <label class="form-label">3. Row Grouping (Drag ☰)</label>
+                        <button type="button" class="section-clear" onclick="clearSection('rows')">Clear</button>
+                    </div>
                     <div class="checkbox-group sortable-list">
                         {% for col in all_cols %}
                         <div class="checkbox-item">
                             <span class="drag-handle">☰</span>
-                            <input type="checkbox" name="index_cols" value="{{ col }}" {% if col == 'SPC Name' %}checked{% endif %}> 
+                            <input type="checkbox" name="index_cols" value="{{ col }}" {% if col == 'Customized Sales Date' %}checked{% endif %}> 
                             <span style="overflow: hidden; text-overflow: ellipsis;">{{ col }}</span>
                         </div>
                         {% endfor %}
@@ -252,7 +268,10 @@ WORKSPACE_HTML = """
                 </div>
 
                 <div class="form-group">
-                    <label class="form-label">4. Column Grouping (Drag ☰ to Reorder)</label>
+                    <div class="form-label-header">
+                        <label class="form-label">4. Column Grouping (Drag ☰)</label>
+                        <button type="button" class="section-clear" onclick="clearSection('cols')">Clear</button>
+                    </div>
                     <div class="checkbox-group sortable-list" style="max-height: 100px;">
                         {% for col in all_cols %}
                         <div class="checkbox-item">
@@ -265,7 +284,10 @@ WORKSPACE_HTML = """
                 </div>
 
                 <div class="form-group">
-                    <label class="form-label">5. Calculation Type</label>
+                    <div class="form-label-header">
+                        <label class="form-label">5. Calculation Type</label>
+                        <button type="button" class="section-clear" onclick="clearSection('aggs')">Clear</button>
+                    </div>
                     <div class="checkbox-group" style="max-height: none;">
                         <label class="checkbox-item"><input type="checkbox" name="agg_funcs" value="sum" checked> Sum (Value)</label>
                         <label class="checkbox-item"><input type="checkbox" name="agg_funcs" value="count"> Count (Qty)</label>
@@ -274,7 +296,10 @@ WORKSPACE_HTML = """
                 </div>
 
                 <div class="form-group">
-                    <label class="form-label">6. Options</label>
+                    <div class="form-label-header">
+                        <label class="form-label">6. Options</label>
+                        <button type="button" class="section-clear" onclick="clearSection('options')">Clear</button>
+                    </div>
                     <div class="checkbox-group" style="max-height: none;">
                         <label class="checkbox-item"><input type="checkbox" name="show_row_total" value="true"> Add Row Totals</label>
                     </div>
@@ -312,6 +337,24 @@ WORKSPACE_HTML = """
             document.getElementById('config-form').reset();
             document.getElementById('start_date').value = '';
             document.getElementById('end_date').value = '';
+            updateDashboard();
+        }
+
+        function clearSection(section) {
+            if (section === 'date') {
+                document.getElementById('start_date').value = '';
+                document.getElementById('end_date').value = '';
+            } else if (section === 'status') {
+                document.querySelectorAll('input[name="status_filters"]').forEach(cb => cb.checked = false);
+            } else if (section === 'rows') {
+                document.querySelectorAll('input[name="index_cols"]').forEach(cb => cb.checked = false);
+            } else if (section === 'cols') {
+                document.querySelectorAll('input[name="columns_cols"]').forEach(cb => cb.checked = false);
+            } else if (section === 'aggs') {
+                document.querySelectorAll('input[name="agg_funcs"]').forEach(cb => cb.checked = false);
+            } else if (section === 'options') {
+                document.querySelectorAll('input[name="show_row_total"]').forEach(cb => cb.checked = false);
+            }
             updateDashboard();
         }
 
@@ -482,7 +525,7 @@ def home():
     df = load_data()
     if df is not None:
         all_cols = df.columns.tolist()
-        default_date_col = 'Sale Date' if 'Sale Date' in all_cols else next((c for c in all_cols if 'date' in str(c).lower()), "")
+        default_date_col = 'Customized Sales Date' if 'Customized Sales Date' in all_cols else ('Sale Date' if 'Sale Date' in all_cols else next((c for c in all_cols if 'date' in str(c).lower()), ""))
         status_col = ""
         for candidate in ['FinalStatus', 'Final Record Status', 'Validation Remarks']:
             if candidate in all_cols:
@@ -505,7 +548,7 @@ def dashboard():
         return render_template_string(UPLOAD_HTML)
         
     all_cols = df.columns.tolist()
-    default_date_col = 'Sale Date' if 'Sale Date' in all_cols else next((c for c in all_cols if 'date' in str(c).lower()), "")
+    default_date_col = 'Customized Sales Date' if 'Customized Sales Date' in all_cols else ('Sale Date' if 'Sale Date' in all_cols else next((c for c in all_cols if 'date' in str(c).lower()), ""))
     
     status_col = ""
     for candidate in ['FinalStatus', 'Final Record Status', 'Validation Remarks']:
