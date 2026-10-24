@@ -1,6 +1,6 @@
 import os
 import io
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import Flask, request, render_template_string, send_file, jsonify
 import pandas as pd
 
@@ -45,18 +45,18 @@ GLOBAL_HEAD = """
     .section-clear { background: none; border: none; color: var(--blue-apple); font-size: 11px; font-weight: 500; cursor: pointer; padding: 0; }
     .section-clear:hover { text-decoration: underline; }
 
-    .form-input { width: 100%; padding: 12px 14px; font-size: 14px; border: 1px solid rgba(0,0,0,0.1); border-radius: 12px; background-color: rgba(255,255,255,0.9); color: var(--text-primary); box-sizing: border-box; transition: all 0.2s ease; }
+    .form-input { width: 100%; padding: 10px 12px; font-size: 13px; border: 1px solid rgba(0,0,0,0.1); border-radius: 12px; background-color: rgba(255,255,255,0.9); color: var(--text-primary); box-sizing: border-box; transition: all 0.2s ease; }
     .form-input:focus { border-color: var(--blue-apple); outline: none; box-shadow: 0 0 0 4px rgba(0, 113, 227, 0.15); }
     
-    .checkbox-group { background: rgba(255,255,255,0.6); border: 1px solid rgba(0,0,0,0.08); border-radius: 14px; padding: 10px; max-height: 150px; overflow-y: auto; backdrop-filter: blur(10px); }
-    .checkbox-item { display: flex; align-items: center; margin-bottom: 6px; font-size: 13px; cursor: pointer; padding: 4px 6px; border-radius: 8px; transition: background 0.15s; }
+    .checkbox-group { background: rgba(255,255,255,0.6); border: 1px solid rgba(0,0,0,0.08); border-radius: 14px; padding: 8px; max-height: 120px; overflow-y: auto; backdrop-filter: blur(10px); }
+    .checkbox-item { display: flex; align-items: center; margin-bottom: 4px; font-size: 12px; cursor: pointer; padding: 3px 6px; border-radius: 6px; transition: background 0.15s; }
     .checkbox-item:hover { background: rgba(0,0,0,0.03); }
     .checkbox-item:last-child { margin-bottom: 0; }
-    .checkbox-item input { margin-right: 10px; width: 16px; height: 16px; accent-color: var(--blue-apple); cursor: pointer; flex-shrink: 0; }
+    .checkbox-item input { margin-right: 8px; width: 15px; height: 15px; accent-color: var(--blue-apple); cursor: pointer; flex-shrink: 0; }
     
     .btn-primary { background-color: var(--blue-apple); color: white; border: none; border-radius: 980px; padding: 12px 20px; font-size: 14px; font-weight: 500; cursor: pointer; text-align: center; display: inline-flex; align-items: center; justify-content: center; text-decoration: none; box-sizing: border-box; transition: background 0.2s, transform 0.1s; }
     .btn-primary:hover { background-color: var(--blue-hover); }
-    .btn-secondary { background-color: rgba(0,0,0,0.05); color: var(--text-primary); border-radius: 980px; padding: 7px 12px; font-size: 12px; font-weight: 500; text-decoration: none; display: inline-block; cursor: pointer; border: 1px solid rgba(0,0,0,0.04); transition: 0.2s; margin: 2px; }
+    .btn-secondary { background-color: rgba(0,0,0,0.05); color: var(--text-primary); border-radius: 980px; padding: 6px 10px; font-size: 11px; font-weight: 500; text-decoration: none; display: inline-block; cursor: pointer; border: 1px solid rgba(0,0,0,0.04); transition: 0.2s; margin: 2px; }
     .btn-secondary:hover { background-color: rgba(0,0,0,0.09); }
     
     /* Export Dropdown */
@@ -72,14 +72,16 @@ GLOBAL_HEAD = """
     .excel-table { width: 100%; table-layout: fixed; border-collapse: separate; border-spacing: 0; font-size: 13px; background: transparent; word-wrap: break-word; min-width: 550px; }
     .excel-table th, .excel-table td { padding: 12px 14px; text-align: left; border-bottom: 1px solid rgba(0,0,0,0.06); overflow: hidden; text-overflow: ellipsis; position: relative; }
     
-    /* Sticky Header Fix & Resizer Handle */
     .excel-table th { background-color: rgba(245, 245, 247, 0.98); backdrop-filter: blur(20px); font-size: 11px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.03em; position: sticky; top: 0; z-index: 100; border-bottom: 2px solid rgba(0,0,0,0.1); user-select: none; }
     .resizer { position: absolute; right: 0; top: 0; bottom: 0; width: 6px; cursor: col-resize; z-index: 101; }
     .resizer:hover { background-color: rgba(0, 113, 227, 0.4); }
 
     .excel-table td { white-space: nowrap; }
     .excel-table tr:hover td { background-color: rgba(0, 113, 227, 0.03); }
-    .excel-table tbody tr:last-child td { font-weight: 700; background-color: rgba(255,255,255,0.85); border-top: 2px solid rgba(0,0,0,0.1); border-bottom: none; }
+    
+    /* Highlight Row Total (Grand Total Footer Row) */
+    .excel-table tbody tr:last-child td { font-weight: 700; background-color: rgba(0, 113, 227, 0.12); color: var(--blue-apple); border-top: 2px solid var(--blue-apple); border-bottom: none; box-shadow: inset 0 1px 0 rgba(255,255,255,0.6); }
+    
     .number-cell { font-variant-numeric: tabular-nums; }
     
     .drag-handle { cursor: grab; color: #aeaeb2; margin-right: 6px; font-weight: bold; user-select: none; }
@@ -138,13 +140,11 @@ GLOBAL_HEAD = """
         }
     }
 
-    // Enable column resizer draggers on table headers
     function makeTableResizable() {
         const table = document.querySelector('.excel-table');
         if (!table) return;
         const cols = table.querySelectorAll('th');
         cols.forEach((col) => {
-            // Avoid adding multiple resizers if already present
             if (col.querySelector('.resizer')) return;
             const resizer = document.createElement('div');
             resizer.className = 'resizer';
@@ -171,6 +171,13 @@ GLOBAL_HEAD = """
                 document.removeEventListener('mouseup', mouseUpHandler);
             }
         });
+    }
+
+    function toggleWeekSelector(show) {
+        const container = document.getElementById('week-selector-container');
+        if (container) {
+            container.style.display = show ? 'block' : 'none';
+        }
     }
 
     window.addEventListener('DOMContentLoaded', () => {
@@ -254,18 +261,30 @@ WORKSPACE_HTML = """
                         <button type="button" class="section-clear" onclick="clearSection('date')">Clear</button>
                     </div>
                     <div style="display: flex; gap: 4px; margin-bottom: 10px; flex-wrap: wrap;">
-                        <button type="button" class="btn-secondary" onclick="setDateRange('today')">Today</button>
-                        <button type="button" class="btn-secondary" onclick="setDateRange('week')">Week</button>
-                        <button type="button" class="btn-secondary" onclick="setDateRange('month')">Month</button>
+                        <button type="button" class="btn-secondary" onclick="setDateRange('today'); toggleWeekSelector(false);">Today</button>
+                        <button type="button" class="btn-secondary" onclick="setDateRange('week'); toggleWeekSelector(true);">Week</button>
+                        <button type="button" class="btn-secondary" onclick="setDateRange('month'); toggleWeekSelector(false);">Month</button>
                     </div>
+                    
+                    <!-- Popup Week Numbers Option -->
+                    <div id="week-selector-container" style="display: none; margin-bottom: 10px; background: rgba(0,113,227,0.05); padding: 8px; border-radius: 10px;">
+                        <label style="font-size:11px; font-weight: 600; color: var(--blue-apple); display:block; margin-bottom: 4px;">Select Week in Month:</label>
+                        <div style="display: flex; gap: 6px;">
+                            <label style="font-size:11px; cursor:pointer;"><input type="radio" name="week_num" value="1" onchange="updateDashboard()"> W1</label>
+                            <label style="font-size:11px; cursor:pointer;"><input type="radio" name="week_num" value="2" onchange="updateDashboard()"> W2</label>
+                            <label style="font-size:11px; cursor:pointer;"><input type="radio" name="week_num" value="3" onchange="updateDashboard()"> W3</label>
+                            <label style="font-size:11px; cursor:pointer;"><input type="radio" name="week_num" value="4" onchange="updateDashboard()"> W4</label>
+                        </div>
+                    </div>
+
                     <div style="display: flex; gap: 8px;">
                         <div style="flex:1;">
                             <label style="font-size:10px; color:#86868b; margin-bottom:2px; display:block; text-transform: uppercase; font-weight: 600;">From</label>
-                            <input type="date" name="start_date" id="start_date" class="form-input" style="padding: 6px 8px;">
+                            <input type="date" name="start_date" id="start_date" class="form-input" style="padding: 6px 8px;" onchange="toggleWeekSelector(false);">
                         </div>
                         <div style="flex:1;">
                             <label style="font-size:10px; color:#86868b; margin-bottom:2px; display:block; text-transform: uppercase; font-weight: 600;">To</label>
-                            <input type="date" name="end_date" id="end_date" class="form-input" style="padding: 6px 8px;">
+                            <input type="date" name="end_date" id="end_date" class="form-input" style="padding: 6px 8px;" onchange="toggleWeekSelector(false);">
                         </div>
                     </div>
                 </div>
@@ -288,14 +307,29 @@ WORKSPACE_HTML = """
                 </div>
                 {% endif %}
 
+                <!-- Option to choose which columns should be listed in sidebars -->
+                <div class="form-group" style="background: rgba(0,113,227,0.03); padding: 10px; border-radius: 12px; border: 1px dashed rgba(0,113,227,0.2);">
+                    <div class="form-label-header">
+                        <label class="form-label" style="color: var(--blue-apple);">Sidebar Column Visibility</label>
+                        <button type="button" class="section-clear" onclick="toggleColumnSelector()">Configure</button>
+                    </div>
+                    <div id="column-visibility-box" style="display: none; max-height: 120px; overflow-y: auto; margin-top: 8px;">
+                        {% for col in all_cols %}
+                        <label class="checkbox-item" style="font-size: 11px;">
+                            <input type="checkbox" class="col-visibility-cb" value="{{ col }}" checked onchange="filterSidebarColumns()"> {{ col }}
+                        </label>
+                        {% endfor %}
+                    </div>
+                </div>
+
                 <div class="form-group">
                     <div class="form-label-header">
                         <label class="form-label">3. Row Grouping (Drag ☰)</label>
                         <button type="button" class="section-clear" onclick="clearSection('rows')">Clear</button>
                     </div>
-                    <div class="checkbox-group sortable-list">
+                    <div class="checkbox-group sortable-list" id="row-grouping-container">
                         {% for col in all_cols %}
-                        <div class="checkbox-item">
+                        <div class="checkbox-item" data-col-name="{{ col }}">
                             <span class="drag-handle">☰</span>
                             <input type="checkbox" name="index_cols" value="{{ col }}" {% if col == 'Customized Sales Date' %}checked{% endif %}> 
                             <span style="overflow: hidden; text-overflow: ellipsis;">{{ col }}</span>
@@ -309,9 +343,9 @@ WORKSPACE_HTML = """
                         <label class="form-label">4. Column Grouping (Drag ☰)</label>
                         <button type="button" class="section-clear" onclick="clearSection('cols')">Clear</button>
                     </div>
-                    <div class="checkbox-group sortable-list" style="max-height: 100px;">
+                    <div class="checkbox-group sortable-list" id="col-grouping-container" style="max-height: 100px;">
                         {% for col in all_cols %}
-                        <div class="checkbox-item">
+                        <div class="checkbox-item" data-col-name="{{ col }}">
                             <span class="drag-handle">☰</span>
                             <input type="checkbox" name="columns_cols" value="{{ col }}"> 
                             <span style="overflow: hidden; text-overflow: ellipsis;">{{ col }}</span>
@@ -374,6 +408,7 @@ WORKSPACE_HTML = """
             document.getElementById('config-form').reset();
             document.getElementById('start_date').value = '';
             document.getElementById('end_date').value = '';
+            toggleWeekSelector(false);
             updateDashboard();
         }
 
@@ -381,6 +416,8 @@ WORKSPACE_HTML = """
             if (section === 'date') {
                 document.getElementById('start_date').value = '';
                 document.getElementById('end_date').value = '';
+                toggleWeekSelector(false);
+                document.querySelectorAll('input[name="week_num"]').forEach(r => r.checked = false);
             } else if (section === 'status') {
                 document.querySelectorAll('input[name="status_filters"]').forEach(cb => cb.checked = false);
             } else if (section === 'rows') {
@@ -395,11 +432,43 @@ WORKSPACE_HTML = """
             updateDashboard();
         }
 
+        function toggleColumnSelector() {
+            const box = document.getElementById('column-visibility-box');
+            box.style.display = box.style.display === 'none' ? 'block' : 'none';
+        }
+
+        function filterSidebarColumns() {
+            const visibleCols = Array.from(document.querySelectorAll('.col-visibility-cb'))
+                                      .filter(cb => cb.checked)
+                                      .map(cb => cb.value);
+
+            // Filter checkboxes in row grouping and column grouping boxes
+            ['row-grouping-container', 'col-grouping-container'].forEach(containerId => {
+                const container = document.getElementById(containerId);
+                if (!container) return;
+                const items = container.querySelectorAll('.checkbox-item');
+                items.forEach(item => {
+                    const colName = item.getAttribute('data-col-name');
+                    if (visibleCols.includes(colName)) {
+                        item.style.display = 'flex';
+                    } else {
+                        item.style.display = 'none';
+                        const cb = item.querySelector('input[type="checkbox"]');
+                        if (cb && cb.checked) {
+                            cb.checked = false;
+                            updateDashboard();
+                        }
+                    }
+                });
+            });
+        }
+
         function setDateRange(range) {
             const today = new Date();
             let start = new Date();
             let end = new Date();
             if (range === 'today') {
+                // Keep today
             } else if (range === 'week') {
                 const day = today.getDay() || 7; 
                 if(day !== 1) start.setHours(-24 * (day - 1));
@@ -439,7 +508,7 @@ WORKSPACE_HTML = """
                     }
                     html += data.table_html;
                     document.getElementById('table-wrapper').innerHTML = html;
-                    makeTableResizable(); // Initialize resizers on table headers
+                    makeTableResizable();
                 } else {
                     document.getElementById('table-wrapper').innerHTML = `<div style="padding: 60px 20px; text-align: center;"><p style="color: #ff3b30;">${data.error}</p></div>`;
                 }
@@ -449,7 +518,9 @@ WORKSPACE_HTML = """
         }
 
         document.querySelectorAll('#config-form input, #config-form select').forEach(el => {
-            el.addEventListener('change', updateDashboard);
+            if(!el.classList.contains('col-visibility-cb')) {
+                el.addEventListener('change', updateDashboard);
+            }
         });
 
         window.onload = function() {
@@ -607,6 +678,7 @@ def calculate():
     date_col = request.form.get('date_col')
     start_date = request.form.get('start_date')
     end_date = request.form.get('end_date')
+    week_num = request.form.get('week_num')
     index_cols = request.form.getlist('index_cols')
     columns_cols = request.form.getlist('columns_cols')
     agg_funcs = request.form.getlist('agg_funcs')
@@ -617,20 +689,51 @@ def calculate():
     value_cols = ['Tentative DP'] if 'Tentative DP' in num_cols else (num_cols[:1] if num_cols else [])
     
     if not index_cols or not value_cols or not agg_funcs:
-        return jsonify({"error": "Missing parameters or no numeric column found."}), 400
+        return jsonify({"error": "Missing parameters or numeric column."}), 400
 
     try:
         filter_texts = []
         df_filtered = df.copy()
         
-        if date_col and date_col in df_filtered.columns and (start_date or end_date):
+        if date_col and date_col in df_filtered.columns:
             df_filtered[date_col] = pd.to_datetime(df_filtered[date_col], errors='coerce', dayfirst=True)
-            if start_date:
-                df_filtered = df_filtered[df_filtered[date_col] >= pd.to_datetime(start_date)]
-            if end_date:
-                end_datetime = pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
-                df_filtered = df_filtered[df_filtered[date_col] <= end_datetime]
-            filter_texts.append(f"<b>{date_col}</b>: {start_date or 'Start'} to {end_date or 'End'}")
+            
+            # Handle Week Number filtering if selected (W1 ~ W4 approx 7-day chunks of current month or filtered range)
+            if week_num and week_num.isdigit():
+                w_idx = int(week_num)
+                # Find min date of dataset to determine current month or use start_date if provided
+                valid_dates = df_filtered[date_col].dropna()
+                if not valid_dates.empty:
+                    base_date = pd.to_datetime(start_date) if start_date else valid_dates.min()
+                    month_start = datetime(base_date.year, base_date.month, 1)
+                    # Define roughly 7-8 day week blocks: W1 (1-7), W2 (8-14), W3 (15-21), W4 (22 to end)
+                    if w_idx == 1:
+                        w_start = month_start
+                        w_end = datetime(base_date.year, base_date.month, 7, 23, 59, 59)
+                    elif w_idx == 2:
+                        w_start = datetime(base_date.year, base_date.month, 8)
+                        w_end = datetime(base_date.year, base_date.month, 14, 23, 59, 59)
+                    elif w_idx == 3:
+                        w_start = datetime(base_date.year, base_date.month, 15)
+                        w_end = datetime(base_date.year, base_date.month, 21, 23, 59, 59)
+                    else:
+                        w_start = datetime(base_date.year, base_date.month, 22)
+                        # Last day of month
+                        next_month = datetime(base_date.year, base_date.month + 1, 1) if base_date.month < 12 else datetime(base_date.year + 1, 1, 1)
+                        w_end = next_month - timedelta(seconds=1)
+                    
+                    df_filtered = df_filtered[(df_filtered[date_col] >= w_start) & (df_filtered[date_col] <= w_end)]
+                    filter_texts.append(f"<b>{date_col}</b>: Week {w_idx} ({w_start.strftime('%d-%b-%y')} to {w_end.strftime('%d-%b-%y')})")
+            else:
+                if start_date:
+                    df_filtered = df_filtered[df_filtered[date_col] >= pd.to_datetime(start_date)]
+                if end_date:
+                    end_datetime = pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+                    df_filtered = df_filtered[df_filtered[date_col] <= end_datetime]
+                if start_date or end_date:
+                    s_str = pd.to_datetime(start_date).strftime('%d-%b-%y') if start_date else 'Start'
+                    e_str = pd.to_datetime(end_date).strftime('%d-%b-%y') if end_date else 'End'
+                    filter_texts.append(f"<b>{date_col}</b>: {s_str} to {e_str}")
 
         status_col = next((c for c in ['FinalStatus', 'Final Record Status', 'Validation Remarks'] if c in df_filtered.columns), "")
         if status_col and status_filters:
@@ -641,6 +744,10 @@ def calculate():
 
         if df_filtered.empty:
             return jsonify({"table_html": "<div style='padding: 60px 20px; text-align: center;'><p style='color: #ff3b30;'>No data found for the selected filters.</p></div>", "filter_text": filter_text})
+
+        # Format datetime index/columns to strict dd-mmm-yy format without prefixes
+        if date_col in index_cols:
+            df_filtered[date_col] = df_filtered[date_col].dt.strftime('%d-%b-%y')
 
         pivot_kwargs = {'data': df_filtered, 'index': index_cols, 'values': value_cols, 'aggfunc': agg_funcs}
         if columns_cols: pivot_kwargs['columns'] = columns_cols
@@ -660,14 +767,27 @@ def calculate():
                     elif item_str in value_cols:
                         if len(value_cols) > 1: parts.append(item_str)
                     elif item_str and item_str.lower() != 'nan':
-                        parts.append(item_str)
+                        # Format any datetime tuple component to dd-mmm-yy
+                        try:
+                            dt_parsed = pd.to_datetime(item_str, errors='raise')
+                            parts.append(dt_parsed.strftime('%d-%b-%y'))
+                        except Exception:
+                            parts.append(item_str)
                         
                 if not parts:
                     new_cols.append(" - ".join(str(c) for c in col if str(c).strip()))
                 else:
                     new_cols.append(" - ".join(parts))
             else:
-                new_cols.append(str(col))
+                col_str = str(col)
+                # Clean header names without prefixes if they look like dates or raw metrics
+                try:
+                    dt_parsed = pd.to_datetime(col_str, errors='raise')
+                    new_cols.append(dt_parsed.strftime('%d-%b-%y'))
+                except Exception:
+                    # Clean up standard prefix tags like 'sum - ' or 'value - ' if present
+                    cleaned = col_str.replace('sum - ', '').replace('count - ', '').replace('mean - ', '')
+                    new_cols.append(cleaned)
                 
         pivot_df.columns = new_cols
 
