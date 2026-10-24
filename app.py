@@ -70,11 +70,13 @@ GLOBAL_HEAD = """
     .table-container { background: var(--glass-bg); backdrop-filter: blur(25px); border-radius: 20px; box-shadow: var(--shadow-glass); border: 1px solid var(--glass-border); overflow: hidden; width: 100%; box-sizing: border-box; display: flex; flex-direction: column; }
     .table-scroll { max-height: calc(100vh - 200px); overflow-y: auto; overflow-x: auto; -webkit-overflow-scrolling: touch; position: relative; }
     .excel-table { width: 100%; table-layout: fixed; border-collapse: separate; border-spacing: 0; font-size: 13px; background: transparent; word-wrap: break-word; min-width: 550px; }
-    .excel-table th, .excel-table td { padding: 12px 14px; text-align: left; border-bottom: 1px solid rgba(0,0,0,0.06); overflow: hidden; text-overflow: ellipsis; }
+    .excel-table th, .excel-table td { padding: 12px 14px; text-align: left; border-bottom: 1px solid rgba(0,0,0,0.06); overflow: hidden; text-overflow: ellipsis; position: relative; }
     
-    /* Sticky Header Fix for Mobile & Desktop */
-    .excel-table th { background-color: rgba(245, 245, 247, 0.98); backdrop-filter: blur(20px); font-size: 11px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.03em; position: sticky; top: 0; z-index: 100; border-bottom: 2px solid rgba(0,0,0,0.1); }
-    
+    /* Sticky Header Fix & Resizer Handle */
+    .excel-table th { background-color: rgba(245, 245, 247, 0.98); backdrop-filter: blur(20px); font-size: 11px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.03em; position: sticky; top: 0; z-index: 100; border-bottom: 2px solid rgba(0,0,0,0.1); user-select: none; }
+    .resizer { position: absolute; right: 0; top: 0; bottom: 0; width: 6px; cursor: col-resize; z-index: 101; }
+    .resizer:hover { background-color: rgba(0, 113, 227, 0.4); }
+
     .excel-table td { white-space: nowrap; }
     .excel-table tr:hover td { background-color: rgba(0, 113, 227, 0.03); }
     .excel-table tbody tr:last-child td { font-weight: 700; background-color: rgba(255,255,255,0.85); border-top: 2px solid rgba(0,0,0,0.1); border-bottom: none; }
@@ -134,6 +136,41 @@ GLOBAL_HEAD = """
                 }
             }
         }
+    }
+
+    // Enable column resizer draggers on table headers
+    function makeTableResizable() {
+        const table = document.querySelector('.excel-table');
+        if (!table) return;
+        const cols = table.querySelectorAll('th');
+        cols.forEach((col) => {
+            // Avoid adding multiple resizers if already present
+            if (col.querySelector('.resizer')) return;
+            const resizer = document.createElement('div');
+            resizer.className = 'resizer';
+            col.appendChild(resizer);
+
+            let x = 0;
+            let w = 0;
+
+            resizer.addEventListener('mousedown', function (e) {
+                x = e.clientX;
+                w = col.offsetWidth;
+                document.addEventListener('mousemove', mouseMoveHandler);
+                document.addEventListener('mouseup', mouseUpHandler);
+                e.stopPropagation();
+            });
+
+            function mouseMoveHandler(e) {
+                const dx = e.clientX - x;
+                col.style.width = `${w + dx}px`;
+            }
+
+            function mouseUpHandler() {
+                document.removeEventListener('mousemove', mouseMoveHandler);
+                document.removeEventListener('mouseup', mouseUpHandler);
+            }
+        });
     }
 
     window.addEventListener('DOMContentLoaded', () => {
@@ -402,6 +439,7 @@ WORKSPACE_HTML = """
                     }
                     html += data.table_html;
                     document.getElementById('table-wrapper').innerHTML = html;
+                    makeTableResizable(); // Initialize resizers on table headers
                 } else {
                     document.getElementById('table-wrapper').innerHTML = `<div style="padding: 60px 20px; text-align: center;"><p style="color: #ff3b30;">${data.error}</p></div>`;
                 }
