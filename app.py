@@ -1,12 +1,26 @@
 import os
 import io
 import json
+import random
+import smtplib
+from email.message import EmailMessage
+from functools import wraps
 from datetime import datetime, timedelta
-from flask import Flask, request, render_template_string, send_file, jsonify, redirect, url_for
+from flask import Flask, request, render_template_string, send_file, jsonify, session, redirect, url_for
 import pandas as pd
 import numpy as np
 
 app = Flask(__name__)
+app.secret_key = os.environ.get('SECRET_KEY', 'liquid_glass_super_secret_key_2026')
+
+# --- AUTHENTICATION MIDDLEWARE ---
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not session.get('authenticated'):
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated_function
 
 UPLOAD_DIR = "/tmp/dashboard_uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -39,6 +53,8 @@ GLOBAL_HEAD = """
     .nav { background: rgba(255, 255, 255, 0.85); backdrop-filter: saturate(200%) blur(30px); border-bottom: 1px solid rgba(0, 0, 0, 0.08); padding: 0 24px; height: 60px; display: flex; justify-content: space-between; align-items: center; font-size: 16px; font-weight: 600; color: var(--text-primary); position: fixed; top: 0; width: 100%; box-sizing: border-box; z-index: 1000; }
     .view-toggle { background: rgba(0,0,0,0.04); padding: 8px 14px; border-radius: 980px; font-size: 12px; font-weight: 500; cursor: pointer; display: flex; align-items: center; transition: 0.2s; border: none; color: var(--text-primary); flex-shrink: 0; }
     .view-toggle:hover { background: rgba(0,0,0,0.08); }
+    .logout-btn { color: var(--text-secondary); text-decoration: none; font-size: 13px; font-weight: 500; margin-left: 16px; transition: 0.2s; }
+    .logout-btn:hover { color: #ff3b30; }
     
     .upload-container { max-width: 520px; margin: 130px auto 40px auto; padding: 0 16px; box-sizing: border-box; }
     .title { font-size: 36px; font-weight: 700; letter-spacing: -0.015em; text-align: center; margin: 0 0 8px 0; }
@@ -82,14 +98,10 @@ GLOBAL_HEAD = """
     @keyframes fadeIn { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: translateY(0); } }
 
     .table-container { background: var(--glass-bg); backdrop-filter: blur(25px); border-radius: 20px; box-shadow: var(--shadow-glass); border: 1px solid var(--glass-border); overflow: hidden; width: 100%; box-sizing: border-box; display: flex; flex-direction: column; }
-    
-    /* Strict scroll container to prevent header overlapping navbar */
     .table-scroll { max-height: calc(100vh - 200px); overflow-y: auto; overflow-x: auto; -webkit-overflow-scrolling: touch; position: relative; }
-    
     .excel-table { width: 100%; table-layout: fixed; border-collapse: separate; border-spacing: 0; font-size: 13px; background: transparent; word-wrap: break-word; min-width: 550px; }
     .excel-table th, .excel-table td { padding: 14px 16px; text-align: left; border-bottom: 1px solid rgba(0,0,0,0.06); overflow: hidden; text-overflow: ellipsis; position: relative; }
     
-    /* Developer IDE Glass Headers */
     .excel-table th { 
         background-color: rgba(30, 30, 34, 0.85); 
         backdrop-filter: blur(20px) saturate(180%); 
@@ -106,12 +118,14 @@ GLOBAL_HEAD = """
         box-shadow: 0 4px 10px rgba(0,0,0,0.1);
     }
     
-    /* Syntax Highlight Colors for Headers */
     .excel-table th:nth-child(5n+1) { color: var(--code-blue); }
     .excel-table th:nth-child(5n+2) { color: var(--code-pink); }
     .excel-table th:nth-child(5n+3) { color: var(--code-orange); }
     .excel-table th:nth-child(5n+4) { color: var(--code-green); }
     .excel-table th:nth-child(5n+5) { color: var(--code-purple); }
+
+    .resizer { position: absolute; right: 0; top: 0; bottom: 0; width: 6px; cursor: col-resize; z-index: 101; }
+    .resizer:hover { background-color: rgba(0, 113, 227, 0.4); }
 
     .excel-table td { white-space: nowrap; }
     .excel-table tr:hover td { background-color: rgba(0, 113, 227, 0.04); }
@@ -124,16 +138,12 @@ GLOBAL_HEAD = """
     .pct-positive { color: #34c759; font-weight: 600; }
     .pct-negative { color: #ff3b30; font-weight: 600; }
     .pct-neutral { color: var(--text-secondary); }
-
-    /* Layout & Sidebar Resizer */
+    
     body.desktop-mode { overflow: hidden; }
     body.desktop-mode .app-layout { display: flex; flex-direction: row; height: 100vh; padding-top: 60px; box-sizing: border-box; }
-    
     body.desktop-mode .sidebar { width: 360px; background: var(--glass-sidebar); backdrop-filter: blur(40px) saturate(180%); padding: 24px 20px; overflow-y: auto; flex-shrink: 0; box-sizing: border-box; height: calc(100vh - 60px); }
-    
     .sidebar-resizer { width: 5px; background: rgba(0,0,0,0.03); cursor: col-resize; z-index: 100; transition: background 0.2s; flex-shrink: 0; border-right: 1px solid rgba(0,0,0,0.06); }
     .sidebar-resizer:hover, .sidebar-resizer.resizing { background: var(--blue-apple); }
-    
     body.desktop-mode .main-content { flex: 1; padding: 24px 32px; overflow-y: auto; overflow-x: hidden; background: var(--bg-main); box-sizing: border-box; height: calc(100vh - 60px); }
     body.desktop-mode .header-actions { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; flex-wrap: wrap; gap: 10px; }
     
@@ -180,6 +190,59 @@ GLOBAL_HEAD = """
 </script>
 """
 
+LOGIN_HTML = """
+<!DOCTYPE html>
+<html>
+<head><title>Login - Analytics Pro</title><meta name="viewport" content="width=device-width, initial-scale=1.0">""" + GLOBAL_HEAD + """</head>
+<body>
+    <div class="nav">
+        <div>Analytics Pro</div>
+    </div>
+    <div class="upload-container">
+        <h1 class="title">Secure Access.</h1>
+        <p class="subtitle">Enter your email address to receive a One-Time Password.</p>
+        <div class="card">
+            <form action="/login" method="post">
+                <div class="form-group">
+                    <label class="form-label" style="margin-bottom: 8px;">Email Address</label>
+                    <input type="email" name="user_id" required class="form-input" placeholder="e.g. user@brand.com">
+                </div>
+                <button type="submit" class="btn-primary">Send OTP</button>
+            </form>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+VERIFY_HTML = """
+<!DOCTYPE html>
+<html>
+<head><title>Verify OTP - Analytics Pro</title><meta name="viewport" content="width=device-width, initial-scale=1.0">""" + GLOBAL_HEAD + """</head>
+<body>
+    <div class="nav">
+        <div>Analytics Pro</div>
+    </div>
+    <div class="upload-container">
+        <h1 class="title">Verify Identity.</h1>
+        <p class="subtitle">Enter the 6-digit code sent to your email.</p>
+        <div class="card">
+            {% if error %}
+            <div style="background: rgba(255,59,48,0.1); color: #ff3b30; padding: 12px; border-radius: 12px; margin-bottom: 16px; font-size: 13px; font-weight: 600; text-align: center;">{{ error }}</div>
+            {% endif %}
+            <form action="/verify" method="post">
+                <div class="form-group">
+                    <label class="form-label" style="margin-bottom: 8px;">Secure OTP</label>
+                    <input type="text" name="otp" required class="form-input" placeholder="● ● ● ● ● ●" maxlength="6" style="text-align: center; font-size: 20px; letter-spacing: 4px;">
+                </div>
+                <button type="submit" class="btn-primary">Authenticate</button>
+            </form>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
 UPLOAD_HTML = """
 <!DOCTYPE html>
 <html>
@@ -189,6 +252,7 @@ UPLOAD_HTML = """
         <div>Analytics Pro</div>
         <div>
             <button class="view-toggle" onclick="toggleViewMode()" id="viewToggleBtn">💻 Desktop Site</button>
+            <a href="/logout" class="logout-btn">Logout</a>
         </div>
     </div>
     <div class="upload-container">
@@ -216,6 +280,7 @@ WORKSPACE_HTML = """
         <div>Analytics Pro</div>
         <div style="display: flex; align-items: center;">
             <button class="view-toggle" onclick="toggleViewMode()" id="viewToggleBtn">💻 Desktop Site</button>
+            <a href="/logout" class="logout-btn">Logout</a>
         </div>
     </div>
     
@@ -447,7 +512,6 @@ WORKSPACE_HTML = """
             </div>
         </div>
         
-        <!-- Sidebar Resizer -->
         <div class="sidebar-resizer" id="sidebarResizer"></div>
 
         <div class="main-content">
@@ -477,7 +541,6 @@ WORKSPACE_HTML = """
     </script>
 
     <script>
-        // Sidebar Resizer Logic
         const resizer = document.getElementById('sidebarResizer');
         const sidebar = document.getElementById('appSidebar');
         let isResizing = false;
@@ -490,7 +553,6 @@ WORKSPACE_HTML = """
 
         document.addEventListener('mousemove', (e) => {
             if (!isResizing) return;
-            // Prevent sidebar from getting too small or too large
             if(e.clientX > 200 && e.clientX < 600) {
                 sidebar.style.width = e.clientX + 'px';
             }
@@ -576,8 +638,10 @@ WORKSPACE_HTML = """
             start.setMinutes(start.getMinutes() - start.getTimezoneOffset());
             end.setMinutes(end.getMinutes() - end.getTimezoneOffset());
             
-            document.getElementById('start_date').value = start.toISOString().split('T')[0];
-            document.getElementById('end_date').value = end.toISOString().split('T')[0];
+            if (range !== 'week' || document.getElementById('week-selector-container').style.display === 'none') {
+                document.getElementById('start_date').value = start.toISOString().split('T')[0];
+                document.getElementById('end_date').value = end.toISOString().split('T')[0];
+            }
             
             updateDashboard();
         }
@@ -605,12 +669,34 @@ WORKSPACE_HTML = """
                     }
                     html += data.table_html;
                     document.getElementById('table-wrapper').innerHTML = html;
+                    makeTableResizable();
                 } else {
                     document.getElementById('table-wrapper').innerHTML = `<div style="padding: 100px 20px; text-align: center;"><p style="color: #ff3b30; font-weight: 600;">${data.error}</p></div>`;
                 }
             } catch (err) {
                 console.error("Failed to update", err);
             }
+        }
+
+        function makeTableResizable() {
+            const table = document.querySelector('.excel-table');
+            if (!table) return;
+            const cols = table.querySelectorAll('th');
+            cols.forEach((col) => {
+                if (col.querySelector('.resizer')) return;
+                const resizer = document.createElement('div');
+                resizer.className = 'resizer';
+                col.appendChild(resizer);
+                let x = 0, w = 0;
+                resizer.addEventListener('mousedown', function (e) {
+                    x = e.clientX; w = col.offsetWidth;
+                    document.addEventListener('mousemove', mouseMoveHandler);
+                    document.addEventListener('mouseup', mouseUpHandler);
+                    e.stopPropagation();
+                });
+                function mouseMoveHandler(e) { col.style.width = `${w + (e.clientX - x)}px`; }
+                function mouseUpHandler() { document.removeEventListener('mousemove', mouseMoveHandler); document.removeEventListener('mouseup', mouseUpHandler); }
+            });
         }
 
         document.querySelectorAll('#config-form input').forEach(el => {
@@ -629,10 +715,9 @@ WORKSPACE_HTML = """
             const body = document.body;
             if (window.innerWidth <= 768) { body.classList.add('mobile-mode'); document.getElementById('viewToggleBtn').innerHTML = "📱 Mobile Site"; } 
             else { body.classList.add('desktop-mode'); document.getElementById('viewToggleBtn').innerHTML = "💻 Desktop Site"; }
-            updateDashboard(); // Run once to show blank state gracefully
+            updateDashboard();
         });
         
-        // JPEG Download Fix
         function exportImage() {
             const captureArea = document.getElementById('capture-area');
             const scrollArea = document.getElementById('table-wrapper');
@@ -752,36 +837,100 @@ def get_date_bounds(df, date_col):
 
 # --- ROUTES ---
 
-@app.route("/", methods=["GET", "POST"])
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == 'POST':
+        user_id = request.form.get('user_id')
+        otp = str(random.randint(100000, 999999))
+        session['pending_user'] = user_id
+        session['expected_otp'] = otp
+        
+        # --- SEND LIVE EMAIL VIA GMAIL ---
+        sender_email = os.environ.get('EMAIL_ADDRESS')
+        sender_password = os.environ.get('EMAIL_PASSWORD')
+        
+        if sender_email and sender_password and '@' in user_id:
+            try:
+                msg = EmailMessage()
+                msg.set_content(f"Your Analytics Pro verification code is: {otp}\n\nPlease do not share this code with anyone.")
+                msg['Subject'] = 'Your Analytics Pro OTP'
+                msg['From'] = f"Analytics Pro <{sender_email}>"
+                msg['To'] = user_id
+
+                server = smtplib.SMTP_SSL('smtp.gmail.com', 465)
+                server.login(sender_email, sender_password)
+                server.send_message(msg)
+                server.quit()
+                print(f"[EMAIL] Sent to {user_id}")
+            except Exception as e:
+                print(f"[EMAIL ERROR] Failed to send: {e}")
+        else:
+            # Fallback
+            print(f"\n\n[SECURITY] 🔒 OTP generated for {user_id}: {otp}\n\n")
+            
+        return redirect(url_for('verify'))
+    return render_template_string(LOGIN_HTML)
+
+@app.route("/verify", methods=["GET", "POST"])
+def verify():
+    error = None
+    if request.method == 'POST':
+        user_otp = request.form.get('otp')
+        if user_otp == session.get('expected_otp'):
+            session['authenticated'] = True
+            session.pop('expected_otp', None)
+            return redirect(url_for('home'))
+        else:
+            error = "Invalid or expired OTP. Please try again."
+    return render_template_string(VERIFY_HTML, error=error)
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for('login'))
+
+@app.route("/", methods=["GET"])
+@login_required
 def home():
     df = load_data()
     if df is not None:
-        all_cols = df.columns.tolist()
-        default_date_col = 'Customized Sales Date' if 'Customized Sales Date' in all_cols else ('Sale Date' if 'Sale Date' in all_cols else next((c for c in all_cols if 'date' in str(c).lower()), ""))
-        
-        grouping_cols = df.select_dtypes(exclude=['number']).columns.tolist()
-        
-        spc_list, seg1_list, family_list, status_col, filter_mapping_json = get_filter_lists(df)
-        unique_statuses = df[status_col].dropna().unique().tolist() if status_col else []
-        upload_time = get_metadata()
-        min_sale_date, max_sale_date = get_date_bounds(df, default_date_col)
-
-        return render_template_string(WORKSPACE_HTML, all_cols=all_cols, grouping_cols=grouping_cols, default_date_col=default_date_col, status_col=status_col, unique_statuses=unique_statuses, spc_list=spc_list, seg1_list=seg1_list, family_list=family_list, upload_time=upload_time, min_sale_date=min_sale_date, max_sale_date=max_sale_date, filter_mapping_json=filter_mapping_json)
-    return render_template_string(UPLOAD_HTML)
+        return redirect(url_for('workspace'))
+    return redirect(url_for('upload_page'))
 
 @app.route("/upload", methods=["GET"])
+@login_required
 def upload_page():
     return render_template_string(UPLOAD_HTML)
 
+@app.route("/workspace", methods=["GET"])
+@login_required
+def workspace():
+    df = load_data()
+    if df is None: return redirect(url_for('upload_page'))
+    
+    all_cols = df.columns.tolist()
+    default_date_col = 'Customized Sales Date' if 'Customized Sales Date' in all_cols else ('Sale Date' if 'Sale Date' in all_cols else next((c for c in all_cols if 'date' in str(c).lower()), ""))
+    
+    grouping_cols = df.select_dtypes(exclude=['number']).columns.tolist()
+    
+    spc_list, seg1_list, family_list, status_col, filter_mapping_json = get_filter_lists(df)
+    unique_statuses = df[status_col].dropna().unique().tolist() if status_col else []
+    upload_time = get_metadata()
+    min_sale_date, max_sale_date = get_date_bounds(df, default_date_col)
+
+    return render_template_string(WORKSPACE_HTML, all_cols=all_cols, grouping_cols=grouping_cols, default_date_col=default_date_col, status_col=status_col, unique_statuses=unique_statuses, spc_list=spc_list, seg1_list=seg1_list, family_list=family_list, upload_time=upload_time, min_sale_date=min_sale_date, max_sale_date=max_sale_date, filter_mapping_json=filter_mapping_json)
+
 @app.route("/dashboard", methods=["POST"])
+@login_required
 def dashboard():
     if 'file' in request.files and request.files['file'].filename != '':
         file = request.files['file']
         df = pd.read_csv(file) if file.filename.endswith('.csv') else pd.read_excel(file)
         save_data(df)
-    return redirect(url_for('home'))
+    return redirect(url_for('workspace'))
 
 @app.route("/calculate", methods=["POST"])
+@login_required
 def calculate():
     df = load_data()
     if df is None: return jsonify({"error": "No data available."}), 400
@@ -999,6 +1148,7 @@ def calculate():
         return jsonify({"error": f"An error occurred: {str(e)}"}), 500
 
 @app.route("/download", methods=["GET"])
+@login_required
 def download():
     summary_path = os.path.join(UPLOAD_DIR, "summary_data.pkl")
     if not os.path.exists(summary_path): return "No data to download", 400
