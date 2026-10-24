@@ -215,11 +215,11 @@ WORKSPACE_HTML = """
                     <div style="display: flex; gap: 8px;">
                         <div style="flex:1;">
                             <label style="font-size:10px; color:#86868b; margin-bottom:2px; display:block; text-transform: uppercase; font-weight: 600;">From</label>
-                            <input type="date" name="start_date" id="start_date" class="form-input" style="padding: 6px 8px;">
+                            <input type="date" name="start_date" id="start_date" class="form-input" style="padding: 6px 8px;" value="{{ min_sale_date_iso }}">
                         </div>
                         <div style="flex:1;">
                             <label style="font-size:10px; color:#86868b; margin-bottom:2px; display:block; text-transform: uppercase; font-weight: 600;">To</label>
-                            <input type="date" name="end_date" id="end_date" class="form-input" style="padding: 6px 8px;">
+                            <input type="date" name="end_date" id="end_date" class="form-input" style="padding: 6px 8px;" value="{{ max_sale_date_iso }}">
                         </div>
                     </div>
                 </div>
@@ -311,29 +311,26 @@ WORKSPACE_HTML = """
     <script>
         function clearAll() {
             document.getElementById('config-form').reset();
-            document.getElementById('start_date').value = '';
-            document.getElementById('end_date').value = '';
+            document.getElementById('start_date').value = '{{ min_sale_date_iso }}';
+            document.getElementById('end_date').value = '{{ max_sale_date_iso }}';
             updateDashboard();
         }
 
         function setDateRange(range) {
-            const today = new Date();
-            let start = new Date();
-            let end = new Date();
+            const maxIso = '{{ max_sale_date_iso }}';
+            let start = new Date(maxIso);
+            let end = new Date(maxIso);
+
             if (range === 'today') {
+                // Keep start and end as max date
             } else if (range === 'week') {
-                const day = today.getDay() || 7; 
-                if(day !== 1) start.setHours(-24 * (day - 1));
-                end = new Date(start);
-                end.setDate(end.getDate() + 6);
+                start.setDate(end.getDate() - 7);
             } else if (range === 'month') {
-                start = new Date(today.getFullYear(), today.getMonth(), 1);
-                end = new Date(today.getFullYear(), today.getMonth() + 1, 0);
+                start.setMonth(end.getMonth() - 1);
             }
-            start.setMinutes(start.getMinutes() - start.getTimezoneOffset());
-            end.setMinutes(end.getMinutes() - end.getTimezoneOffset());
+
             document.getElementById('start_date').value = start.toISOString().split('T')[0];
-            document.getElementById('end_date').value = end.toISOString().split('T')[0];
+            document.getElementById('end_date').value = maxIso;
             updateDashboard();
         }
 
@@ -479,24 +476,27 @@ def get_metadata(df):
             
     min_sale_date = "N/A"
     max_sale_date = "N/A"
+    min_sale_date_iso = ""
+    max_sale_date_iso = ""
     
     all_cols = df.columns.tolist()
     date_col = 'Sale Date' if 'Sale Date' in all_cols else next((c for c in all_cols if 'date' in str(c).lower()), "")
     if date_col:
         try:
-            parsed_dates = pd.to_datetime(df[date_col], errors='coerce')
-            if parsed_dates.isna().all():
-                parsed_dates = pd.to_datetime(df[date_col], dayfirst=True, errors='coerce')
+            # Safely coerce dates, handling mixed formats or Excel timestamps
+            parsed_dates = pd.to_datetime(df[date_col], errors='coerce', dayfirst=True)
             min_dt = parsed_dates.min()
             max_dt = parsed_dates.max()
             if pd.notna(min_dt):
                 min_sale_date = min_dt.strftime("%d %b %Y")
+                min_sale_date_iso = min_dt.strftime("%Y-%m-%d")
             if pd.notna(max_dt):
                 max_sale_date = max_dt.strftime("%d %b %Y")
+                max_sale_date_iso = max_dt.strftime("%Y-%m-%d")
         except Exception:
             pass
             
-    return upload_time, min_sale_date, max_sale_date
+    return upload_time, min_sale_date, max_sale_date, min_sale_date_iso, max_sale_date_iso
 
 @app.route("/", methods=["GET", "POST"])
 def home():
@@ -510,8 +510,8 @@ def home():
                 status_col = candidate
                 break
         unique_statuses = df[status_col].dropna().unique().tolist() if status_col else []
-        upload_time, min_sale_date, max_sale_date = get_metadata(df)
-        return render_template_string(WORKSPACE_HTML, all_cols=all_cols, default_date_col=default_date_col, status_col=status_col, unique_statuses=unique_statuses, upload_time=upload_time, min_sale_date=min_sale_date, max_sale_date=max_sale_date)
+        upload_time, min_sale_date, max_sale_date, min_sale_date_iso, max_sale_date_iso = get_metadata(df)
+        return render_template_string(WORKSPACE_HTML, all_cols=all_cols, default_date_col=default_date_col, status_col=status_col, unique_statuses=unique_statuses, upload_time=upload_time, min_sale_date=min_sale_date, max_sale_date=max_sale_date, min_sale_date_iso=min_sale_date_iso, max_sale_date_iso=max_sale_date_iso)
     return render_template_string(UPLOAD_HTML)
 
 @app.route("/dashboard", methods=["GET", "POST"])
@@ -535,9 +535,9 @@ def dashboard():
             break
             
     unique_statuses = df[status_col].dropna().unique().tolist() if status_col else []
-    upload_time, min_sale_date, max_sale_date = get_metadata(df)
+    upload_time, min_sale_date, max_sale_date, min_sale_date_iso, max_sale_date_iso = get_metadata(df)
     
-    return render_template_string(WORKSPACE_HTML, all_cols=all_cols, default_date_col=default_date_col, status_col=status_col, unique_statuses=unique_statuses, upload_time=upload_time, min_sale_date=min_sale_date, max_sale_date=max_sale_date)
+    return render_template_string(WORKSPACE_HTML, all_cols=all_cols, default_date_col=default_date_col, status_col=status_col, unique_statuses=unique_statuses, upload_time=upload_time, min_sale_date=min_sale_date, max_sale_date=max_sale_date, min_sale_date_iso=min_sale_date_iso, max_sale_date_iso=max_sale_date_iso)
 
 @app.route("/calculate", methods=["GET", "POST"])
 def calculate():
@@ -563,11 +563,8 @@ def calculate():
         filter_texts = []
         df_filtered = df.copy()
         
-        if date_col and date_col in df_filtered.columns and (start_date or end_date):
-            df_filtered[date_col] = pd.to_datetime(df_filtered[date_col], errors='coerce')
-            if df_filtered[date_col].isna().all():
-                df_filtered[date_col] = pd.to_datetime(df_filtered[date_col].astype(str), dayfirst=True, errors='coerce')
-            
+        if date_col and date_col in df_filtered.columns:
+            df_filtered[date_col] = pd.to_datetime(df_filtered[date_col], errors='coerce', dayfirst=True)
             if start_date:
                 df_filtered = df_filtered[df_filtered[date_col] >= pd.to_datetime(start_date)]
             if end_date:
