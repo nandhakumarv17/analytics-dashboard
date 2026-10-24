@@ -18,7 +18,7 @@ GLOBAL_HEAD = """
     :root {
         --bg-main: #f2f2f7;
         --glass-bg: rgba(255, 255, 255, 0.78);
-        --glass-sidebar: rgba(255, 255, 255, 0.7);
+        --glass-sidebar: rgba(255, 255, 255, 0.85);
         --glass-border: rgba(255, 255, 255, 0.85);
         --text-primary: #1d1d1f;
         --text-secondary: #86868b;
@@ -89,11 +89,11 @@ GLOBAL_HEAD = """
     .drag-handle { cursor: grab; color: #aeaeb2; margin-right: 6px; font-weight: bold; user-select: none; }
     .drag-handle:active { cursor: grabbing; }
 
-    /* Responsive Layout Engine */
-    body.desktop-mode { overflow: hidden; }
-    body.desktop-mode .app-layout { display: flex; flex-direction: row; height: 100vh; padding-top: 56px; box-sizing: border-box; }
-    body.desktop-mode .sidebar { width: 360px; background: var(--glass-sidebar); backdrop-filter: blur(40px) saturate(180%); border-right: 1px solid rgba(0,0,0,0.08); padding: 20px 16px; overflow-y: auto; flex-shrink: 0; box-sizing: border-box; }
-    body.desktop-mode .main-content { flex: 1; padding: 20px 24px; overflow-y: auto; background: var(--bg-main); box-sizing: border-box; }
+    /* Responsive Layout Engine - Fixed Desktop Horizontal Scroll Trap */
+    body.desktop-mode { overflow: auto; }
+    body.desktop-mode .app-layout { display: flex; flex-direction: row; min-height: 100vh; padding-top: 56px; box-sizing: border-box; }
+    body.desktop-mode .sidebar { width: 360px; background: var(--glass-sidebar); backdrop-filter: blur(40px) saturate(180%); border-right: 1px solid rgba(0,0,0,0.08); padding: 20px 16px; overflow-y: auto; flex-shrink: 0; box-sizing: border-box; height: calc(100vh - 56px); position: sticky; top: 56px; }
+    body.desktop-mode .main-content { flex: 1; padding: 20px 24px; overflow-x: auto; background: var(--bg-main); box-sizing: border-box; min-width: 0; }
     body.desktop-mode .header-actions { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; flex-wrap: wrap; gap: 10px; }
     
     body.mobile-mode { overflow: auto; }
@@ -324,6 +324,60 @@ WORKSPACE_HTML = """
                 </div>
                 {% endif %}
 
+                <!-- Multi-select Filter: SPC Name -->
+                {% if spc_list %}
+                <div class="form-group">
+                    <div class="form-label-header">
+                        <label class="form-label">Filter by SPC Name</label>
+                        <button type="button" class="section-clear" onclick="clearSection('spc')">Clear</button>
+                    </div>
+                    <div class="checkbox-group" style="max-height: 100px;">
+                        {% for spc in spc_list %}
+                        <label class="checkbox-item">
+                            <input type="checkbox" name="spc_filters" value="{{ spc }}"> 
+                            <span style="overflow:hidden; text-overflow:ellipsis;">{{ spc }}</span>
+                        </label>
+                        {% endfor %}
+                    </div>
+                </div>
+                {% endif %}
+
+                <!-- Multi-select Filter: SEG1 -->
+                {% if seg1_list %}
+                <div class="form-group">
+                    <div class="form-label-header">
+                        <label class="form-label">Filter by SEG1</label>
+                        <button type="button" class="section-clear" onclick="clearSection('seg1')">Clear</button>
+                    </div>
+                    <div class="checkbox-group" style="max-height: 100px;">
+                        {% for seg in seg1_list %}
+                        <label class="checkbox-item">
+                            <input type="checkbox" name="seg1_filters" value="{{ seg }}"> 
+                            <span style="overflow:hidden; text-overflow:ellipsis;">{{ seg }}</span>
+                        </label>
+                        {% endfor %}
+                    </div>
+                </div>
+                {% endif %}
+
+                <!-- Multi-select Filter: Family Name -->
+                {% if family_list %}
+                <div class="form-group">
+                    <div class="form-label-header">
+                        <label class="form-label">Filter by Family Name</label>
+                        <button type="button" class="section-clear" onclick="clearSection('family')">Clear</button>
+                    </div>
+                    <div class="checkbox-group" style="max-height: 100px;">
+                        {% for fam in family_list %}
+                        <label class="checkbox-item">
+                            <input type="checkbox" name="family_filters" value="{{ fam }}"> 
+                            <span style="overflow:hidden; text-overflow:ellipsis;">{{ fam }}</span>
+                        </label>
+                        {% endfor %}
+                    </div>
+                </div>
+                {% endif %}
+
                 <!-- Option to choose which columns should be listed in sidebars with Show/Hide Button -->
                 <div class="form-group" style="background: rgba(0,113,227,0.03); padding: 10px; border-radius: 12px; border: 1px dashed rgba(0,113,227,0.2);">
                     <div class="form-label-header">
@@ -455,6 +509,12 @@ WORKSPACE_HTML = """
                 document.querySelectorAll('input[name="week_num"]').forEach(r => r.checked = false);
             } else if (section === 'status') {
                 document.querySelectorAll('input[name="status_filters"]').forEach(cb => cb.checked = false);
+            } else if (section === 'spc') {
+                document.querySelectorAll('input[name="spc_filters"]').forEach(cb => cb.checked = false);
+            } else if (section === 'seg1') {
+                document.querySelectorAll('input[name="seg1_filters"]').forEach(cb => cb.checked = false);
+            } else if (section === 'family') {
+                document.querySelectorAll('input[name="family_filters"]').forEach(cb => cb.checked = false);
             } else if (section === 'rows') {
                 document.querySelectorAll('input[name="index_cols"]').forEach(cb => cb.checked = false);
             } else if (section === 'cols') {
@@ -658,6 +718,17 @@ def get_metadata():
             pass
     return upload_time
 
+def get_filter_lists(df):
+    spc_col = next((c for c in df.columns if 'spc' in str(c).lower() and 'name' in str(c).lower()), 'SPC Name' if 'SPC Name' in df.columns else '')
+    seg1_col = next((c for c in df.columns if 'seg1' in str(c).lower()), 'SEG1' if 'SEG1' in df.columns else '')
+    family_col = next((c for c in df.columns if 'family' in str(c).lower()), 'Family Name' if 'Family Name' in df.columns else '')
+    
+    spc_list = df[spc_col].dropna().unique().tolist() if spc_col and spc_col in df.columns else []
+    seg1_list = df[seg1_col].dropna().unique().tolist() if seg1_col and seg1_col in df.columns else []
+    family_list = df[family_col].dropna().unique().tolist() if family_col and family_col in df.columns else []
+    
+    return sorted([str(x) for x in spc_list]), sorted([str(x) for x in seg1_list]), sorted([str(x) for x in family_list])
+
 @app.route("/", methods=["GET", "POST"])
 def home():
     df = load_data()
@@ -670,8 +741,9 @@ def home():
                 status_col = candidate
                 break
         unique_statuses = df[status_col].dropna().unique().tolist() if status_col else []
+        spc_list, seg1_list, family_list = get_filter_lists(df)
         upload_time = get_metadata()
-        return render_template_string(WORKSPACE_HTML, all_cols=all_cols, default_date_col=default_date_col, status_col=status_col, unique_statuses=unique_statuses, upload_time=upload_time)
+        return render_template_string(WORKSPACE_HTML, all_cols=all_cols, default_date_col=default_date_col, status_col=status_col, unique_statuses=unique_statuses, spc_list=spc_list, seg1_list=seg1_list, family_list=family_list, upload_time=upload_time)
     return render_template_string(UPLOAD_HTML)
 
 @app.route("/dashboard", methods=["GET", "POST"])
@@ -695,9 +767,10 @@ def dashboard():
             break
             
     unique_statuses = df[status_col].dropna().unique().tolist() if status_col else []
+    spc_list, seg1_list, family_list = get_filter_lists(df)
     upload_time = get_metadata()
     
-    return render_template_string(WORKSPACE_HTML, all_cols=all_cols, default_date_col=default_date_col, status_col=status_col, unique_statuses=unique_statuses, upload_time=upload_time)
+    return render_template_string(WORKSPACE_HTML, all_cols=all_cols, default_date_col=default_date_col, status_col=status_col, unique_statuses=unique_statuses, spc_list=spc_list, seg1_list=seg1_list, family_list=family_list, upload_time=upload_time)
 
 @app.route("/calculate", methods=["GET", "POST"])
 def calculate():
@@ -713,6 +786,9 @@ def calculate():
     columns_cols = request.form.getlist('columns_cols')
     agg_funcs = request.form.getlist('agg_funcs')
     status_filters = request.form.getlist('status_filters')
+    spc_filters = request.form.getlist('spc_filters')
+    seg1_filters = request.form.getlist('seg1_filters')
+    family_filters = request.form.getlist('family_filters')
     show_row_total = request.form.get('show_row_total') == 'true'
     
     num_cols = df.select_dtypes(include='number').columns.tolist()
@@ -725,8 +801,8 @@ def calculate():
         filter_texts = []
         df_filtered = df.copy()
         
-        # Handle SPC Comparison View (Day-wise / Week-wise automatically injected into index or columns)
-        spc_col = 'SPC Name' if 'SPC Name' in df_filtered.columns else next((c for c in df_filtered.columns if 'spc' in str(c).lower()), "")
+        # Handle SPC Comparison View (Day-wise / Week-wise)
+        spc_col = next((c for c in df_filtered.columns if 'spc' in str(c).lower() and 'name' in str(c).lower()), 'SPC Name' if 'SPC Name' in df_filtered.columns else '')
         if spc_compare in ['day', 'week'] and spc_col and date_col:
             df_filtered[date_col] = pd.to_datetime(df_filtered[date_col], errors='coerce', dayfirst=True)
             if spc_compare == 'day':
@@ -734,7 +810,6 @@ def calculate():
                 if spc_col not in index_cols: index_cols = [spc_col]
                 if '_Day_Comp' not in columns_cols: columns_cols = ['_Day_Comp']
             elif spc_compare == 'week':
-                # Map date to week number in month
                 def get_week_of_month(dt):
                     if pd.isna(dt): return 'Unknown'
                     dom = dt.day
@@ -781,10 +856,28 @@ def calculate():
                     e_str = pd.to_datetime(end_date).strftime('%d-%b-%y') if end_date else 'End'
                     filter_texts.append(f"<b>{date_col}</b>: {s_str} to {e_str}")
 
+        # Status filter
         status_col = next((c for c in ['FinalStatus', 'Final Record Status', 'Validation Remarks'] if c in df_filtered.columns), "")
         if status_col and status_filters:
             df_filtered = df_filtered[df_filtered[status_col].isin(status_filters)]
             filter_texts.append(f"<b>{status_col}</b>: {', '.join(status_filters)}")
+
+        # SPC Name filter
+        if spc_col and spc_filters and spc_col in df_filtered.columns:
+            df_filtered = df_filtered[df_filtered[spc_col].astype(str).isin(spc_filters)]
+            filter_texts.append(f"<b>SPC Name</b>: {', '.join(spc_filters)}")
+
+        # SEG1 filter
+        seg1_col = next((c for c in df_filtered.columns if 'seg1' in str(c).lower()), 'SEG1' if 'SEG1' in df_filtered.columns else '')
+        if seg1_col and seg1_filters and seg1_col in df_filtered.columns:
+            df_filtered = df_filtered[df_filtered[seg1_col].astype(str).isin(seg1_filters)]
+            filter_texts.append(f"<b>SEG1</b>: {', '.join(seg1_filters)}")
+
+        # Family Name filter
+        family_col = next((c for c in df_filtered.columns if 'family' in str(c).lower()), 'Family Name' if 'Family Name' in df_filtered.columns else '')
+        if family_col and family_filters and family_col in df_filtered.columns:
+            df_filtered = df_filtered[df_filtered[family_col].astype(str).isin(family_filters)]
+            filter_texts.append(f"<b>Family Name</b>: {', '.join(family_filters)}")
 
         filter_text = f"<p style='color:#86868b; font-size:13px; margin:0;'>Filtered by {' | '.join(filter_texts)}</p>" if filter_texts else ""
 
@@ -872,15 +965,8 @@ def calculate():
             pivot_df[c] = pivot_df[c].apply(format_indian_number)
         
         table_html = pivot_df.to_html(classes='excel-table', border=0, index=False, justify='left')
-        
-        # Add highlight classes to the side total column (TOTAL) if present
         table_html = table_html.replace('<th>TOTAL</th>', '<th class="total-col-header">TOTAL</th>')
         table_html = table_html.replace('<td>', '<td class="number-cell">')
-        
-        # Inject class for cells belonging to TOTAL column
-        if show_row_total:
-            # Simple tag replacement for cells in the last column before total row
-            pass
 
         return jsonify({"table_html": table_html, "filter_text": filter_text})
         
