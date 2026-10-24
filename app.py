@@ -109,13 +109,14 @@ GLOBAL_HEAD = """
 
     /* TABLE CSS FIXES FOR "STUFFED" DATES */
     .table-container { background: var(--glass-bg); backdrop-filter: blur(25px); border-radius: 20px; box-shadow: var(--shadow-glass); border: 1px solid var(--glass-border); overflow: hidden; width: 100%; box-sizing: border-box; display: flex; flex-direction: column; animation: fadeIn 0.5s ease; }
+    .filter-text-bar { padding: 14px 20px; border-bottom: 1px solid rgba(0,0,0,0.06); background: rgba(255,255,255,0.6); }
     .table-scroll { max-height: calc(100vh - 280px); overflow-y: auto; overflow-x: auto; -webkit-overflow-scrolling: touch; position: relative; }
     
     .excel-table { width: max-content; min-width: 100%; border-collapse: separate; border-spacing: 0; font-size: 13px; background: transparent; }
     .excel-table th, .excel-table td { padding: 14px 20px; text-align: left; border-bottom: 1px solid rgba(0,0,0,0.06); white-space: nowrap; position: relative; }
     
     .excel-table th { 
-        background-color: rgba(30, 30, 34, 0.95); 
+        background-color: rgba(30, 30, 34, 0.85); 
         backdrop-filter: blur(20px) saturate(180%); 
         font-family: 'SF Mono', ui-monospace, Menlo, Monaco, monospace;
         font-size: 11px; 
@@ -142,12 +143,19 @@ GLOBAL_HEAD = """
     
     .excel-table th.total-col-header { color: #ffffff !important; background-color: rgba(20, 20, 24, 0.98); border-left: 1px solid rgba(255,255,255,0.1); }
     .excel-table td.total-col-cell { background-color: rgba(0, 113, 227, 0.03); font-weight: 600; border-left: 1px solid rgba(0, 113, 227, 0.1); }
-    .excel-table tbody tr:last-child td { font-weight: 700; background-color: rgba(0, 113, 227, 0.12); color: var(--blue-apple); border-top: 2px solid var(--blue-apple); border-bottom: none; }
+    .excel-table tbody tr:last-child td { font-weight: 700; background-color: rgba(0, 113, 227, 0.12); color: var(--blue-apple); border-top: 2px solid var(--blue-apple); border-bottom: none; box-shadow: inset 0 1px 0 rgba(255,255,255,0.6); }
     
     .number-cell { font-variant-numeric: tabular-nums; }
     .pct-positive { color: #34c759; font-weight: 600; }
     .pct-negative { color: #ff3b30; font-weight: 600; }
     .pct-neutral { color: var(--text-secondary); }
+
+    /* Solid Colors for Image Export Hack */
+    body.export-mode .kpi-card { background: #ffffff !important; backdrop-filter: none !important; border: 1px solid rgba(0,0,0,0.1) !important; }
+    body.export-mode .table-container { background: #ffffff !important; backdrop-filter: none !important; }
+    body.export-mode .filter-text-bar { background: #ffffff !important; }
+    body.export-mode .excel-table th { background-color: #1e1e22 !important; backdrop-filter: none !important; }
+    body.export-mode .excel-table th.total-col-header { background-color: #141418 !important; color: #ffffff !important; }
 
     /* Layout & Sidebar Resizer */
     body.desktop-mode { overflow: hidden; }
@@ -616,7 +624,6 @@ WORKSPACE_HTML = """
                 const data = await response.json();
                 
                 if (response.ok) {
-                    // Update KPIs
                     const kpiBanner = document.getElementById('kpi-banner');
                     if(data.kpi_html) {
                         kpiBanner.innerHTML = data.kpi_html;
@@ -625,10 +632,9 @@ WORKSPACE_HTML = """
                         kpiBanner.style.display = 'none';
                     }
                     
-                    // Update Table
                     let html = "";
                     if (data.filter_text) {
-                        html += `<div style="padding: 14px 20px; border-bottom: 1px solid rgba(0,0,0,0.06); background: rgba(255,255,255,0.8);">${data.filter_text}</div>`;
+                        html += `<div class="filter-text-bar">${data.filter_text}</div>`;
                     }
                     html += data.table_html;
                     document.getElementById('table-wrapper').innerHTML = html;
@@ -681,21 +687,22 @@ WORKSPACE_HTML = """
             updateDashboard();
         });
         
-        // Accurate JPEG Download Logic for Scrolled Tables
+        // Solid Color Screenshot Fix for html2canvas
         function exportImage() {
             const captureArea = document.querySelector('.main-content');
             const scrollArea = document.getElementById('table-wrapper');
             
-            // Save original styles
             const origMaxHeight = scrollArea.style.maxHeight;
             const origOverflow = scrollArea.style.overflow;
             
-            // Temporarily expand the container to full height so html2canvas sees everything
             scrollArea.style.maxHeight = 'none';
             scrollArea.style.overflow = 'visible';
             
+            // Add temporary solid-color export mode
+            document.body.classList.add('export-mode');
+            
             setTimeout(() => {
-                html2canvas(captureArea, { scale: 2, backgroundColor: '#f2f2f7', useCORS: true }).then(canvas => {
+                html2canvas(captureArea, { scale: 2, backgroundColor: '#f2f2f7', useCORS: true, logging: false }).then(canvas => {
                     const imgData = canvas.toDataURL('image/jpeg', 1.0);
                     
                     if (/Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent)) {
@@ -740,14 +747,14 @@ WORKSPACE_HTML = """
                         document.body.appendChild(modal);
                     } else {
                         let link = document.createElement('a');
-                        link.download = 'Dashboard_Export.jpeg';
+                        link.download = 'Executive_Report_Export.jpeg';
                         link.href = imgData;
                         link.click();
                     }
                     
-                    // Restore original styles
                     scrollArea.style.maxHeight = origMaxHeight;
                     scrollArea.style.overflow = origOverflow;
+                    document.body.classList.remove('export-mode');
                 });
             }, 150);
         }
@@ -827,7 +834,6 @@ def login():
         session['pending_user'] = user_id
         session['expected_otp'] = otp
         
-        # --- SEND LIVE EMAIL VIA GMAIL ---
         sender_email = os.environ.get('EMAIL_ADDRESS')
         sender_password = os.environ.get('EMAIL_PASSWORD')
         
@@ -839,17 +845,16 @@ def login():
                 msg['From'] = f"Analytics Pro <{sender_email}>"
                 msg['To'] = user_id
 
-                server = smtplib.SMTP_SSL('smtp.gmail.com', 465)
+                server = smtplib.SMTP('smtp.gmail.com', 587, timeout=10)
+                server.starttls()
                 server.login(sender_email, sender_password)
                 server.send_message(msg)
                 server.quit()
-                print(f"[EMAIL] Sent to {user_id}")
+                print(f"[EMAIL] Successfully sent to {user_id}")
             except Exception as e:
                 print(f"[EMAIL ERROR] Failed to send: {e}")
-                # Print to logs so you can still log in if email fails
                 print(f"\n\n[SECURITY] 🔒 OTP generated for {user_id}: {otp}\n\n")
         else:
-            # Fallback if vars are missing
             print(f"\n\n[SECURITY] 🔒 OTP generated for {user_id}: {otp}\n\n")
             
         return redirect(url_for('verify'))
@@ -941,7 +946,6 @@ def calculate():
         filter_texts = []
         df_filtered = df.copy()
         
-        # Filtering Engine
         if date_col and date_col in df_filtered.columns:
             df_filtered[date_col] = pd.to_datetime(df_filtered[date_col], errors='coerce', dayfirst=True)
             if week_nums:
@@ -991,7 +995,6 @@ def calculate():
             df_filtered = df_filtered[df_filtered[family_col].astype(str).isin(family_filters)]
             filter_texts.append(f"<b>Family</b>: {', '.join(family_filters)}")
 
-        # Calculate Executive KPIs based strictly on the filtered slice
         kpi_html = ""
         if not df_filtered.empty and value_cols:
             total_val = format_indian_number(df_filtered[value_cols[0]].sum())
