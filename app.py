@@ -1,31 +1,17 @@
 import os
 import io
 import json
-import random
-import smtplib
-from email.message import EmailMessage
-from functools import wraps
 from datetime import datetime, timedelta
-from flask import Flask, request, render_template_string, send_file, jsonify, session, redirect, url_for
+from flask import Flask, request, render_template_string, send_file, jsonify, redirect, url_for
 import pandas as pd
 import numpy as np
 
 app = Flask(__name__)
-app.secret_key = os.environ.get('SECRET_KEY', 'liquid_glass_super_secret_key_2026')
 
 UPLOAD_DIR = "/tmp/dashboard_uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 DATA_FILE_PATH = os.path.join(UPLOAD_DIR, "shared_data.pkl")
 META_FILE_PATH = os.path.join(UPLOAD_DIR, "metadata.pkl")
-
-# --- AUTHENTICATION MIDDLEWARE ---
-def login_required(f):
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        if not session.get('authenticated'):
-            return redirect(url_for('login'))
-        return f(*args, **kwargs)
-    return decorated_function
 
 # --- APPLE iOS "LIQUID GLASS" THEME & STICKY MOBILE ENGINE ---
 GLOBAL_HEAD = """
@@ -54,8 +40,6 @@ GLOBAL_HEAD = """
     .nav { background: rgba(255, 255, 255, 0.85); backdrop-filter: saturate(200%) blur(30px); border-bottom: 1px solid rgba(0, 0, 0, 0.08); padding: 0 24px; height: 60px; display: flex; justify-content: space-between; align-items: center; font-size: 16px; font-weight: 600; color: var(--text-primary); position: fixed; top: 0; width: 100%; box-sizing: border-box; z-index: 1000; }
     .view-toggle { background: rgba(0,0,0,0.04); padding: 8px 14px; border-radius: 980px; font-size: 12px; font-weight: 500; cursor: pointer; display: flex; align-items: center; transition: 0.2s; border: none; color: var(--text-primary); flex-shrink: 0; }
     .view-toggle:hover { background: rgba(0,0,0,0.08); }
-    .logout-btn { color: var(--text-secondary); text-decoration: none; font-size: 13px; font-weight: 500; margin-left: 16px; transition: 0.2s; }
-    .logout-btn:hover { color: #ff3b30; }
     
     .upload-container { max-width: 480px; margin: 120px auto 40px auto; padding: 0 16px; box-sizing: border-box; animation: fadeIn 0.4s ease; }
     .title { font-size: 36px; font-weight: 700; letter-spacing: -0.015em; text-align: center; margin: 0 0 8px 0; }
@@ -150,12 +134,20 @@ GLOBAL_HEAD = """
     .pct-negative { color: #ff3b30; font-weight: 600; }
     .pct-neutral { color: var(--text-secondary); }
 
-    /* Solid Colors for Image Export Hack */
-    body.export-mode .kpi-card { background: #ffffff !important; backdrop-filter: none !important; border: 1px solid rgba(0,0,0,0.1) !important; }
-    body.export-mode .table-container { background: #ffffff !important; backdrop-filter: none !important; }
-    body.export-mode .filter-text-bar { background: #ffffff !important; }
-    body.export-mode .excel-table th { background-color: #1e1e22 !important; backdrop-filter: none !important; }
-    body.export-mode .excel-table th.total-col-header { background-color: #141418 !important; color: #ffffff !important; }
+    /* HIGH-CONTRAST EXPORT MODE HACK */
+    body.export-mode .main-content { background: #ffffff !important; }
+    body.export-mode .kpi-card { background: #f2f2f7 !important; backdrop-filter: none !important; border: 1px solid #d1d1d6 !important; box-shadow: none !important; }
+    body.export-mode .kpi-card .kpi-label { color: #86868b !important; }
+    body.export-mode .kpi-card .kpi-val { color: #000000 !important; }
+    body.export-mode .table-container { background: #ffffff !important; backdrop-filter: none !important; border: 1px solid #d1d1d6 !important; box-shadow: none !important; }
+    body.export-mode .filter-text-bar { background: #f2f2f7 !important; color: #000000 !important; border-bottom: 1px solid #d1d1d6 !important; }
+    body.export-mode .excel-table th { background-color: #f2f2f7 !important; color: #000000 !important; backdrop-filter: none !important; border-bottom: 1px solid #d1d1d6 !important; border-right: 1px solid #d1d1d6 !important; }
+    body.export-mode .excel-table td { background-color: #ffffff !important; color: #000000 !important; border-bottom: 1px solid #e5e5ea !important; border-right: 1px solid #e5e5ea !important; }
+    body.export-mode .excel-table th.total-col-header { background-color: #e5e5ea !important; color: #000000 !important; }
+    body.export-mode .excel-table td.total-col-cell { background-color: #f8f8f8 !important; color: #000000 !important; }
+    body.export-mode .excel-table tbody tr:last-child td { background-color: #e5e5ea !important; color: #000000 !important; border-top: 2px solid #000000 !important; }
+    body.export-mode .pct-positive { color: #28a745 !important; }
+    body.export-mode .pct-negative { color: #dc3545 !important; }
 
     /* Layout & Sidebar Resizer */
     body.desktop-mode { overflow: hidden; }
@@ -212,59 +204,6 @@ GLOBAL_HEAD = """
 </script>
 """
 
-LOGIN_HTML = """
-<!DOCTYPE html>
-<html>
-<head><title>Login - Analytics Pro</title><meta name="viewport" content="width=device-width, initial-scale=1.0">""" + GLOBAL_HEAD + """</head>
-<body>
-    <div class="nav">
-        <div>Analytics Pro</div>
-    </div>
-    <div class="upload-container">
-        <h1 class="title">Corporate Access.</h1>
-        <p class="subtitle">Enter your registered email to receive a One-Time Password.</p>
-        <div class="card">
-            <form action="/login" method="post">
-                <div class="form-group">
-                    <label class="form-label" style="margin-bottom: 8px;">Work Email</label>
-                    <input type="email" name="user_id" required class="form-input" placeholder="e.g. executive@brand.com">
-                </div>
-                <button type="submit" class="btn-primary">Authenticate</button>
-            </form>
-        </div>
-    </div>
-</body>
-</html>
-"""
-
-VERIFY_HTML = """
-<!DOCTYPE html>
-<html>
-<head><title>Verify OTP - Analytics Pro</title><meta name="viewport" content="width=device-width, initial-scale=1.0">""" + GLOBAL_HEAD + """</head>
-<body>
-    <div class="nav">
-        <div>Analytics Pro</div>
-    </div>
-    <div class="upload-container">
-        <h1 class="title">Verify Identity.</h1>
-        <p class="subtitle">Enter the 6-digit code sent to your inbox.</p>
-        <div class="card">
-            {% if error %}
-            <div style="background: rgba(255,59,48,0.1); color: #ff3b30; padding: 12px; border-radius: 12px; margin-bottom: 16px; font-size: 13px; font-weight: 600; text-align: center;">{{ error }}</div>
-            {% endif %}
-            <form action="/verify" method="post">
-                <div class="form-group">
-                    <label class="form-label" style="margin-bottom: 8px;">Secure OTP</label>
-                    <input type="text" name="otp" required class="form-input" placeholder="● ● ● ● ● ●" maxlength="6" style="text-align: center; font-size: 24px; letter-spacing: 6px; font-weight: 600;">
-                </div>
-                <button type="submit" class="btn-primary">Login Securely</button>
-            </form>
-        </div>
-    </div>
-</body>
-</html>
-"""
-
 UPLOAD_HTML = """
 <!DOCTYPE html>
 <html>
@@ -274,7 +213,6 @@ UPLOAD_HTML = """
         <div>Analytics Pro</div>
         <div>
             <button class="view-toggle" onclick="toggleViewMode()" id="viewToggleBtn">💻 Desktop Site</button>
-            <a href="/logout" class="logout-btn">Logout</a>
         </div>
     </div>
     <div class="upload-container">
@@ -302,7 +240,6 @@ WORKSPACE_HTML = """
         <div>Analytics Pro</div>
         <div style="display: flex; align-items: center;">
             <button class="view-toggle" onclick="toggleViewMode()" id="viewToggleBtn">💻 Desktop Site</button>
-            <a href="/logout" class="logout-btn">Logout</a>
         </div>
     </div>
     
@@ -503,7 +440,7 @@ WORKSPACE_HTML = """
         <div class="main-content">
             <div class="header-actions">
                 <h2 style="font-size: 28px; font-weight: 700; margin: 0; letter-spacing: -0.015em;">Executive Dashboard</h2>
-                <div class="dropdown">
+                <div class="dropdown" id="exportDropdownContainer">
                     <button onclick="toggleExportMenu()" class="btn-primary">Export ▾</button>
                     <div id="exportDropdown" class="dropdown-content">
                         <button onclick="exportImage(); toggleExportMenu();" class="dropdown-item">🖼️ Save Image</button>
@@ -687,22 +624,24 @@ WORKSPACE_HTML = """
             updateDashboard();
         });
         
-        // Solid Color Screenshot Fix for html2canvas
+        // Bulletproof Solid Color Export Mode
         function exportImage() {
             const captureArea = document.querySelector('.main-content');
             const scrollArea = document.getElementById('table-wrapper');
+            const exportBtn = document.getElementById('exportDropdownContainer');
             
             const origMaxHeight = scrollArea.style.maxHeight;
             const origOverflow = scrollArea.style.overflow;
             
             scrollArea.style.maxHeight = 'none';
             scrollArea.style.overflow = 'visible';
+            exportBtn.style.display = 'none'; 
             
-            // Add temporary solid-color export mode
             document.body.classList.add('export-mode');
             
+            // Wait 500ms for browser to completely repaint solid colors
             setTimeout(() => {
-                html2canvas(captureArea, { scale: 2, backgroundColor: '#f2f2f7', useCORS: true, logging: false }).then(canvas => {
+                html2canvas(captureArea, { scale: 2, backgroundColor: '#ffffff', useCORS: true, logging: false }).then(canvas => {
                     const imgData = canvas.toDataURL('image/jpeg', 1.0);
                     
                     if (/Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent)) {
@@ -747,16 +686,17 @@ WORKSPACE_HTML = """
                         document.body.appendChild(modal);
                     } else {
                         let link = document.createElement('a');
-                        link.download = 'Executive_Report_Export.jpeg';
+                        link.download = 'Executive_Report.jpeg';
                         link.href = imgData;
                         link.click();
                     }
                     
                     scrollArea.style.maxHeight = origMaxHeight;
                     scrollArea.style.overflow = origOverflow;
+                    exportBtn.style.display = 'inline-block';
                     document.body.classList.remove('export-mode');
                 });
-            }, 150);
+            }, 500);
         }
     </script>
 </body>
@@ -826,60 +766,7 @@ def format_indian_number(x):
 
 # --- ROUTES ---
 
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    if request.method == 'POST':
-        user_id = request.form.get('user_id')
-        otp = str(random.randint(100000, 999999))
-        session['pending_user'] = user_id
-        session['expected_otp'] = otp
-        
-        sender_email = os.environ.get('EMAIL_ADDRESS')
-        sender_password = os.environ.get('EMAIL_PASSWORD')
-        
-        if sender_email and sender_password and '@' in user_id:
-            try:
-                msg = EmailMessage()
-                msg.set_content(f"Your Analytics Pro verification code is: {otp}\n\nPlease do not share this code with anyone.")
-                msg['Subject'] = 'Analytics Pro Access Code'
-                msg['From'] = f"Analytics Pro <{sender_email}>"
-                msg['To'] = user_id
-
-                server = smtplib.SMTP('smtp.gmail.com', 587, timeout=10)
-                server.starttls()
-                server.login(sender_email, sender_password)
-                server.send_message(msg)
-                server.quit()
-                print(f"[EMAIL] Successfully sent to {user_id}")
-            except Exception as e:
-                print(f"[EMAIL ERROR] Failed to send: {e}")
-                print(f"\n\n[SECURITY] 🔒 OTP generated for {user_id}: {otp}\n\n")
-        else:
-            print(f"\n\n[SECURITY] 🔒 OTP generated for {user_id}: {otp}\n\n")
-            
-        return redirect(url_for('verify'))
-    return render_template_string(LOGIN_HTML)
-
-@app.route("/verify", methods=["GET", "POST"])
-def verify():
-    error = None
-    if request.method == 'POST':
-        user_otp = request.form.get('otp')
-        if user_otp == session.get('expected_otp'):
-            session['authenticated'] = True
-            session.pop('expected_otp', None)
-            return redirect(url_for('home'))
-        else:
-            error = "Invalid code. Please try again."
-    return render_template_string(VERIFY_HTML, error=error)
-
-@app.route("/logout")
-def logout():
-    session.clear()
-    return redirect(url_for('login'))
-
 @app.route("/", methods=["GET", "POST"])
-@login_required
 def home():
     df = load_data()
     if df is not None:
@@ -897,12 +784,10 @@ def home():
     return render_template_string(UPLOAD_HTML)
 
 @app.route("/upload", methods=["GET"])
-@login_required
 def upload_page():
     return render_template_string(UPLOAD_HTML)
 
 @app.route("/dashboard", methods=["POST"])
-@login_required
 def dashboard():
     if 'file' in request.files and request.files['file'].filename != '':
         file = request.files['file']
@@ -911,7 +796,6 @@ def dashboard():
     return redirect(url_for('home'))
 
 @app.route("/calculate", methods=["POST"])
-@login_required
 def calculate():
     df = load_data()
     if df is None: return jsonify({"error": "No data available."}), 400
@@ -1137,7 +1021,6 @@ def calculate():
         return jsonify({"error": f"An error occurred: {str(e)}"}), 500
 
 @app.route("/download", methods=["GET"])
-@login_required
 def download():
     summary_path = os.path.join(UPLOAD_DIR, "summary_data.pkl")
     if not os.path.exists(summary_path): return "No data to download", 400
