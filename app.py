@@ -11,6 +11,15 @@ import numpy as np
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'liquid_glass_super_secret_key_2026')
 
+# --- AUTHENTICATION MIDDLEWARE ---
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not session.get('authenticated'):
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated_function
+
 UPLOAD_DIR = "/tmp/dashboard_uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 DATA_FILE_PATH = os.path.join(UPLOAD_DIR, "shared_data.pkl")
@@ -43,7 +52,6 @@ GLOBAL_HEAD = """
     .subtitle { font-size: 17px; font-weight: 400; text-align: center; color: var(--text-secondary); margin: 0 0 32px 0; }
     .card { background: var(--glass-bg); backdrop-filter: blur(25px) saturate(180%); border-radius: 24px; padding: 32px; box-shadow: var(--shadow-glass); border: 1px solid var(--glass-border); box-sizing: border-box; }
     
-    /* Simplified Sidebar Elements */
     .step-card { background: rgba(255,255,255,0.7); border: 1px solid rgba(0,0,0,0.06); border-radius: 16px; margin-bottom: 16px; padding: 16px; box-shadow: 0 2px 8px rgba(0,0,0,0.02); }
     .step-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; border-bottom: 1px solid rgba(0,0,0,0.05); padding-bottom: 8px; }
     .step-title { font-size: 14px; font-weight: 700; color: var(--text-primary); margin: 0; display: flex; align-items: center; }
@@ -497,7 +505,6 @@ WORKSPACE_HTML = """
         </div>
     </div>
 
-    <!-- Injecting Data Map for Cascading Filters -->
     <script>
         const filterMap = {{ filter_mapping_json|safe }};
     </script>
