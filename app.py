@@ -3,6 +3,7 @@ import io
 from datetime import datetime, timedelta
 from flask import Flask, request, render_template_string, send_file, jsonify
 import pandas as pd
+import numpy as np
 
 app = Flask(__name__)
 
@@ -39,20 +40,26 @@ GLOBAL_HEAD = """
     
     .card { background: var(--glass-bg); backdrop-filter: blur(25px) saturate(180%); border-radius: 24px; padding: 24px; box-shadow: var(--shadow-glass); border: 1px solid var(--glass-border); box-sizing: border-box; }
     
-    .form-group { margin-bottom: 18px; }
-    .form-label-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
-    .form-label { font-size: 13px; font-weight: 600; color: var(--text-primary); margin: 0; }
-    .section-clear { background: none; border: none; color: var(--blue-apple); font-size: 11px; font-weight: 500; cursor: pointer; padding: 0; }
-    .section-clear:hover { text-decoration: underline; }
+    /* Clean Accordion Sidebar Styles */
+    .sidebar-section { background: rgba(255,255,255,0.6); border: 1px solid rgba(0,0,0,0.06); border-radius: 14px; margin-bottom: 12px; padding: 0 12px; transition: background 0.2s; }
+    .sidebar-section[open] { padding-bottom: 12px; background: rgba(255,255,255,0.85); box-shadow: 0 2px 8px rgba(0,0,0,0.02); }
+    .section-title { font-size: 13px; font-weight: 600; color: var(--text-primary); padding: 12px 0; cursor: pointer; display: flex; justify-content: space-between; align-items: center; list-style: none; user-select: none; }
+    .section-title::-webkit-details-marker { display: none; }
+    .section-title i { font-style: normal; margin-right: 6px; font-size: 14px; }
+    .section-title .indicator { font-size: 10px; color: var(--text-secondary); transition: transform 0.2s; }
+    .sidebar-section[open] .section-title .indicator { transform: rotate(180deg); }
+    
+    .section-clear { background: rgba(0,113,227,0.1); border: none; color: var(--blue-apple); font-size: 10px; font-weight: 600; cursor: pointer; padding: 4px 8px; border-radius: 6px; margin-left: auto; margin-right: 10px; transition: 0.2s; text-transform: uppercase; }
+    .section-clear:hover { background: rgba(0,113,227,0.2); }
 
-    .form-input { width: 100%; padding: 10px 12px; font-size: 13px; border: 1px solid rgba(0,0,0,0.1); border-radius: 12px; background-color: rgba(255,255,255,0.9); color: var(--text-primary); box-sizing: border-box; transition: all 0.2s ease; }
+    .form-input { width: 100%; padding: 10px 12px; font-size: 13px; border: 1px solid rgba(0,0,0,0.1); border-radius: 10px; background-color: rgba(255,255,255,0.9); color: var(--text-primary); box-sizing: border-box; transition: all 0.2s ease; margin-bottom: 8px; }
     .form-input:focus { border-color: var(--blue-apple); outline: none; box-shadow: 0 0 0 4px rgba(0, 113, 227, 0.15); }
     
-    .checkbox-group { background: rgba(255,255,255,0.6); border: 1px solid rgba(0,0,0,0.08); border-radius: 14px; padding: 8px; max-height: 120px; overflow-y: auto; backdrop-filter: blur(10px); }
-    .checkbox-item { display: flex; align-items: center; margin-bottom: 4px; font-size: 12px; cursor: pointer; padding: 3px 6px; border-radius: 6px; transition: background 0.15s; }
-    .checkbox-item:hover { background: rgba(0,0,0,0.03); }
+    .checkbox-group { background: rgba(0,0,0,0.02); border: 1px solid rgba(0,0,0,0.05); border-radius: 10px; padding: 8px; max-height: 140px; overflow-y: auto; }
+    .checkbox-item { display: flex; align-items: center; margin-bottom: 4px; font-size: 12px; cursor: pointer; padding: 4px 8px; border-radius: 6px; transition: background 0.15s; }
+    .checkbox-item:hover { background: rgba(0,0,0,0.04); }
     .checkbox-item:last-child { margin-bottom: 0; }
-    .checkbox-item input { margin-right: 8px; width: 15px; height: 15px; accent-color: var(--blue-apple); cursor: pointer; flex-shrink: 0; }
+    .checkbox-item input { margin-right: 8px; width: 14px; height: 14px; accent-color: var(--blue-apple); cursor: pointer; flex-shrink: 0; }
     
     .btn-primary { background-color: var(--blue-apple); color: white; border: none; border-radius: 980px; padding: 12px 20px; font-size: 14px; font-weight: 500; cursor: pointer; text-align: center; display: inline-flex; align-items: center; justify-content: center; text-decoration: none; box-sizing: border-box; transition: background 0.2s, transform 0.1s; }
     .btn-primary:hover { background-color: var(--blue-hover); }
@@ -72,7 +79,7 @@ GLOBAL_HEAD = """
     .excel-table { width: 100%; table-layout: fixed; border-collapse: separate; border-spacing: 0; font-size: 13px; background: transparent; word-wrap: break-word; min-width: 550px; }
     .excel-table th, .excel-table td { padding: 12px 14px; text-align: left; border-bottom: 1px solid rgba(0,0,0,0.06); overflow: hidden; text-overflow: ellipsis; position: relative; }
     
-    /* Highlighted Table Headers */
+    /* Highlighted Table Headers & Resizer */
     .excel-table th { background-color: rgba(0, 113, 227, 0.08); color: var(--blue-apple); font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; position: sticky; top: 0; z-index: 100; border-bottom: 2px solid rgba(0, 113, 227, 0.2); user-select: none; }
     .resizer { position: absolute; right: 0; top: 0; bottom: 0; width: 6px; cursor: col-resize; z-index: 101; }
     .resizer:hover { background-color: rgba(0, 113, 227, 0.4); }
@@ -80,19 +87,22 @@ GLOBAL_HEAD = """
     .excel-table td { white-space: nowrap; }
     .excel-table tr:hover td { background-color: rgba(0, 113, 227, 0.03); }
     
-    /* Highlight Side Total Column (TOTAL) and Footer Row (GRAND TOTAL) */
-    .excel-table th.total-col-header, .excel-table td.total-col-cell { background-color: rgba(0, 113, 227, 0.06); font-weight: 600; border-left: 1px solid rgba(0, 113, 227, 0.15); }
-    .excel-table tbody tr:last-child td { font-weight: 700; background-color: rgba(0, 113, 227, 0.15); color: var(--blue-apple); border-top: 2px solid var(--blue-apple); border-bottom: none; box-shadow: inset 0 1px 0 rgba(255,255,255,0.6); }
+    /* Highlight Side Total and Row Totals */
+    .excel-table th.total-col-header, .excel-table td.total-col-cell { background-color: rgba(0, 113, 227, 0.04); font-weight: 600; border-left: 1px solid rgba(0, 113, 227, 0.1); }
+    .excel-table tbody tr:last-child td { font-weight: 700; background-color: rgba(0, 113, 227, 0.12); color: var(--blue-apple); border-top: 2px solid var(--blue-apple); border-bottom: none; box-shadow: inset 0 1px 0 rgba(255,255,255,0.6); }
     
     .number-cell { font-variant-numeric: tabular-nums; }
+    .pct-positive { color: #34c759; font-weight: 600; }
+    .pct-negative { color: #ff3b30; font-weight: 600; }
+    .pct-neutral { color: var(--text-secondary); }
     
     .drag-handle { cursor: grab; color: #aeaeb2; margin-right: 6px; font-weight: bold; user-select: none; }
     .drag-handle:active { cursor: grabbing; }
 
-    /* Responsive Layout Engine - Fixed Desktop Horizontal Scroll Trap */
+    /* Responsive Layout Engine */
     body.desktop-mode { overflow: auto; }
     body.desktop-mode .app-layout { display: flex; flex-direction: row; min-height: 100vh; padding-top: 56px; box-sizing: border-box; }
-    body.desktop-mode .sidebar { width: 360px; background: var(--glass-sidebar); backdrop-filter: blur(40px) saturate(180%); border-right: 1px solid rgba(0,0,0,0.08); padding: 20px 16px; overflow-y: auto; flex-shrink: 0; box-sizing: border-box; height: calc(100vh - 56px); position: sticky; top: 56px; }
+    body.desktop-mode .sidebar { width: 340px; background: var(--glass-sidebar); backdrop-filter: blur(40px) saturate(180%); border-right: 1px solid rgba(0,0,0,0.08); padding: 20px 14px; overflow-y: auto; flex-shrink: 0; box-sizing: border-box; height: calc(100vh - 56px); position: sticky; top: 56px; }
     body.desktop-mode .main-content { flex: 1; padding: 20px 24px; overflow-x: auto; background: var(--bg-main); box-sizing: border-box; min-width: 0; }
     body.desktop-mode .header-actions { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; flex-wrap: wrap; gap: 10px; }
     
@@ -182,13 +192,6 @@ GLOBAL_HEAD = """
         }
     }
 
-    function toggleColumnBox() {
-        const box = document.getElementById('column-visibility-box');
-        if (box) {
-            box.style.display = box.style.display === 'none' ? 'block' : 'none';
-        }
-    }
-
     function selectAllColumns(source) {
         const checkboxes = document.querySelectorAll('.col-visibility-cb');
         checkboxes.forEach(cb => {
@@ -259,33 +262,38 @@ WORKSPACE_HTML = """
     
     <div class="app-layout">
         <div class="sidebar">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
-                <h2 style="font-size: 17px; font-weight: 600; margin: 0;">Parameters</h2>
-                <button type="button" onclick="clearAll()" style="background: none; border: none; color: var(--blue-apple); font-size: 13px; font-weight: 500; cursor: pointer; padding: 0;">Clear All</button>
+            
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; padding: 0 4px;">
+                <h2 style="font-size: 16px; font-weight: 700; margin: 0;">Workspace</h2>
+                <button type="button" onclick="clearAll()" style="background: none; border: none; color: var(--blue-apple); font-size: 12px; font-weight: 600; cursor: pointer; padding: 0;">Reset All</button>
             </div>
             
-            <div style="background: rgba(255,255,255,0.7); padding: 10px 12px; border-radius: 12px; margin-bottom: 14px; font-size: 12px; color: var(--text-secondary); border: 1px solid rgba(0,0,0,0.04);">
-                <div><b>Uploaded:</b> {{ upload_time }}</div>
+            <div style="background: rgba(255,255,255,0.6); padding: 10px 12px; border-radius: 12px; margin-bottom: 16px; font-size: 11px; color: var(--text-secondary); border: 1px solid rgba(0,0,0,0.04);">
+                <div style="margin-bottom: 4px;"><b>Data Synced:</b> {{ upload_time }}</div>
+                <div style="color: var(--blue-apple); font-weight: 600;">{{ min_sale_date }} → {{ max_sale_date }}</div>
             </div>
 
             <form id="config-form">
                 <input type="hidden" name="date_col" value="{{ default_date_col }}">
 
-                {% if default_date_col %}
-                <div class="form-group" style="background: rgba(255,255,255,0.6); padding: 12px; border-radius: 14px; border: 1px solid rgba(0,0,0,0.06);">
-                    <div class="form-label-header">
-                        <label class="form-label">1. Date Filter ({{ default_date_col }})</label>
-                        <button type="button" class="section-clear" onclick="clearSection('date')">Clear</button>
-                    </div>
+                <!-- 1. TIME FRAME -->
+                <details class="sidebar-section" open>
+                    <summary class="section-title">
+                        <div><i>📅</i> Date & Time</div>
+                        <div style="display: flex; align-items: center;">
+                            <button type="button" class="section-clear" onclick="event.preventDefault(); clearSection('date')">Clear</button>
+                            <span class="indicator">▼</span>
+                        </div>
+                    </summary>
+                    {% if default_date_col %}
                     <div style="display: flex; gap: 4px; margin-bottom: 10px; flex-wrap: wrap;">
                         <button type="button" class="btn-secondary" onclick="setDateRange('today'); toggleWeekSelector(false);">Today</button>
                         <button type="button" class="btn-secondary" onclick="setDateRange('week'); toggleWeekSelector(true);">Week</button>
                         <button type="button" class="btn-secondary" onclick="setDateRange('month'); toggleWeekSelector(false);">Month</button>
                     </div>
                     
-                    <!-- Popup Week Numbers Option -->
                     <div id="week-selector-container" style="display: none; margin-bottom: 10px; background: rgba(0,113,227,0.05); padding: 8px; border-radius: 10px;">
-                        <label style="font-size:11px; font-weight: 600; color: var(--blue-apple); display:block; margin-bottom: 4px;">Select Week in Month:</label>
+                        <label style="font-size:11px; font-weight: 600; color: var(--blue-apple); display:block; margin-bottom: 6px;">Select Week:</label>
                         <div style="display: flex; gap: 6px;">
                             <label style="font-size:11px; cursor:pointer;"><input type="radio" name="week_num" value="1" onchange="updateDashboard()"> W1</label>
                             <label style="font-size:11px; cursor:pointer;"><input type="radio" name="week_num" value="2" onchange="updateDashboard()"> W2</label>
@@ -296,182 +304,175 @@ WORKSPACE_HTML = """
 
                     <div style="display: flex; gap: 8px;">
                         <div style="flex:1;">
-                            <label style="font-size:10px; color:#86868b; margin-bottom:2px; display:block; text-transform: uppercase; font-weight: 600;">From</label>
-                            <input type="date" name="start_date" id="start_date" class="form-input" style="padding: 6px 8px;" onchange="toggleWeekSelector(false);">
+                            <label style="font-size:10px; color:#86868b; margin-bottom:4px; display:block; font-weight: 600;">START DATE</label>
+                            <input type="date" name="start_date" id="start_date" class="form-input" onchange="toggleWeekSelector(false);">
                         </div>
                         <div style="flex:1;">
-                            <label style="font-size:10px; color:#86868b; margin-bottom:2px; display:block; text-transform: uppercase; font-weight: 600;">To</label>
-                            <input type="date" name="end_date" id="end_date" class="form-input" style="padding: 6px 8px;" onchange="toggleWeekSelector(false);">
+                            <label style="font-size:10px; color:#86868b; margin-bottom:4px; display:block; font-weight: 600;">END DATE</label>
+                            <input type="date" name="end_date" id="end_date" class="form-input" onchange="toggleWeekSelector(false);">
                         </div>
                     </div>
-                </div>
-                {% endif %}
+                    {% endif %}
+                </details>
 
-                {% if status_col %}
-                <div class="form-group">
-                    <div class="form-label-header">
-                        <label class="form-label">2. Filter by {{ status_col }}</label>
-                        <button type="button" class="section-clear" onclick="clearSection('status')">Clear</button>
-                    </div>
-                    <div class="checkbox-group" style="max-height: 100px;">
-                        {% for status in unique_statuses %}
-                        <label class="checkbox-item">
-                            <input type="checkbox" name="status_filters" value="{{ status }}" {% if status|string|lower == 'ok' %}checked{% endif %}> 
-                            <span style="overflow:hidden; text-overflow:ellipsis;">{{ status }}</span>
-                        </label>
-                        {% endfor %}
-                    </div>
-                </div>
-                {% endif %}
-
-                <!-- Multi-select Filter: SPC Name -->
-                {% if spc_list %}
-                <div class="form-group">
-                    <div class="form-label-header">
-                        <label class="form-label">Filter by SPC Name</label>
-                        <button type="button" class="section-clear" onclick="clearSection('spc')">Clear</button>
-                    </div>
-                    <div class="checkbox-group" style="max-height: 100px;">
-                        {% for spc in spc_list %}
-                        <label class="checkbox-item">
-                            <input type="checkbox" name="spc_filters" value="{{ spc }}"> 
-                            <span style="overflow:hidden; text-overflow:ellipsis;">{{ spc }}</span>
-                        </label>
-                        {% endfor %}
-                    </div>
-                </div>
-                {% endif %}
-
-                <!-- Multi-select Filter: SEG1 -->
-                {% if seg1_list %}
-                <div class="form-group">
-                    <div class="form-label-header">
-                        <label class="form-label">Filter by SEG1</label>
-                        <button type="button" class="section-clear" onclick="clearSection('seg1')">Clear</button>
-                    </div>
-                    <div class="checkbox-group" style="max-height: 100px;">
-                        {% for seg in seg1_list %}
-                        <label class="checkbox-item">
-                            <input type="checkbox" name="seg1_filters" value="{{ seg }}"> 
-                            <span style="overflow:hidden; text-overflow:ellipsis;">{{ seg }}</span>
-                        </label>
-                        {% endfor %}
-                    </div>
-                </div>
-                {% endif %}
-
-                <!-- Multi-select Filter: Family Name -->
-                {% if family_list %}
-                <div class="form-group">
-                    <div class="form-label-header">
-                        <label class="form-label">Filter by Family Name</label>
-                        <button type="button" class="section-clear" onclick="clearSection('family')">Clear</button>
-                    </div>
-                    <div class="checkbox-group" style="max-height: 100px;">
-                        {% for fam in family_list %}
-                        <label class="checkbox-item">
-                            <input type="checkbox" name="family_filters" value="{{ fam }}"> 
-                            <span style="overflow:hidden; text-overflow:ellipsis;">{{ fam }}</span>
-                        </label>
-                        {% endfor %}
-                    </div>
-                </div>
-                {% endif %}
-
-                <!-- Option to choose which columns should be listed in sidebars with Show/Hide Button -->
-                <div class="form-group" style="background: rgba(0,113,227,0.03); padding: 10px; border-radius: 12px; border: 1px dashed rgba(0,113,227,0.2);">
-                    <div class="form-label-header">
-                        <label class="form-label" style="color: var(--blue-apple);">Sidebar Column Visibility</label>
-                        <button type="button" class="section-clear" onclick="toggleColumnBox()">Show / Hide ▾</button>
-                    </div>
-                    <div id="column-visibility-box" style="display: none; margin-top: 8px;">
-                        <div style="margin-bottom: 6px; border-bottom: 1px solid rgba(0,0,0,0.06); padding-bottom: 4px;">
-                            <label style="font-size: 11px; font-weight: 600; cursor: pointer;">
-                                <input type="checkbox" id="select-all-cols" onclick="selectAllColumns(this)" checked> Select All
-                            </label>
+                <!-- 2. DATA FILTERS -->
+                <details class="sidebar-section">
+                    <summary class="section-title">
+                        <div><i>🔍</i> Data Filters</div>
+                        <div style="display: flex; align-items: center;">
+                            <button type="button" class="section-clear" onclick="event.preventDefault(); clearSection('filters')">Clear</button>
+                            <span class="indicator">▼</span>
                         </div>
-                        <div style="max-height: 110px; overflow-y: auto;">
-                            {% for col in all_cols %}
-                            <label class="checkbox-item" style="font-size: 11px;">
-                                <input type="checkbox" class="col-visibility-cb" value="{{ col }}" checked onchange="filterSidebarColumns()"> {{ col }}
-                            </label>
+                    </summary>
+                    
+                    {% if status_col %}
+                    <div style="margin-bottom: 12px;">
+                        <label style="font-size:11px; font-weight: 600; margin-bottom:4px; display:block;">STATUS</label>
+                        <div class="checkbox-group">
+                            {% for status in unique_statuses %}
+                            <label class="checkbox-item"><input type="checkbox" name="status_filters" value="{{ status }}" {% if status|string|lower == 'ok' %}checked{% endif %}> <span style="overflow:hidden; text-overflow:ellipsis;">{{ status }}</span></label>
                             {% endfor %}
                         </div>
                     </div>
-                </div>
+                    {% endif %}
 
-                <!-- SPC Comparison Mode (Day-wise / Week-wise) -->
-                <div class="form-group" style="background: rgba(52,199,89,0.04); padding: 10px; border-radius: 12px; border: 1px solid rgba(52,199,89,0.15);">
-                    <label class="form-label" style="color: #248a3d; margin-bottom: 6px;">SPC Comparison View</label>
-                    <div style="display: flex; gap: 10px;">
-                        <label style="font-size: 11px; cursor: pointer;"><input type="radio" name="spc_compare" value="none" checked onchange="updateDashboard()"> Standard</label>
-                        <label style="font-size: 11px; cursor: pointer;"><input type="radio" name="spc_compare" value="day" onchange="updateDashboard()"> Day-wise</label>
-                        <label style="font-size: 11px; cursor: pointer;"><input type="radio" name="spc_compare" value="week" onchange="updateDashboard()"> Week-wise</label>
-                    </div>
-                </div>
-
-                <div class="form-group">
-                    <div class="form-label-header">
-                        <label class="form-label">3. Row Grouping (Drag ☰)</label>
-                        <button type="button" class="section-clear" onclick="clearSection('rows')">Clear</button>
-                    </div>
-                    <div class="checkbox-group sortable-list" id="row-grouping-container">
-                        {% for col in all_cols %}
-                        <div class="checkbox-item" data-col-name="{{ col }}">
-                            <span class="drag-handle">☰</span>
-                            <input type="checkbox" name="index_cols" value="{{ col }}" {% if col == 'Customized Sales Date' %}checked{% endif %}> 
-                            <span style="overflow: hidden; text-overflow: ellipsis;">{{ col }}</span>
+                    {% if spc_list %}
+                    <div style="margin-bottom: 12px;">
+                        <label style="font-size:11px; font-weight: 600; margin-bottom:4px; display:block;">SPC NAME</label>
+                        <div class="checkbox-group">
+                            {% for spc in spc_list %}
+                            <label class="checkbox-item"><input type="checkbox" name="spc_filters" value="{{ spc }}"> <span style="overflow:hidden; text-overflow:ellipsis;">{{ spc }}</span></label>
+                            {% endfor %}
                         </div>
-                        {% endfor %}
                     </div>
-                </div>
+                    {% endif %}
 
-                <div class="form-group">
-                    <div class="form-label-header">
-                        <label class="form-label">4. Column Grouping (Drag ☰)</label>
-                        <button type="button" class="section-clear" onclick="clearSection('cols')">Clear</button>
-                    </div>
-                    <div class="checkbox-group sortable-list" id="col-grouping-container" style="max-height: 100px;">
-                        {% for col in all_cols %}
-                        <div class="checkbox-item" data-col-name="{{ col }}">
-                            <span class="drag-handle">☰</span>
-                            <input type="checkbox" name="columns_cols" value="{{ col }}"> 
-                            <span style="overflow: hidden; text-overflow: ellipsis;">{{ col }}</span>
+                    {% if seg1_list %}
+                    <div style="margin-bottom: 12px;">
+                        <label style="font-size:11px; font-weight: 600; margin-bottom:4px; display:block;">SEG 1</label>
+                        <div class="checkbox-group">
+                            {% for seg in seg1_list %}
+                            <label class="checkbox-item"><input type="checkbox" name="seg1_filters" value="{{ seg }}"> <span style="overflow:hidden; text-overflow:ellipsis;">{{ seg }}</span></label>
+                            {% endfor %}
                         </div>
-                        {% endfor %}
                     </div>
-                </div>
+                    {% endif %}
 
-                <div class="form-group">
-                    <div class="form-label-header">
-                        <label class="form-label">5. Calculation Type</label>
-                        <button type="button" class="section-clear" onclick="clearSection('aggs')">Clear</button>
+                    {% if family_list %}
+                    <div style="margin-bottom: 6px;">
+                        <label style="font-size:11px; font-weight: 600; margin-bottom:4px; display:block;">FAMILY NAME</label>
+                        <div class="checkbox-group">
+                            {% for fam in family_list %}
+                            <label class="checkbox-item"><input type="checkbox" name="family_filters" value="{{ fam }}"> <span style="overflow:hidden; text-overflow:ellipsis;">{{ fam }}</span></label>
+                            {% endfor %}
+                        </div>
                     </div>
-                    <div class="checkbox-group" style="max-height: none;">
-                        <label class="checkbox-item"><input type="checkbox" name="agg_funcs" value="sum" checked> Sum (Value)</label>
-                        <label class="checkbox-item"><input type="checkbox" name="agg_funcs" value="count"> Count (Qty)</label>
-                        <label class="checkbox-item"><input type="checkbox" name="agg_funcs" value="mean"> Average</label>
-                    </div>
-                </div>
+                    {% endif %}
+                </details>
 
-                <div class="form-group">
-                    <div class="form-label-header">
-                        <label class="form-label">6. Options</label>
-                        <button type="button" class="section-clear" onclick="clearSection('options')">Clear</button>
+                <!-- 3. GROUPING & LAYOUT -->
+                <details class="sidebar-section" open>
+                    <summary class="section-title">
+                        <div><i>📊</i> Grouping & Layout</div>
+                        <div style="display: flex; align-items: center;">
+                            <button type="button" class="section-clear" onclick="event.preventDefault(); clearSection('layout')">Clear</button>
+                            <span class="indicator">▼</span>
+                        </div>
+                    </summary>
+
+                    <!-- Sidebar Configuration -->
+                    <div style="background: rgba(0,113,227,0.03); padding: 10px; border-radius: 10px; border: 1px dashed rgba(0,113,227,0.2); margin-bottom: 12px;">
+                        <label style="font-size:11px; font-weight: 600; color: var(--blue-apple); display: flex; justify-content: space-between; cursor: pointer;" onclick="document.getElementById('column-visibility-box').style.display = document.getElementById('column-visibility-box').style.display === 'none' ? 'block' : 'none';">
+                            <span>Manage Visible Fields</span> <span>+/-</span>
+                        </label>
+                        <div id="column-visibility-box" style="display: none; margin-top: 8px;">
+                            <div style="margin-bottom: 6px; border-bottom: 1px solid rgba(0,0,0,0.06); padding-bottom: 4px;">
+                                <label style="font-size: 11px; font-weight: 600; cursor: pointer;"><input type="checkbox" id="select-all-cols" onclick="selectAllColumns(this)" checked> Select All</label>
+                            </div>
+                            <div style="max-height: 120px; overflow-y: auto;" class="checkbox-group">
+                                {% for col in all_cols %}
+                                <label class="checkbox-item"><input type="checkbox" class="col-visibility-cb" value="{{ col }}" checked onchange="filterSidebarColumns()"> {{ col }}</label>
+                                {% endfor %}
+                            </div>
+                        </div>
                     </div>
-                    <div class="checkbox-group" style="max-height: none;">
-                        <label class="checkbox-item"><input type="checkbox" name="show_row_total" value="true"> Add Row Totals</label>
+
+                    <!-- SPC Compare -->
+                    <div style="background: rgba(52,199,89,0.04); padding: 10px; border-radius: 10px; border: 1px solid rgba(52,199,89,0.15); margin-bottom: 12px;">
+                        <label style="font-size:11px; font-weight: 600; color: #248a3d; margin-bottom:6px; display:block;">SPC COMPARISON</label>
+                        <div style="display: flex; gap: 8px;">
+                            <label style="font-size: 11px; cursor: pointer;"><input type="radio" name="spc_compare" value="none" checked onchange="updateDashboard()"> Off</label>
+                            <label style="font-size: 11px; cursor: pointer;"><input type="radio" name="spc_compare" value="day" onchange="updateDashboard()"> Daily</label>
+                            <label style="font-size: 11px; cursor: pointer;"><input type="radio" name="spc_compare" value="week" onchange="updateDashboard()"> Weekly</label>
+                        </div>
                     </div>
-                </div>
+
+                    <div style="margin-bottom: 12px;">
+                        <label style="font-size:11px; font-weight: 600; margin-bottom:4px; display:block;">ROWS (DRAG ☰)</label>
+                        <div class="checkbox-group sortable-list" id="row-grouping-container">
+                            {% for col in all_cols %}
+                            <div class="checkbox-item" data-col-name="{{ col }}">
+                                <span class="drag-handle">☰</span>
+                                <input type="checkbox" name="index_cols" value="{{ col }}" {% if col == 'Customized Sales Date' or col == 'SPC Name' %}checked{% endif %}> 
+                                <span style="overflow: hidden; text-overflow: ellipsis;">{{ col }}</span>
+                            </div>
+                            {% endfor %}
+                        </div>
+                    </div>
+
+                    <div style="margin-bottom: 6px;">
+                        <label style="font-size:11px; font-weight: 600; margin-bottom:4px; display:block;">COLUMNS (DRAG ☰)</label>
+                        <div class="checkbox-group sortable-list" id="col-grouping-container">
+                            {% for col in all_cols %}
+                            <div class="checkbox-item" data-col-name="{{ col }}">
+                                <span class="drag-handle">☰</span>
+                                <input type="checkbox" name="columns_cols" value="{{ col }}"> 
+                                <span style="overflow: hidden; text-overflow: ellipsis;">{{ col }}</span>
+                            </div>
+                            {% endfor %}
+                        </div>
+                    </div>
+                </details>
+
+                <!-- 4. METRICS & OPTIONS -->
+                <details class="sidebar-section" open>
+                    <summary class="section-title">
+                        <div><i>⚙️</i> Metrics & Settings</div>
+                        <div style="display: flex; align-items: center;">
+                            <button type="button" class="section-clear" onclick="event.preventDefault(); clearSection('metrics')">Clear</button>
+                            <span class="indicator">▼</span>
+                        </div>
+                    </summary>
+
+                    <div style="margin-bottom: 12px;">
+                        <label style="font-size:11px; font-weight: 600; margin-bottom:4px; display:block;">CALCULATION TYPE</label>
+                        <div class="checkbox-group" style="max-height: none;">
+                            <label class="checkbox-item"><input type="checkbox" name="agg_funcs" value="sum" checked> Sum (Value)</label>
+                            <label class="checkbox-item"><input type="checkbox" name="agg_funcs" value="count"> Count (Qty)</label>
+                            <label class="checkbox-item"><input type="checkbox" name="agg_funcs" value="mean"> Average</label>
+                            <div style="border-top: 1px solid rgba(0,0,0,0.06); margin: 4px 0;"></div>
+                            <label class="checkbox-item" title="% of Column Total"><input type="checkbox" name="agg_funcs" value="contrib"> Contrib % (of Col)</label>
+                            <label class="checkbox-item" title="Period-over-Period Growth"><input type="checkbox" name="agg_funcs" value="growth"> Growth % (PoP)</label>
+                        </div>
+                    </div>
+
+                    <div style="margin-bottom: 6px;">
+                        <label style="font-size:11px; font-weight: 600; margin-bottom:4px; display:block;">TABLE OPTIONS</label>
+                        <div class="checkbox-group" style="max-height: none;">
+                            <label class="checkbox-item"><input type="checkbox" name="show_row_total" value="true" checked> Show Grand Totals</label>
+                        </div>
+                    </div>
+                </details>
+
             </form>
-            <div style="text-align: center; margin-top: 20px;">
-                <a href="/" style="color: #ff3b30; font-size: 13px; text-decoration: none; font-weight: 500;">← Upload Different File</a>
+            <div style="text-align: center; margin-top: 24px; margin-bottom: 24px;">
+                <a href="/" style="color: #ff3b30; font-size: 13px; text-decoration: none; font-weight: 600; background: rgba(255,59,48,0.1); padding: 10px 20px; border-radius: 980px;">← New File</a>
             </div>
         </div>
 
         <div class="main-content">
             <div class="header-actions">
-                <h2 style="font-size: 24px; font-weight: 700; margin: 0; letter-spacing: -0.015em;">Live Dashboard</h2>
+                <h2 style="font-size: 26px; font-weight: 700; margin: 0; letter-spacing: -0.015em;">Live Dashboard</h2>
                 <div class="dropdown">
                     <button onclick="toggleExportMenu()" class="btn-primary">Export ▾</button>
                     <div id="exportDropdown" class="dropdown-content">
@@ -484,7 +485,7 @@ WORKSPACE_HTML = """
             <div id="capture-area" class="table-container">
                 <div id="table-wrapper" class="table-scroll">
                     <div style="padding: 60px 20px; text-align: center;">
-                        <p style="color: #86868b; font-size: 15px;">Select at least one Row from the left panel to see your data instantly.</p>
+                        <p style="color: #86868b; font-size: 15px;">Configure your parameters on the left to see the data instantly.</p>
                     </div>
                 </div>
             </div>
@@ -497,7 +498,6 @@ WORKSPACE_HTML = """
             document.getElementById('start_date').value = '';
             document.getElementById('end_date').value = '';
             toggleWeekSelector(false);
-            document.querySelectorAll('input[name="spc_compare"][value="none"]').forEach(r => r.checked = true);
             updateDashboard();
         }
 
@@ -507,22 +507,13 @@ WORKSPACE_HTML = """
                 document.getElementById('end_date').value = '';
                 toggleWeekSelector(false);
                 document.querySelectorAll('input[name="week_num"]').forEach(r => r.checked = false);
-            } else if (section === 'status') {
-                document.querySelectorAll('input[name="status_filters"]').forEach(cb => cb.checked = false);
-            } else if (section === 'spc') {
-                document.querySelectorAll('input[name="spc_filters"]').forEach(cb => cb.checked = false);
-            } else if (section === 'seg1') {
-                document.querySelectorAll('input[name="seg1_filters"]').forEach(cb => cb.checked = false);
-            } else if (section === 'family') {
-                document.querySelectorAll('input[name="family_filters"]').forEach(cb => cb.checked = false);
-            } else if (section === 'rows') {
-                document.querySelectorAll('input[name="index_cols"]').forEach(cb => cb.checked = false);
-            } else if (section === 'cols') {
-                document.querySelectorAll('input[name="columns_cols"]').forEach(cb => cb.checked = false);
-            } else if (section === 'aggs') {
-                document.querySelectorAll('input[name="agg_funcs"]').forEach(cb => cb.checked = false);
-            } else if (section === 'options') {
-                document.querySelectorAll('input[name="show_row_total"]').forEach(cb => cb.checked = false);
+            } else if (section === 'filters') {
+                document.querySelectorAll('input[name="status_filters"], input[name="spc_filters"], input[name="seg1_filters"], input[name="family_filters"]').forEach(cb => cb.checked = false);
+            } else if (section === 'layout') {
+                document.querySelectorAll('input[name="index_cols"], input[name="columns_cols"]').forEach(cb => cb.checked = false);
+                document.querySelectorAll('input[name="spc_compare"][value="none"]').forEach(r => r.checked = true);
+            } else if (section === 'metrics') {
+                document.querySelectorAll('input[name="agg_funcs"], input[name="show_row_total"]').forEach(cb => cb.checked = false);
             }
             updateDashboard();
         }
@@ -557,7 +548,6 @@ WORKSPACE_HTML = """
             let start = new Date();
             let end = new Date();
             if (range === 'today') {
-                // Keep today
             } else if (range === 'week') {
                 const day = today.getDay() || 7; 
                 if(day !== 1) start.setHours(-24 * (day - 1));
@@ -582,7 +572,7 @@ WORKSPACE_HTML = """
             const aggFuncs = formData.getAll('agg_funcs');
             
             if (indexCols.length === 0 || aggFuncs.length === 0) {
-                document.getElementById('table-wrapper').innerHTML = '<div style="padding: 60px 20px; text-align: center;"><p style="color: #86868b; font-size: 15px;">Select at least one Row and one Calculation Type.</p></div>';
+                document.getElementById('table-wrapper').innerHTML = '<div style="padding: 60px 20px; text-align: center;"><p style="color: #86868b; font-size: 15px;">Select at least one Row and one Metric.</p></div>';
                 return;
             }
 
@@ -606,10 +596,13 @@ WORKSPACE_HTML = """
             }
         }
 
-        document.querySelectorAll('#config-form input, #config-form select').forEach(el => {
-            if(!el.classList.contains('col-visibility-cb')) {
+        document.querySelectorAll('#config-form input').forEach(el => {
+            if(!el.classList.contains('col-visibility-cb') && el.type !== 'date') {
                 el.addEventListener('change', updateDashboard);
             }
+        });
+        document.querySelectorAll('#config-form input[type="date"]').forEach(el => {
+            el.addEventListener('blur', updateDashboard);
         });
 
         window.onload = function() {
@@ -657,12 +650,6 @@ WORKSPACE_HTML = """
                         closeBtn.style.fontWeight = '600';
                         closeBtn.onclick = () => document.body.removeChild(modal);
                         
-                        const inst = document.createElement('p');
-                        inst.innerText = 'Long-press the image below to save it to your Photos.';
-                        inst.style.color = '#ffffff'; 
-                        inst.style.marginBottom = '20px';
-                        inst.style.fontSize = '14px';
-                        
                         const img = document.createElement('img');
                         img.src = imgData;
                         img.style.maxWidth = '90%'; 
@@ -671,7 +658,6 @@ WORKSPACE_HTML = """
                         img.style.boxShadow = '0 10px 30px rgba(0,0,0,0.5)';
                         
                         modal.appendChild(closeBtn);
-                        modal.appendChild(inst);
                         modal.appendChild(img);
                         document.body.appendChild(modal);
                     } else {
@@ -743,7 +729,17 @@ def home():
         unique_statuses = df[status_col].dropna().unique().tolist() if status_col else []
         spc_list, seg1_list, family_list = get_filter_lists(df)
         upload_time = get_metadata()
-        return render_template_string(WORKSPACE_HTML, all_cols=all_cols, default_date_col=default_date_col, status_col=status_col, unique_statuses=unique_statuses, spc_list=spc_list, seg1_list=seg1_list, family_list=family_list, upload_time=upload_time)
+        
+        min_sale_date = "N/A"
+        max_sale_date = "N/A"
+        if default_date_col and default_date_col in df.columns:
+            try:
+                parsed = pd.to_datetime(df[default_date_col], errors='coerce', dayfirst=True)
+                if pd.notna(parsed.min()): min_sale_date = parsed.min().strftime("%d %b %y")
+                if pd.notna(parsed.max()): max_sale_date = parsed.max().strftime("%d %b %y")
+            except: pass
+
+        return render_template_string(WORKSPACE_HTML, all_cols=all_cols, default_date_col=default_date_col, status_col=status_col, unique_statuses=unique_statuses, spc_list=spc_list, seg1_list=seg1_list, family_list=family_list, upload_time=upload_time, min_sale_date=min_sale_date, max_sale_date=max_sale_date)
     return render_template_string(UPLOAD_HTML)
 
 @app.route("/dashboard", methods=["GET", "POST"])
@@ -752,25 +748,7 @@ def dashboard():
         file = request.files['file']
         df = pd.read_csv(file) if file.filename.endswith('.csv') else pd.read_excel(file)
         save_data(df)
-    
-    df = load_data()
-    if df is None:
-        return render_template_string(UPLOAD_HTML)
-        
-    all_cols = df.columns.tolist()
-    default_date_col = 'Customized Sales Date' if 'Customized Sales Date' in all_cols else ('Sale Date' if 'Sale Date' in all_cols else next((c for c in all_cols if 'date' in str(c).lower()), ""))
-    
-    status_col = ""
-    for candidate in ['FinalStatus', 'Final Record Status', 'Validation Remarks']:
-        if candidate in all_cols:
-            status_col = candidate
-            break
-            
-    unique_statuses = df[status_col].dropna().unique().tolist() if status_col else []
-    spc_list, seg1_list, family_list = get_filter_lists(df)
-    upload_time = get_metadata()
-    
-    return render_template_string(WORKSPACE_HTML, all_cols=all_cols, default_date_col=default_date_col, status_col=status_col, unique_statuses=unique_statuses, spc_list=spc_list, seg1_list=seg1_list, family_list=family_list, upload_time=upload_time)
+    return home()
 
 @app.route("/calculate", methods=["GET", "POST"])
 def calculate():
@@ -785,6 +763,7 @@ def calculate():
     index_cols = request.form.getlist('index_cols')
     columns_cols = request.form.getlist('columns_cols')
     agg_funcs = request.form.getlist('agg_funcs')
+    
     status_filters = request.form.getlist('status_filters')
     spc_filters = request.form.getlist('spc_filters')
     seg1_filters = request.form.getlist('seg1_filters')
@@ -797,142 +776,148 @@ def calculate():
     if not index_cols or not value_cols or not agg_funcs:
         return jsonify({"error": "Missing parameters or numeric column."}), 400
 
+    calc_contrib = 'contrib' in agg_funcs
+    calc_growth = 'growth' in agg_funcs
+    base_aggs = [f for f in agg_funcs if f in ['sum', 'count', 'mean']]
+    if not base_aggs: 
+        base_aggs = ['sum']
+
     try:
         filter_texts = []
         df_filtered = df.copy()
         
-        # Handle SPC Comparison View (Day-wise / Week-wise)
-        spc_col = next((c for c in df_filtered.columns if 'spc' in str(c).lower() and 'name' in str(c).lower()), 'SPC Name' if 'SPC Name' in df_filtered.columns else '')
-        if spc_compare in ['day', 'week'] and spc_col and date_col:
-            df_filtered[date_col] = pd.to_datetime(df_filtered[date_col], errors='coerce', dayfirst=True)
-            if spc_compare == 'day':
-                df_filtered['_Day_Comp'] = df_filtered[date_col].dt.strftime('%d-%b-%y')
-                if spc_col not in index_cols: index_cols = [spc_col]
-                if '_Day_Comp' not in columns_cols: columns_cols = ['_Day_Comp']
-            elif spc_compare == 'week':
-                def get_week_of_month(dt):
-                    if pd.isna(dt): return 'Unknown'
-                    dom = dt.day
-                    w = (dom - 1) // 7 + 1
-                    return f"W{w} ({dt.strftime('%b')})"
-                df_filtered['_Week_Comp'] = df_filtered[date_col].apply(get_week_of_month)
-                if spc_col not in index_cols: index_cols = [spc_col]
-                if '_Week_Comp' not in columns_cols: columns_cols = ['_Week_Comp']
-            filter_texts.append(f"<b>SPC Comparison</b>: {spc_compare.capitalize()}-wise breakdown")
-
+        # 1. Date & Week Filters
         if date_col and date_col in df_filtered.columns:
             df_filtered[date_col] = pd.to_datetime(df_filtered[date_col], errors='coerce', dayfirst=True)
-            
             if week_num and week_num.isdigit():
                 w_idx = int(week_num)
                 valid_dates = df_filtered[date_col].dropna()
                 if not valid_dates.empty:
                     base_date = pd.to_datetime(start_date) if start_date else valid_dates.min()
                     month_start = datetime(base_date.year, base_date.month, 1)
-                    if w_idx == 1:
-                        w_start = month_start
-                        w_end = datetime(base_date.year, base_date.month, 7, 23, 59, 59)
-                    elif w_idx == 2:
-                        w_start = datetime(base_date.year, base_date.month, 8)
-                        w_end = datetime(base_date.year, base_date.month, 14, 23, 59, 59)
-                    elif w_idx == 3:
-                        w_start = datetime(base_date.year, base_date.month, 15)
-                        w_end = datetime(base_date.year, base_date.month, 21, 23, 59, 59)
+                    if w_idx == 1: w_start, w_end = month_start, datetime(base_date.year, base_date.month, 7, 23, 59, 59)
+                    elif w_idx == 2: w_start, w_end = datetime(base_date.year, base_date.month, 8), datetime(base_date.year, base_date.month, 14, 23, 59, 59)
+                    elif w_idx == 3: w_start, w_end = datetime(base_date.year, base_date.month, 15), datetime(base_date.year, base_date.month, 21, 23, 59, 59)
                     else:
                         w_start = datetime(base_date.year, base_date.month, 22)
-                        next_month = datetime(base_date.year, base_date.month + 1, 1) if base_date.month < 12 else datetime(base_date.year + 1, 1, 1)
-                        w_end = next_month - timedelta(seconds=1)
-                    
+                        nm = datetime(base_date.year, base_date.month + 1, 1) if base_date.month < 12 else datetime(base_date.year + 1, 1, 1)
+                        w_end = nm - timedelta(seconds=1)
                     df_filtered = df_filtered[(df_filtered[date_col] >= w_start) & (df_filtered[date_col] <= w_end)]
                     filter_texts.append(f"<b>{date_col}</b>: Week {w_idx} ({w_start.strftime('%d-%b-%y')} to {w_end.strftime('%d-%b-%y')})")
             else:
-                if start_date:
-                    df_filtered = df_filtered[df_filtered[date_col] >= pd.to_datetime(start_date)]
-                if end_date:
-                    end_datetime = pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
-                    df_filtered = df_filtered[df_filtered[date_col] <= end_datetime]
+                if start_date: df_filtered = df_filtered[df_filtered[date_col] >= pd.to_datetime(start_date)]
+                if end_date: df_filtered = df_filtered[df_filtered[date_col] <= pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)]
                 if start_date or end_date:
                     s_str = pd.to_datetime(start_date).strftime('%d-%b-%y') if start_date else 'Start'
                     e_str = pd.to_datetime(end_date).strftime('%d-%b-%y') if end_date else 'End'
                     filter_texts.append(f"<b>{date_col}</b>: {s_str} to {e_str}")
 
-        # Status filter
+        # 2. Checkbox Filters
         status_col = next((c for c in ['FinalStatus', 'Final Record Status', 'Validation Remarks'] if c in df_filtered.columns), "")
         if status_col and status_filters:
             df_filtered = df_filtered[df_filtered[status_col].isin(status_filters)]
             filter_texts.append(f"<b>{status_col}</b>: {', '.join(status_filters)}")
 
-        # SPC Name filter
+        spc_col = next((c for c in df_filtered.columns if 'spc' in str(c).lower() and 'name' in str(c).lower()), 'SPC Name' if 'SPC Name' in df_filtered.columns else '')
         if spc_col and spc_filters and spc_col in df_filtered.columns:
             df_filtered = df_filtered[df_filtered[spc_col].astype(str).isin(spc_filters)]
             filter_texts.append(f"<b>SPC Name</b>: {', '.join(spc_filters)}")
 
-        # SEG1 filter
         seg1_col = next((c for c in df_filtered.columns if 'seg1' in str(c).lower()), 'SEG1' if 'SEG1' in df_filtered.columns else '')
         if seg1_col and seg1_filters and seg1_col in df_filtered.columns:
             df_filtered = df_filtered[df_filtered[seg1_col].astype(str).isin(seg1_filters)]
             filter_texts.append(f"<b>SEG1</b>: {', '.join(seg1_filters)}")
 
-        # Family Name filter
         family_col = next((c for c in df_filtered.columns if 'family' in str(c).lower()), 'Family Name' if 'Family Name' in df_filtered.columns else '')
         if family_col and family_filters and family_col in df_filtered.columns:
             df_filtered = df_filtered[df_filtered[family_col].astype(str).isin(family_filters)]
             filter_texts.append(f"<b>Family Name</b>: {', '.join(family_filters)}")
 
-        filter_text = f"<p style='color:#86868b; font-size:13px; margin:0;'>Filtered by {' | '.join(filter_texts)}</p>" if filter_texts else ""
+        # 3. SPC Comparison Injection
+        if spc_compare in ['day', 'week'] and spc_col and date_col:
+            if spc_compare == 'day':
+                df_filtered['_Day'] = df_filtered[date_col].dt.strftime('%d-%b-%y')
+                if spc_col not in index_cols: index_cols = [spc_col]
+                if '_Day' not in columns_cols: columns_cols = ['_Day']
+            elif spc_compare == 'week':
+                def gw(dt):
+                    if pd.isna(dt): return 'Unknown'
+                    w = (dt.day - 1) // 7 + 1
+                    return f"W{w} ({dt.strftime('%b')})"
+                df_filtered['_Week'] = df_filtered[date_col].apply(gw)
+                if spc_col not in index_cols: index_cols = [spc_col]
+                if '_Week' not in columns_cols: columns_cols = ['_Week']
+            filter_texts.append(f"<b>Compare</b>: {spc_compare.capitalize()}-wise")
+
+        filter_text = f"<p style='color:#86868b; font-size:12px; margin:0;'>{' | '.join(filter_texts)}</p>" if filter_texts else ""
 
         if df_filtered.empty:
             return jsonify({"table_html": "<div style='padding: 60px 20px; text-align: center;'><p style='color: #ff3b30;'>No data found for the selected filters.</p></div>", "filter_text": filter_text})
 
-        # Format datetime index columns to strict dd-mmm-yy format without prefixes
         for col in index_cols:
             if col in df_filtered.columns and pd.api.types.is_datetime64_any_dtype(df_filtered[col]):
                 df_filtered[col] = df_filtered[col].dt.strftime('%d-%b-%y')
 
-        pivot_kwargs = {'data': df_filtered, 'index': index_cols, 'values': value_cols, 'aggfunc': agg_funcs}
+        # 4. Generate Pivot
+        pivot_kwargs = {'data': df_filtered, 'index': index_cols, 'values': value_cols, 'aggfunc': base_aggs}
         if columns_cols: pivot_kwargs['columns'] = columns_cols
-
         pivot_df = pd.pivot_table(**pivot_kwargs).reset_index().fillna(0)
         
+        # Flatten Headers
         new_cols = []
         agg_map = {'sum': 'Value', 'count': 'Qty', 'mean': 'Avg'}
-        
         for col in pivot_df.columns:
             if isinstance(col, tuple):
                 parts = []
                 for item in col:
                     item_str = str(item).strip()
                     if item_str in agg_map:
-                        if len(agg_funcs) > 1: parts.append(agg_map[item_str])
+                        if len(base_aggs) > 1: parts.append(agg_map[item_str])
                     elif item_str in value_cols:
                         if len(value_cols) > 1: parts.append(item_str)
                     elif item_str and item_str.lower() != 'nan':
-                        try:
-                            dt_parsed = pd.to_datetime(item_str, errors='raise')
-                            parts.append(dt_parsed.strftime('%d-%b-%y'))
-                        except Exception:
-                            parts.append(item_str)
-                        
-                if not parts:
-                    new_cols.append(" - ".join(str(c) for c in col if str(c).strip()))
-                else:
-                    new_cols.append(" - ".join(parts))
+                        try: parts.append(pd.to_datetime(item_str, errors='raise').strftime('%d-%b-%y'))
+                        except Exception: parts.append(item_str)
+                new_cols.append(" - ".join(parts) if parts else " - ".join(str(c) for c in col if str(c).strip()))
             else:
-                col_str = str(col)
-                try:
-                    dt_parsed = pd.to_datetime(col_str, errors='raise')
-                    new_cols.append(dt_parsed.strftime('%d-%b-%y'))
-                except Exception:
-                    cleaned = col_str.replace('sum - ', '').replace('count - ', '').replace('mean - ', '')
-                    new_cols.append(cleaned)
-                
+                try: new_cols.append(pd.to_datetime(str(col), errors='raise').strftime('%d-%b-%y'))
+                except Exception: new_cols.append(str(col).replace('sum - ', '').replace('count - ', '').replace('mean - ', ''))
         pivot_df.columns = new_cols
 
+        # 5. Calculate Advanced Metrics (Contrib % and Growth %)
         metric_columns = [col for col in pivot_df.columns if col not in index_cols]
+        
+        contrib_data = {}
+        if calc_contrib:
+            for c in metric_columns:
+                total = pivot_df[c].sum()
+                contrib_data[f"{c} Contrib %"] = (pivot_df[c] / total * 100).fillna(0) if total else 0
+                
+        growth_data = {}
+        if calc_growth and len(metric_columns) > 1:
+            for i in range(1, len(metric_columns)):
+                prev = metric_columns[i-1]
+                curr = metric_columns[i]
+                growth_data[f"{curr} Growth %"] = ((pivot_df[curr] - pivot_df[prev]) / pivot_df[prev].replace(0, pd.NA) * 100).fillna(0)
 
+        # Merge them sequentially
+        final_cols = index_cols.copy()
+        for i, c in enumerate(metric_columns):
+            final_cols.append(c)
+            if calc_contrib: 
+                pivot_df[f"{c} Contrib %"] = contrib_data[f"{c} Contrib %"]
+                final_cols.append(f"{c} Contrib %")
+            if calc_growth and i > 0:
+                pivot_df[f"{c} Growth %"] = growth_data[f"{c} Growth %"]
+                final_cols.append(f"{c} Growth %")
+        
+        # 6. Row Totals
         if show_row_total:
             pivot_df['TOTAL'] = pivot_df[metric_columns].sum(axis=1)
+            final_cols.append('TOTAL')
             metric_columns.append('TOTAL')
+            
+        pivot_df = pivot_df[final_cols]
             
         if not pivot_df.empty:
             total_row = pd.DataFrame([{c: '' for c in pivot_df.columns}])
@@ -943,28 +928,34 @@ def calculate():
             
         pivot_df.to_pickle(os.path.join(UPLOAD_DIR, "summary_data.pkl"))
         
-        def format_indian_number(x):
+        # 7. Formatter (Number & Percentages)
+        def format_metric(x, is_pct=False):
             if pd.isna(x) or x == '': return ''
             try:
-                num = int(round(float(x)))
-                s = str(abs(num))
-                if len(s) <= 3:
-                    formatted = s
+                if is_pct:
+                    val = float(x)
+                    if val > 0: return f'<span class="pct-positive">+{val:.1f}%</span>'
+                    elif val < 0: return f'<span class="pct-negative">{val:.1f}%</span>'
+                    return f'<span class="pct-neutral">0.0%</span>'
                 else:
-                    res = s[-3:]
-                    s = s[:-3]
-                    while len(s) > 2:
-                        res = s[-2:] + ',' + res
-                        s = s[:-2]
-                    formatted = s + ',' + res
-                return '-' + formatted if num < 0 else formatted
-            except (ValueError, TypeError):
-                return str(x)
+                    num = int(round(float(x)))
+                    s = str(abs(num))
+                    if len(s) > 3:
+                        res = s[-3:]
+                        s = s[:-3]
+                        while len(s) > 2:
+                            res = s[-2:] + ',' + res
+                            s = s[:-2]
+                        s = s + ',' + res
+                    return '-' + s if num < 0 else s
+            except (ValueError, TypeError): return str(x)
                 
-        for c in metric_columns:
-            pivot_df[c] = pivot_df[c].apply(format_indian_number)
+        for c in pivot_df.columns:
+            if c not in index_cols:
+                is_pct = 'Contrib %' in c or 'Growth %' in c
+                pivot_df[c] = pivot_df[c].apply(lambda x: format_metric(x, is_pct))
         
-        table_html = pivot_df.to_html(classes='excel-table', border=0, index=False, justify='left')
+        table_html = pivot_df.to_html(classes='excel-table', border=0, index=False, justify='left', escape=False)
         table_html = table_html.replace('<th>TOTAL</th>', '<th class="total-col-header">TOTAL</th>')
         table_html = table_html.replace('<td>', '<td class="number-cell">')
 
@@ -978,18 +969,11 @@ def download():
     summary_path = os.path.join(UPLOAD_DIR, "summary_data.pkl")
     if not os.path.exists(summary_path): return "No data to download", 400
     df = pd.read_pickle(summary_path)
-        
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         df.to_excel(writer, index=False, sheet_name='Dashboard_Report')
     output.seek(0)
-    
-    return send_file(
-        output, 
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        download_name="Dynamic_Dashboard_Report.xlsx", 
-        as_attachment=True
-    )
+    return send_file(output, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", download_name="Dynamic_Dashboard_Report.xlsx", as_attachment=True)
 
 if __name__ == '__main__':
     app.run(debug=True)
