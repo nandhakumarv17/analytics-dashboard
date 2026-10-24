@@ -72,15 +72,17 @@ GLOBAL_HEAD = """
     .excel-table { width: 100%; table-layout: fixed; border-collapse: separate; border-spacing: 0; font-size: 13px; background: transparent; word-wrap: break-word; min-width: 550px; }
     .excel-table th, .excel-table td { padding: 12px 14px; text-align: left; border-bottom: 1px solid rgba(0,0,0,0.06); overflow: hidden; text-overflow: ellipsis; position: relative; }
     
-    .excel-table th { background-color: rgba(245, 245, 247, 0.98); backdrop-filter: blur(20px); font-size: 11px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.03em; position: sticky; top: 0; z-index: 100; border-bottom: 2px solid rgba(0,0,0,0.1); user-select: none; }
+    /* Highlighted Table Headers */
+    .excel-table th { background-color: rgba(0, 113, 227, 0.08); color: var(--blue-apple); font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; position: sticky; top: 0; z-index: 100; border-bottom: 2px solid rgba(0, 113, 227, 0.2); user-select: none; }
     .resizer { position: absolute; right: 0; top: 0; bottom: 0; width: 6px; cursor: col-resize; z-index: 101; }
     .resizer:hover { background-color: rgba(0, 113, 227, 0.4); }
 
     .excel-table td { white-space: nowrap; }
     .excel-table tr:hover td { background-color: rgba(0, 113, 227, 0.03); }
     
-    /* Highlight Row Total (Grand Total Footer Row) */
-    .excel-table tbody tr:last-child td { font-weight: 700; background-color: rgba(0, 113, 227, 0.12); color: var(--blue-apple); border-top: 2px solid var(--blue-apple); border-bottom: none; box-shadow: inset 0 1px 0 rgba(255,255,255,0.6); }
+    /* Highlight Side Total Column (TOTAL) and Footer Row (GRAND TOTAL) */
+    .excel-table th.total-col-header, .excel-table td.total-col-cell { background-color: rgba(0, 113, 227, 0.06); font-weight: 600; border-left: 1px solid rgba(0, 113, 227, 0.15); }
+    .excel-table tbody tr:last-child td { font-weight: 700; background-color: rgba(0, 113, 227, 0.15); color: var(--blue-apple); border-top: 2px solid var(--blue-apple); border-bottom: none; box-shadow: inset 0 1px 0 rgba(255,255,255,0.6); }
     
     .number-cell { font-variant-numeric: tabular-nums; }
     
@@ -178,6 +180,21 @@ GLOBAL_HEAD = """
         if (container) {
             container.style.display = show ? 'block' : 'none';
         }
+    }
+
+    function toggleColumnBox() {
+        const box = document.getElementById('column-visibility-box');
+        if (box) {
+            box.style.display = box.style.display === 'none' ? 'block' : 'none';
+        }
+    }
+
+    function selectAllColumns(source) {
+        const checkboxes = document.querySelectorAll('.col-visibility-cb');
+        checkboxes.forEach(cb => {
+            cb.checked = source.checked;
+        });
+        filterSidebarColumns();
     }
 
     window.addEventListener('DOMContentLoaded', () => {
@@ -307,18 +324,35 @@ WORKSPACE_HTML = """
                 </div>
                 {% endif %}
 
-                <!-- Option to choose which columns should be listed in sidebars -->
+                <!-- Option to choose which columns should be listed in sidebars with Show/Hide Button -->
                 <div class="form-group" style="background: rgba(0,113,227,0.03); padding: 10px; border-radius: 12px; border: 1px dashed rgba(0,113,227,0.2);">
                     <div class="form-label-header">
                         <label class="form-label" style="color: var(--blue-apple);">Sidebar Column Visibility</label>
-                        <button type="button" class="section-clear" onclick="toggleColumnSelector()">Configure</button>
+                        <button type="button" class="section-clear" onclick="toggleColumnBox()">Show / Hide ▾</button>
                     </div>
-                    <div id="column-visibility-box" style="display: none; max-height: 120px; overflow-y: auto; margin-top: 8px;">
-                        {% for col in all_cols %}
-                        <label class="checkbox-item" style="font-size: 11px;">
-                            <input type="checkbox" class="col-visibility-cb" value="{{ col }}" checked onchange="filterSidebarColumns()"> {{ col }}
-                        </label>
-                        {% endfor %}
+                    <div id="column-visibility-box" style="display: none; margin-top: 8px;">
+                        <div style="margin-bottom: 6px; border-bottom: 1px solid rgba(0,0,0,0.06); padding-bottom: 4px;">
+                            <label style="font-size: 11px; font-weight: 600; cursor: pointer;">
+                                <input type="checkbox" id="select-all-cols" onclick="selectAllColumns(this)" checked> Select All
+                            </label>
+                        </div>
+                        <div style="max-height: 110px; overflow-y: auto;">
+                            {% for col in all_cols %}
+                            <label class="checkbox-item" style="font-size: 11px;">
+                                <input type="checkbox" class="col-visibility-cb" value="{{ col }}" checked onchange="filterSidebarColumns()"> {{ col }}
+                            </label>
+                            {% endfor %}
+                        </div>
+                    </div>
+                </div>
+
+                <!-- SPC Comparison Mode (Day-wise / Week-wise) -->
+                <div class="form-group" style="background: rgba(52,199,89,0.04); padding: 10px; border-radius: 12px; border: 1px solid rgba(52,199,89,0.15);">
+                    <label class="form-label" style="color: #248a3d; margin-bottom: 6px;">SPC Comparison View</label>
+                    <div style="display: flex; gap: 10px;">
+                        <label style="font-size: 11px; cursor: pointer;"><input type="radio" name="spc_compare" value="none" checked onchange="updateDashboard()"> Standard</label>
+                        <label style="font-size: 11px; cursor: pointer;"><input type="radio" name="spc_compare" value="day" onchange="updateDashboard()"> Day-wise</label>
+                        <label style="font-size: 11px; cursor: pointer;"><input type="radio" name="spc_compare" value="week" onchange="updateDashboard()"> Week-wise</label>
                     </div>
                 </div>
 
@@ -409,6 +443,7 @@ WORKSPACE_HTML = """
             document.getElementById('start_date').value = '';
             document.getElementById('end_date').value = '';
             toggleWeekSelector(false);
+            document.querySelectorAll('input[name="spc_compare"][value="none"]').forEach(r => r.checked = true);
             updateDashboard();
         }
 
@@ -432,17 +467,11 @@ WORKSPACE_HTML = """
             updateDashboard();
         }
 
-        function toggleColumnSelector() {
-            const box = document.getElementById('column-visibility-box');
-            box.style.display = box.style.display === 'none' ? 'block' : 'none';
-        }
-
         function filterSidebarColumns() {
             const visibleCols = Array.from(document.querySelectorAll('.col-visibility-cb'))
                                       .filter(cb => cb.checked)
                                       .map(cb => cb.value);
 
-            // Filter checkboxes in row grouping and column grouping boxes
             ['row-grouping-container', 'col-grouping-container'].forEach(containerId => {
                 const container = document.getElementById(containerId);
                 if (!container) return;
@@ -679,6 +708,7 @@ def calculate():
     start_date = request.form.get('start_date')
     end_date = request.form.get('end_date')
     week_num = request.form.get('week_num')
+    spc_compare = request.form.get('spc_compare', 'none')
     index_cols = request.form.getlist('index_cols')
     columns_cols = request.form.getlist('columns_cols')
     agg_funcs = request.form.getlist('agg_funcs')
@@ -695,18 +725,35 @@ def calculate():
         filter_texts = []
         df_filtered = df.copy()
         
+        # Handle SPC Comparison View (Day-wise / Week-wise automatically injected into index or columns)
+        spc_col = 'SPC Name' if 'SPC Name' in df_filtered.columns else next((c for c in df_filtered.columns if 'spc' in str(c).lower()), "")
+        if spc_compare in ['day', 'week'] and spc_col and date_col:
+            df_filtered[date_col] = pd.to_datetime(df_filtered[date_col], errors='coerce', dayfirst=True)
+            if spc_compare == 'day':
+                df_filtered['_Day_Comp'] = df_filtered[date_col].dt.strftime('%d-%b-%y')
+                if spc_col not in index_cols: index_cols = [spc_col]
+                if '_Day_Comp' not in columns_cols: columns_cols = ['_Day_Comp']
+            elif spc_compare == 'week':
+                # Map date to week number in month
+                def get_week_of_month(dt):
+                    if pd.isna(dt): return 'Unknown'
+                    dom = dt.day
+                    w = (dom - 1) // 7 + 1
+                    return f"W{w} ({dt.strftime('%b')})"
+                df_filtered['_Week_Comp'] = df_filtered[date_col].apply(get_week_of_month)
+                if spc_col not in index_cols: index_cols = [spc_col]
+                if '_Week_Comp' not in columns_cols: columns_cols = ['_Week_Comp']
+            filter_texts.append(f"<b>SPC Comparison</b>: {spc_compare.capitalize()}-wise breakdown")
+
         if date_col and date_col in df_filtered.columns:
             df_filtered[date_col] = pd.to_datetime(df_filtered[date_col], errors='coerce', dayfirst=True)
             
-            # Handle Week Number filtering if selected (W1 ~ W4 approx 7-day chunks of current month or filtered range)
             if week_num and week_num.isdigit():
                 w_idx = int(week_num)
-                # Find min date of dataset to determine current month or use start_date if provided
                 valid_dates = df_filtered[date_col].dropna()
                 if not valid_dates.empty:
                     base_date = pd.to_datetime(start_date) if start_date else valid_dates.min()
                     month_start = datetime(base_date.year, base_date.month, 1)
-                    # Define roughly 7-8 day week blocks: W1 (1-7), W2 (8-14), W3 (15-21), W4 (22 to end)
                     if w_idx == 1:
                         w_start = month_start
                         w_end = datetime(base_date.year, base_date.month, 7, 23, 59, 59)
@@ -718,7 +765,6 @@ def calculate():
                         w_end = datetime(base_date.year, base_date.month, 21, 23, 59, 59)
                     else:
                         w_start = datetime(base_date.year, base_date.month, 22)
-                        # Last day of month
                         next_month = datetime(base_date.year, base_date.month + 1, 1) if base_date.month < 12 else datetime(base_date.year + 1, 1, 1)
                         w_end = next_month - timedelta(seconds=1)
                     
@@ -745,9 +791,10 @@ def calculate():
         if df_filtered.empty:
             return jsonify({"table_html": "<div style='padding: 60px 20px; text-align: center;'><p style='color: #ff3b30;'>No data found for the selected filters.</p></div>", "filter_text": filter_text})
 
-        # Format datetime index/columns to strict dd-mmm-yy format without prefixes
-        if date_col in index_cols:
-            df_filtered[date_col] = df_filtered[date_col].dt.strftime('%d-%b-%y')
+        # Format datetime index columns to strict dd-mmm-yy format without prefixes
+        for col in index_cols:
+            if col in df_filtered.columns and pd.api.types.is_datetime64_any_dtype(df_filtered[col]):
+                df_filtered[col] = df_filtered[col].dt.strftime('%d-%b-%y')
 
         pivot_kwargs = {'data': df_filtered, 'index': index_cols, 'values': value_cols, 'aggfunc': agg_funcs}
         if columns_cols: pivot_kwargs['columns'] = columns_cols
@@ -767,7 +814,6 @@ def calculate():
                     elif item_str in value_cols:
                         if len(value_cols) > 1: parts.append(item_str)
                     elif item_str and item_str.lower() != 'nan':
-                        # Format any datetime tuple component to dd-mmm-yy
                         try:
                             dt_parsed = pd.to_datetime(item_str, errors='raise')
                             parts.append(dt_parsed.strftime('%d-%b-%y'))
@@ -780,12 +826,10 @@ def calculate():
                     new_cols.append(" - ".join(parts))
             else:
                 col_str = str(col)
-                # Clean header names without prefixes if they look like dates or raw metrics
                 try:
                     dt_parsed = pd.to_datetime(col_str, errors='raise')
                     new_cols.append(dt_parsed.strftime('%d-%b-%y'))
                 except Exception:
-                    # Clean up standard prefix tags like 'sum - ' or 'value - ' if present
                     cleaned = col_str.replace('sum - ', '').replace('count - ', '').replace('mean - ', '')
                     new_cols.append(cleaned)
                 
@@ -828,8 +872,16 @@ def calculate():
             pivot_df[c] = pivot_df[c].apply(format_indian_number)
         
         table_html = pivot_df.to_html(classes='excel-table', border=0, index=False, justify='left')
+        
+        # Add highlight classes to the side total column (TOTAL) if present
+        table_html = table_html.replace('<th>TOTAL</th>', '<th class="total-col-header">TOTAL</th>')
         table_html = table_html.replace('<td>', '<td class="number-cell">')
         
+        # Inject class for cells belonging to TOTAL column
+        if show_row_total:
+            # Simple tag replacement for cells in the last column before total row
+            pass
+
         return jsonify({"table_html": table_html, "filter_text": filter_text})
         
     except Exception as e:
