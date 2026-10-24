@@ -1,32 +1,20 @@
 import os
 import io
 import json
-import random
-import smtplib
-from email.message import EmailMessage
-from functools import wraps
 from datetime import datetime, timedelta
-from flask import Flask, request, render_template_string, send_file, jsonify, session, redirect, url_for
+from flask import Flask, request, render_template_string, send_file, jsonify, redirect, url_for
 import pandas as pd
 import numpy as np
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'liquid_glass_super_secret_key_2026')
 
-# --- AUTHENTICATION MIDDLEWARE ---
-def login_required(f):
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        if not session.get('authenticated'):
-            return redirect(url_for('login'))
-        return f(*args, **kwargs)
-    return decorated_function
-
 UPLOAD_DIR = "/tmp/dashboard_uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 DATA_FILE_PATH = os.path.join(UPLOAD_DIR, "shared_data.pkl")
 META_FILE_PATH = os.path.join(UPLOAD_DIR, "metadata.pkl")
 
+# --- APPLE iOS "LIQUID GLASS" THEME & STICKY MOBILE ENGINE ---
 GLOBAL_HEAD = """
 <style>
     :root {
@@ -53,43 +41,39 @@ GLOBAL_HEAD = """
     .nav { background: rgba(255, 255, 255, 0.85); backdrop-filter: saturate(200%) blur(30px); border-bottom: 1px solid rgba(0, 0, 0, 0.08); padding: 0 24px; height: 60px; display: flex; justify-content: space-between; align-items: center; font-size: 16px; font-weight: 600; color: var(--text-primary); position: fixed; top: 0; width: 100%; box-sizing: border-box; z-index: 1000; }
     .view-toggle { background: rgba(0,0,0,0.04); padding: 8px 14px; border-radius: 980px; font-size: 12px; font-weight: 500; cursor: pointer; display: flex; align-items: center; transition: 0.2s; border: none; color: var(--text-primary); flex-shrink: 0; }
     .view-toggle:hover { background: rgba(0,0,0,0.08); }
-    .logout-btn { color: var(--text-secondary); text-decoration: none; font-size: 13px; font-weight: 500; margin-left: 16px; transition: 0.2s; }
-    .logout-btn:hover { color: #ff3b30; }
     
     .upload-container { max-width: 520px; margin: 130px auto 40px auto; padding: 0 16px; box-sizing: border-box; }
     .title { font-size: 36px; font-weight: 700; letter-spacing: -0.015em; text-align: center; margin: 0 0 8px 0; }
     .subtitle { font-size: 17px; font-weight: 400; text-align: center; color: var(--text-secondary); margin: 0 0 32px 0; }
+    
     .card { background: var(--glass-bg); backdrop-filter: blur(25px) saturate(180%); border-radius: 24px; padding: 32px; box-shadow: var(--shadow-glass); border: 1px solid var(--glass-border); box-sizing: border-box; }
     
-    .step-card { background: rgba(255,255,255,0.7); border: 1px solid rgba(0,0,0,0.06); border-radius: 16px; margin-bottom: 16px; padding: 16px; box-shadow: 0 2px 8px rgba(0,0,0,0.02); }
-    .step-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; border-bottom: 1px solid rgba(0,0,0,0.05); padding-bottom: 8px; }
-    .step-title { font-size: 14px; font-weight: 700; color: var(--text-primary); margin: 0; display: flex; align-items: center; }
+    /* Simplified Clean Sidebar Elements */
+    .sidebar-section { margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid rgba(0,0,0,0.06); }
+    .sidebar-section:last-child { border-bottom: none; }
+    .section-title { font-size: 13px; font-weight: 700; color: var(--text-primary); margin: 0 0 12px 0; text-transform: uppercase; letter-spacing: 0.03em; }
     
     .form-group { margin-bottom: 16px; }
-    .form-group:last-child { margin-bottom: 0; }
-    .form-label-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
-    .form-label { font-size: 11px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; margin: 0; }
+    .form-label { font-size: 11px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; margin-bottom: 6px; display: block; }
     
-    .btn-micro { background: rgba(0,0,0,0.04); border: none; color: var(--blue-apple); font-size: 10px; font-weight: 600; cursor: pointer; padding: 4px 8px; border-radius: 6px; transition: 0.2s; }
-    .btn-micro:hover { background: rgba(0,113,227,0.1); }
-    
-    .form-input { width: 100%; padding: 10px 12px; font-size: 13px; border: 1px solid rgba(0,0,0,0.1); border-radius: 10px; background-color: rgba(255,255,255,0.9); color: var(--text-primary); box-sizing: border-box; transition: all 0.2s ease; margin-bottom: 8px; }
+    .form-input { width: 100%; padding: 10px 12px; font-size: 13px; border: 1px solid rgba(0,0,0,0.1); border-radius: 8px; background-color: rgba(255,255,255,0.9); color: var(--text-primary); box-sizing: border-box; transition: all 0.2s ease; }
     .form-input:focus { border-color: var(--blue-apple); outline: none; box-shadow: 0 0 0 4px rgba(0, 113, 227, 0.15); }
     
-    .checkbox-group { background: rgba(0,0,0,0.02); border: 1px solid rgba(0,0,0,0.05); border-radius: 10px; padding: 8px; max-height: 140px; overflow-y: auto; }
-    .checkbox-item { display: flex; align-items: center; margin-bottom: 4px; font-size: 12px; cursor: pointer; padding: 4px 8px; border-radius: 6px; transition: background 0.15s; }
+    .checkbox-group { background: rgba(255,255,255,0.6); border: 1px solid rgba(0,0,0,0.08); border-radius: 10px; padding: 8px; max-height: 160px; overflow-y: auto; }
+    .checkbox-item { display: flex; align-items: center; margin-bottom: 4px; font-size: 13px; cursor: pointer; padding: 6px 8px; border-radius: 6px; transition: background 0.15s; }
     .checkbox-item:hover { background: rgba(0,0,0,0.04); }
     .checkbox-item:last-child { margin-bottom: 0; }
-    .checkbox-item input { margin-right: 8px; width: 14px; height: 14px; accent-color: var(--blue-apple); cursor: pointer; flex-shrink: 0; }
+    .checkbox-item input { margin-right: 10px; width: 16px; height: 16px; accent-color: var(--blue-apple); cursor: pointer; flex-shrink: 0; }
     
     .btn-primary { background-color: var(--blue-apple); color: white; border: none; border-radius: 980px; padding: 12px 20px; font-size: 14px; font-weight: 500; cursor: pointer; text-align: center; display: inline-flex; align-items: center; justify-content: center; text-decoration: none; box-sizing: border-box; transition: background 0.2s, transform 0.1s; width: 100%; }
     .btn-primary:hover { background-color: var(--blue-hover); }
     
-    .btn-segmented { display: flex; background: rgba(0,0,0,0.04); border-radius: 8px; padding: 2px; gap: 2px; }
-    .btn-segmented label { flex: 1; text-align: center; font-size: 11px; font-weight: 500; padding: 6px 0; border-radius: 6px; cursor: pointer; color: var(--text-secondary); transition: 0.2s; }
+    .btn-segmented { display: flex; background: rgba(0,0,0,0.04); border-radius: 8px; padding: 3px; gap: 3px; }
+    .btn-segmented label { flex: 1; text-align: center; font-size: 12px; font-weight: 500; padding: 6px 0; border-radius: 6px; cursor: pointer; color: var(--text-secondary); transition: 0.2s; }
     .btn-segmented input { display: none; }
     .btn-segmented input:checked + label { background: #ffffff; color: var(--text-primary); box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
     
+    /* Dropdown */
     .dropdown { position: relative; display: inline-block; }
     .dropdown-content { display: none; position: absolute; right: 0; background-color: rgba(255,255,255,0.95); backdrop-filter: blur(30px); min-width: 170px; box-shadow: 0 15px 35px rgba(0,0,0,0.12); border-radius: 16px; border: 1px solid rgba(255,255,255,0.8); z-index: 2000; overflow: hidden; margin-top: 8px; }
     .dropdown-content.show { display: block; animation: fadeIn 0.2s ease; }
@@ -97,13 +81,16 @@ GLOBAL_HEAD = """
     .dropdown-item:hover { background-color: rgba(0,113,227,0.08); color: var(--blue-apple); }
     @keyframes fadeIn { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: translateY(0); } }
 
+    /* TABLE CSS FIXES FOR "STUFFED" DATES */
     .table-container { background: var(--glass-bg); backdrop-filter: blur(25px); border-radius: 20px; box-shadow: var(--shadow-glass); border: 1px solid var(--glass-border); overflow: hidden; width: 100%; box-sizing: border-box; display: flex; flex-direction: column; }
-    .table-scroll { max-height: calc(100vh - 200px); overflow-y: auto; overflow-x: auto; -webkit-overflow-scrolling: touch; position: relative; }
-    .excel-table { width: 100%; table-layout: fixed; border-collapse: separate; border-spacing: 0; font-size: 13px; background: transparent; word-wrap: break-word; min-width: 550px; }
-    .excel-table th, .excel-table td { padding: 14px 16px; text-align: left; border-bottom: 1px solid rgba(0,0,0,0.06); overflow: hidden; text-overflow: ellipsis; position: relative; }
+    .table-scroll { max-height: calc(100vh - 180px); overflow-y: auto; overflow-x: auto; -webkit-overflow-scrolling: touch; position: relative; }
+    
+    /* Using max-content to prevent squishing */
+    .excel-table { width: max-content; min-width: 100%; border-collapse: separate; border-spacing: 0; font-size: 13px; background: transparent; }
+    .excel-table th, .excel-table td { padding: 14px 20px; text-align: left; border-bottom: 1px solid rgba(0,0,0,0.06); white-space: nowrap; position: relative; }
     
     .excel-table th { 
-        background-color: rgba(30, 30, 34, 0.85); 
+        background-color: rgba(30, 30, 34, 0.95); 
         backdrop-filter: blur(20px) saturate(180%); 
         font-family: 'SF Mono', ui-monospace, Menlo, Monaco, monospace;
         font-size: 11px; 
@@ -115,7 +102,6 @@ GLOBAL_HEAD = """
         z-index: 100; 
         border-bottom: 1px solid rgba(255,255,255,0.1); 
         user-select: none;
-        box-shadow: 0 4px 10px rgba(0,0,0,0.1);
     }
     
     .excel-table th:nth-child(5n+1) { color: var(--code-blue); }
@@ -127,23 +113,26 @@ GLOBAL_HEAD = """
     .resizer { position: absolute; right: 0; top: 0; bottom: 0; width: 6px; cursor: col-resize; z-index: 101; }
     .resizer:hover { background-color: rgba(0, 113, 227, 0.4); }
 
-    .excel-table td { white-space: nowrap; }
     .excel-table tr:hover td { background-color: rgba(0, 113, 227, 0.04); }
     
-    .excel-table th.total-col-header { color: #ffffff !important; background-color: rgba(20, 20, 24, 0.95); border-left: 1px solid rgba(255,255,255,0.1); }
+    .excel-table th.total-col-header { color: #ffffff !important; background-color: rgba(20, 20, 24, 0.98); border-left: 1px solid rgba(255,255,255,0.1); }
     .excel-table td.total-col-cell { background-color: rgba(0, 113, 227, 0.03); font-weight: 600; border-left: 1px solid rgba(0, 113, 227, 0.1); }
-    .excel-table tbody tr:last-child td { font-weight: 700; background-color: rgba(0, 113, 227, 0.12); color: var(--blue-apple); border-top: 2px solid var(--blue-apple); border-bottom: none; box-shadow: inset 0 1px 0 rgba(255,255,255,0.6); }
+    .excel-table tbody tr:last-child td { font-weight: 700; background-color: rgba(0, 113, 227, 0.12); color: var(--blue-apple); border-top: 2px solid var(--blue-apple); border-bottom: none; }
     
     .number-cell { font-variant-numeric: tabular-nums; }
     .pct-positive { color: #34c759; font-weight: 600; }
     .pct-negative { color: #ff3b30; font-weight: 600; }
     .pct-neutral { color: var(--text-secondary); }
-    
+
+    /* Layout & Sidebar Resizer */
     body.desktop-mode { overflow: hidden; }
     body.desktop-mode .app-layout { display: flex; flex-direction: row; height: 100vh; padding-top: 60px; box-sizing: border-box; }
-    body.desktop-mode .sidebar { width: 360px; background: var(--glass-sidebar); backdrop-filter: blur(40px) saturate(180%); padding: 24px 20px; overflow-y: auto; flex-shrink: 0; box-sizing: border-box; height: calc(100vh - 60px); }
+    
+    body.desktop-mode .sidebar { width: 340px; background: var(--glass-sidebar); backdrop-filter: blur(40px) saturate(180%); padding: 24px 20px; overflow-y: auto; flex-shrink: 0; box-sizing: border-box; height: calc(100vh - 60px); }
+    
     .sidebar-resizer { width: 5px; background: rgba(0,0,0,0.03); cursor: col-resize; z-index: 100; transition: background 0.2s; flex-shrink: 0; border-right: 1px solid rgba(0,0,0,0.06); }
     .sidebar-resizer:hover, .sidebar-resizer.resizing { background: var(--blue-apple); }
+    
     body.desktop-mode .main-content { flex: 1; padding: 24px 32px; overflow-y: auto; overflow-x: hidden; background: var(--bg-main); box-sizing: border-box; height: calc(100vh - 60px); }
     body.desktop-mode .header-actions { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; flex-wrap: wrap; gap: 10px; }
     
@@ -190,59 +179,6 @@ GLOBAL_HEAD = """
 </script>
 """
 
-LOGIN_HTML = """
-<!DOCTYPE html>
-<html>
-<head><title>Login - Analytics Pro</title><meta name="viewport" content="width=device-width, initial-scale=1.0">""" + GLOBAL_HEAD + """</head>
-<body>
-    <div class="nav">
-        <div>Analytics Pro</div>
-    </div>
-    <div class="upload-container">
-        <h1 class="title">Secure Access.</h1>
-        <p class="subtitle">Enter your email address to receive a One-Time Password.</p>
-        <div class="card">
-            <form action="/login" method="post">
-                <div class="form-group">
-                    <label class="form-label" style="margin-bottom: 8px;">Email Address</label>
-                    <input type="email" name="user_id" required class="form-input" placeholder="e.g. user@brand.com">
-                </div>
-                <button type="submit" class="btn-primary">Send OTP</button>
-            </form>
-        </div>
-    </div>
-</body>
-</html>
-"""
-
-VERIFY_HTML = """
-<!DOCTYPE html>
-<html>
-<head><title>Verify OTP - Analytics Pro</title><meta name="viewport" content="width=device-width, initial-scale=1.0">""" + GLOBAL_HEAD + """</head>
-<body>
-    <div class="nav">
-        <div>Analytics Pro</div>
-    </div>
-    <div class="upload-container">
-        <h1 class="title">Verify Identity.</h1>
-        <p class="subtitle">Enter the 6-digit code sent to your email.</p>
-        <div class="card">
-            {% if error %}
-            <div style="background: rgba(255,59,48,0.1); color: #ff3b30; padding: 12px; border-radius: 12px; margin-bottom: 16px; font-size: 13px; font-weight: 600; text-align: center;">{{ error }}</div>
-            {% endif %}
-            <form action="/verify" method="post">
-                <div class="form-group">
-                    <label class="form-label" style="margin-bottom: 8px;">Secure OTP</label>
-                    <input type="text" name="otp" required class="form-input" placeholder="● ● ● ● ● ●" maxlength="6" style="text-align: center; font-size: 20px; letter-spacing: 4px;">
-                </div>
-                <button type="submit" class="btn-primary">Authenticate</button>
-            </form>
-        </div>
-    </div>
-</body>
-</html>
-"""
-
 UPLOAD_HTML = """
 <!DOCTYPE html>
 <html>
@@ -252,7 +188,6 @@ UPLOAD_HTML = """
         <div>Analytics Pro</div>
         <div>
             <button class="view-toggle" onclick="toggleViewMode()" id="viewToggleBtn">💻 Desktop Site</button>
-            <a href="/logout" class="logout-btn">Logout</a>
         </div>
     </div>
     <div class="upload-container">
@@ -280,83 +215,62 @@ WORKSPACE_HTML = """
         <div>Analytics Pro</div>
         <div style="display: flex; align-items: center;">
             <button class="view-toggle" onclick="toggleViewMode()" id="viewToggleBtn">💻 Desktop Site</button>
-            <a href="/logout" class="logout-btn">Logout</a>
         </div>
     </div>
     
     <div class="app-layout">
         <div class="sidebar" id="appSidebar">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; padding: 0 4px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px;">
                 <h2 style="font-size: 20px; font-weight: 700; margin: 0;">Workspace</h2>
-                <button type="button" onclick="clearAll()" style="background: none; border: none; color: var(--blue-apple); font-size: 13px; font-weight: 600; cursor: pointer; padding: 0;">Reset All</button>
+                <button type="button" onclick="clearAll()" style="background: rgba(0,113,227,0.1); border: none; color: var(--blue-apple); font-size: 11px; font-weight: 600; cursor: pointer; padding: 6px 12px; border-radius: 8px;">Reset All</button>
             </div>
 
             <form id="config-form">
                 <input type="hidden" name="date_col" value="{{ default_date_col }}">
 
-                <!-- STEP 1: FILTER DATA -->
-                <div class="step-card">
-                    <div class="step-header">
-                        <h3 class="step-title">1. Filter Data</h3>
+                <!-- DATE & WEEKS -->
+                <div class="sidebar-section">
+                    <h3 class="section-title">Timeline</h3>
+                    {% if default_date_col %}
+                    <div style="display: flex; gap: 8px; margin-bottom: 12px;">
+                        <div style="flex:1;">
+                            <label class="form-label">FROM</label>
+                            <input type="date" name="start_date" id="start_date" class="form-input">
+                        </div>
+                        <div style="flex:1;">
+                            <label class="form-label">TO</label>
+                            <input type="date" name="end_date" id="end_date" class="form-input">
+                        </div>
                     </div>
                     
-                    {% if default_date_col %}
-                    <div class="form-group">
-                        <div class="form-label-header">
-                            <label class="form-label">DATE RANGE</label>
-                        </div>
-                        <div class="btn-segmented" style="margin-bottom: 12px;">
-                            <input type="radio" id="dr_today" name="dr_preset" onclick="setDateRange('today')">
-                            <label for="dr_today">Today</label>
-                            
-                            <input type="radio" id="dr_week" name="dr_preset" onclick="setDateRange('week')">
-                            <label for="dr_week">Week</label>
-                            
-                            <input type="radio" id="dr_month" name="dr_preset" onclick="setDateRange('month')">
-                            <label for="dr_month">Month</label>
-                            
-                            <input type="radio" id="dr_custom" name="dr_preset" checked>
-                            <label for="dr_custom">Custom</label>
-                        </div>
-                        
-                        <div style="display: flex; gap: 8px; margin-bottom: 12px;">
-                            <div style="flex:1;">
-                                <label style="font-size:10px; color:#86868b; margin-bottom:4px; display:block; font-weight:600;">FROM</label>
-                                <input type="date" name="start_date" id="start_date" class="form-input" style="padding: 8px;">
-                            </div>
-                            <div style="flex:1;">
-                                <label style="font-size:10px; color:#86868b; margin-bottom:4px; display:block; font-weight:600;">TO</label>
-                                <input type="date" name="end_date" id="end_date" class="form-input" style="padding: 8px;">
-                            </div>
-                        </div>
+                    <label class="form-label">SPECIFIC WEEKS</label>
+                    <div style="display: flex; gap: 12px; margin-bottom: 8px;">
+                        <label style="font-size:12px; cursor:pointer; display:flex; align-items:center;"><input type="checkbox" name="week_num" value="1" onchange="updateDashboard()" style="margin-right:6px;"> W1</label>
+                        <label style="font-size:12px; cursor:pointer; display:flex; align-items:center;"><input type="checkbox" name="week_num" value="2" onchange="updateDashboard()" style="margin-right:6px;"> W2</label>
+                        <label style="font-size:12px; cursor:pointer; display:flex; align-items:center;"><input type="checkbox" name="week_num" value="3" onchange="updateDashboard()" style="margin-right:6px;"> W3</label>
+                        <label style="font-size:12px; cursor:pointer; display:flex; align-items:center;"><input type="checkbox" name="week_num" value="4" onchange="updateDashboard()" style="margin-right:6px;"> W4</label>
+                    </div>
+                    {% endif %}
+                </div>
 
-                        <div style="background: rgba(0,113,227,0.04); border-radius: 8px; padding: 8px;">
-                            <div class="form-label-header">
-                                <label class="form-label" style="color: var(--blue-apple);">WEEKS IN MONTH</label>
-                                <div>
-                                    <button type="button" class="btn-micro" onclick="selectAll('week_num', true)">All</button>
-                                    <button type="button" class="btn-micro" onclick="selectAll('week_num', false)">Clear</button>
-                                </div>
-                            </div>
-                            <div style="display: flex; gap: 8px;">
-                                <label class="checkbox-item" style="margin:0;"><input type="checkbox" name="week_num" value="1"> W1</label>
-                                <label class="checkbox-item" style="margin:0;"><input type="checkbox" name="week_num" value="2"> W2</label>
-                                <label class="checkbox-item" style="margin:0;"><input type="checkbox" name="week_num" value="3"> W3</label>
-                                <label class="checkbox-item" style="margin:0;"><input type="checkbox" name="week_num" value="4"> W4</label>
-                            </div>
+                <!-- DATA FILTERS -->
+                <div class="sidebar-section">
+                    <h3 class="section-title">Filters</h3>
+                    
+                    {% if status_col %}
+                    <div class="form-group">
+                        <label class="form-label">STATUS</label>
+                        <div class="checkbox-group" style="max-height: 100px;">
+                            {% for status in unique_statuses %}
+                            <label class="checkbox-item"><input type="checkbox" name="status_filters" value="{{ status }}"> <span style="overflow:hidden; text-overflow:ellipsis;">{{ status }}</span></label>
+                            {% endfor %}
                         </div>
                     </div>
                     {% endif %}
 
                     {% if spc_list %}
                     <div class="form-group">
-                        <div class="form-label-header">
-                            <label class="form-label">SPC NAME</label>
-                            <div>
-                                <button type="button" class="btn-micro" onclick="selectAll('spc_filters', true)">All</button>
-                                <button type="button" class="btn-micro" onclick="selectAll('spc_filters', false)">Clear</button>
-                            </div>
-                        </div>
+                        <label class="form-label">SPC NAME</label>
                         <div class="checkbox-group" id="spc-container">
                             {% for spc in spc_list %}
                             <label class="checkbox-item" data-val="{{ spc }}"><input type="checkbox" name="spc_filters" value="{{ spc }}" onchange="handleCascade()"> <span style="overflow:hidden; text-overflow:ellipsis;">{{ spc }}</span></label>
@@ -367,13 +281,7 @@ WORKSPACE_HTML = """
 
                     {% if seg1_list %}
                     <div class="form-group">
-                        <div class="form-label-header">
-                            <label class="form-label">SEG 1</label>
-                            <div>
-                                <button type="button" class="btn-micro" onclick="selectAll('seg1_filters', true)">All</button>
-                                <button type="button" class="btn-micro" onclick="selectAll('seg1_filters', false)">Clear</button>
-                            </div>
-                        </div>
+                        <label class="form-label">SEG 1</label>
                         <div class="checkbox-group" id="seg-container">
                             {% for seg in seg1_list %}
                             <label class="checkbox-item" data-val="{{ seg }}"><input type="checkbox" name="seg1_filters" value="{{ seg }}" onchange="handleCascade()"> <span style="overflow:hidden; text-overflow:ellipsis;">{{ seg }}</span></label>
@@ -384,13 +292,7 @@ WORKSPACE_HTML = """
 
                     {% if family_list %}
                     <div class="form-group">
-                        <div class="form-label-header">
-                            <label class="form-label">FAMILY NAME</label>
-                            <div>
-                                <button type="button" class="btn-micro" onclick="selectAll('family_filters', true)">All</button>
-                                <button type="button" class="btn-micro" onclick="selectAll('family_filters', false)">Clear</button>
-                            </div>
-                        </div>
+                        <label class="form-label">FAMILY NAME</label>
                         <div class="checkbox-group" id="fam-container">
                             {% for fam in family_list %}
                             <label class="checkbox-item" data-val="{{ fam }}"><input type="checkbox" name="family_filters" value="{{ fam }}"> <span style="overflow:hidden; text-overflow:ellipsis;">{{ fam }}</span></label>
@@ -398,67 +300,38 @@ WORKSPACE_HTML = """
                         </div>
                     </div>
                     {% endif %}
-                    
-                    {% if status_col %}
-                    <div class="form-group">
-                        <div class="form-label-header">
-                            <label class="form-label">STATUS</label>
-                        </div>
-                        <div class="checkbox-group" style="max-height: 80px;">
-                            {% for status in unique_statuses %}
-                            <label class="checkbox-item"><input type="checkbox" name="status_filters" value="{{ status }}"> <span style="overflow:hidden; text-overflow:ellipsis;">{{ status }}</span></label>
-                            {% endfor %}
-                        </div>
-                    </div>
-                    {% endif %}
                 </div>
 
-                <!-- STEP 2: BUILD TABLE -->
-                <div class="step-card">
-                    <div class="step-header">
-                        <h3 class="step-title">2. Build Table</h3>
-                    </div>
+                <!-- TABLE STRUCTURE -->
+                <div class="sidebar-section">
+                    <h3 class="section-title">Structure</h3>
 
                     <div class="form-group">
-                        <div class="form-label-header">
-                            <label class="form-label">ROW GROUPING</label>
-                            <div>
-                                <button type="button" class="btn-micro" onclick="selectAll('index_cols', true)">All</button>
-                                <button type="button" class="btn-micro" onclick="selectAll('index_cols', false)">Clear</button>
-                            </div>
-                        </div>
+                        <label class="form-label">ROWS</label>
                         <div class="checkbox-group" id="row-grouping-container">
                             {% for col in grouping_cols %}
-                            <div class="checkbox-item">
+                            <label class="checkbox-item">
                                 <input type="checkbox" name="index_cols" value="{{ col }}"> 
                                 <span style="overflow: hidden; text-overflow: ellipsis;">{{ col }}</span>
-                            </div>
+                            </label>
                             {% endfor %}
                         </div>
                     </div>
 
                     <div class="form-group">
-                        <div class="form-label-header">
-                            <label class="form-label">COLUMN SPLIT</label>
-                            <div>
-                                <button type="button" class="btn-micro" onclick="selectAll('columns_cols', true)">All</button>
-                                <button type="button" class="btn-micro" onclick="selectAll('columns_cols', false)">Clear</button>
-                            </div>
-                        </div>
+                        <label class="form-label">COLUMNS</label>
                         <div class="checkbox-group" id="col-grouping-container">
                             {% for col in grouping_cols %}
-                            <div class="checkbox-item">
+                            <label class="checkbox-item">
                                 <input type="checkbox" name="columns_cols" value="{{ col }}"> 
                                 <span style="overflow: hidden; text-overflow: ellipsis;">{{ col }}</span>
-                            </div>
+                            </label>
                             {% endfor %}
                         </div>
                     </div>
                     
-                    <div class="form-group" style="background: rgba(52,199,89,0.06); padding: 10px; border-radius: 10px;">
-                        <div class="form-label-header">
-                            <label class="form-label" style="color: #248a3d;">COMPARE VIEW</label>
-                        </div>
+                    <div class="form-group">
+                        <label class="form-label">COMPARE VIEW</label>
                         <div class="btn-segmented">
                             <input type="radio" id="cv_none" name="spc_compare" value="none" checked onchange="updateDashboard()">
                             <label for="cv_none">None</label>
@@ -472,35 +345,18 @@ WORKSPACE_HTML = """
                     </div>
                 </div>
 
-                <!-- STEP 3: METRICS -->
-                <div class="step-card">
-                    <div class="step-header">
-                        <h3 class="step-title">3. Choose Metrics</h3>
-                    </div>
-
+                <!-- METRICS -->
+                <div class="sidebar-section">
+                    <h3 class="section-title">Metrics</h3>
                     <div class="form-group">
-                        <div class="form-label-header">
-                            <label class="form-label">VALUES</label>
-                        </div>
                         <div class="checkbox-group" style="max-height: none;">
                             <label class="checkbox-item"><input type="checkbox" name="agg_funcs" value="sum"> Sum Total</label>
                             <label class="checkbox-item"><input type="checkbox" name="agg_funcs" value="count"> Count (Quantity)</label>
                             <label class="checkbox-item"><input type="checkbox" name="agg_funcs" value="mean"> Average Price</label>
-                        </div>
-                    </div>
-
-                    <div class="form-group">
-                        <div class="form-label-header">
-                            <label class="form-label">INSIGHTS</label>
-                        </div>
-                        <div class="checkbox-group" style="max-height: none;">
+                            <div style="border-top: 1px solid rgba(0,0,0,0.06); margin: 6px 0;"></div>
                             <label class="checkbox-item" title="% of Column Total"><input type="checkbox" name="agg_funcs" value="contrib"> Contribution %</label>
                             <label class="checkbox-item" title="Period-over-Period Growth"><input type="checkbox" name="agg_funcs" value="growth"> Growth % (PoP)</label>
-                        </div>
-                    </div>
-
-                    <div class="form-group">
-                        <div class="checkbox-group" style="max-height: none; background: transparent; border: none; padding: 0;">
+                            <div style="border-top: 1px solid rgba(0,0,0,0.06); margin: 6px 0;"></div>
                             <label class="checkbox-item"><input type="checkbox" name="show_row_total" value="true"> <b>Show Grand Totals</b></label>
                         </div>
                     </div>
@@ -529,18 +385,20 @@ WORKSPACE_HTML = """
             <div id="capture-area" class="table-container">
                 <div id="table-wrapper" class="table-scroll">
                     <div style="padding: 100px 20px; text-align: center;">
-                        <p style="color: #86868b; font-size: 15px; font-weight: 500;">Configure your parameters on the left to view data.</p>
+                        <p style="color: #86868b; font-size: 15px; font-weight: 500;">Select at least one <b>Row</b> and one <b>Metric</b> from the sidebar to view data.</p>
                     </div>
                 </div>
             </div>
         </div>
     </div>
 
+    <!-- Injecting Data Map for Cascading Filters -->
     <script>
         const filterMap = {{ filter_mapping_json|safe }};
     </script>
 
     <script>
+        // Sidebar Resizer Logic
         const resizer = document.getElementById('sidebarResizer');
         const sidebar = document.getElementById('appSidebar');
         let isResizing = false;
@@ -566,23 +424,10 @@ WORKSPACE_HTML = """
             }
         });
 
-        function selectAll(name, checked) {
-            const checkboxes = document.querySelectorAll(`input[name="${name}"]`);
-            checkboxes.forEach(cb => { cb.checked = checked; });
-            if(['spc_filters', 'seg1_filters', 'family_filters'].includes(name)) {
-                handleCascade();
-            } else {
-                updateDashboard();
-            }
-        }
-
         function clearAll() {
             document.getElementById('config-form').reset();
-            document.getElementById('start_date').value = '';
-            document.getElementById('end_date').value = '';
-            document.getElementById('dr_custom').checked = true;
             document.querySelectorAll('.checkbox-item').forEach(el => el.style.display = 'flex');
-            updateDashboard();
+            document.getElementById('table-wrapper').innerHTML = '<div style="padding: 100px 20px; text-align: center;"><p style="color: #86868b; font-size: 15px; font-weight: 500;">Select at least one <b>Row</b> and one <b>Metric</b> from the sidebar to view data.</p></div>';
         }
 
         function handleCascade() {
@@ -617,35 +462,6 @@ WORKSPACE_HTML = """
             updateDashboard();
         }
 
-        function setDateRange(range) {
-            const today = new Date();
-            let start = new Date();
-            let end = new Date();
-            
-            document.querySelectorAll('input[name="week_num"]').forEach(r => r.checked = false);
-            
-            if (range === 'today') {
-            } else if (range === 'week') {
-                const day = today.getDay() || 7; 
-                if(day !== 1) start.setHours(-24 * (day - 1));
-                end = new Date(start);
-                end.setDate(end.getDate() + 6);
-            } else if (range === 'month') {
-                start = new Date(today.getFullYear(), today.getMonth(), 1);
-                end = new Date(today.getFullYear(), today.getMonth() + 1, 0);
-            }
-            
-            start.setMinutes(start.getMinutes() - start.getTimezoneOffset());
-            end.setMinutes(end.getMinutes() - end.getTimezoneOffset());
-            
-            if (range !== 'week' || document.getElementById('week-selector-container').style.display === 'none') {
-                document.getElementById('start_date').value = start.toISOString().split('T')[0];
-                document.getElementById('end_date').value = end.toISOString().split('T')[0];
-            }
-            
-            updateDashboard();
-        }
-
         async function updateDashboard() {
             const form = document.getElementById('config-form');
             const formData = new FormData(form);
@@ -654,7 +470,7 @@ WORKSPACE_HTML = """
             const aggFuncs = formData.getAll('agg_funcs');
             
             if (indexCols.length === 0 || aggFuncs.length === 0) {
-                document.getElementById('table-wrapper').innerHTML = '<div style="padding: 100px 20px; text-align: center;"><p style="color: #86868b; font-size: 15px; font-weight: 500;">Select at least one Row Grouping and one Metric.</p></div>';
+                document.getElementById('table-wrapper').innerHTML = '<div style="padding: 100px 20px; text-align: center;"><p style="color: #86868b; font-size: 15px; font-weight: 500;">Select at least one <b>Row</b> and one <b>Metric</b> from the sidebar to view data.</p></div>';
                 return;
             }
 
@@ -665,7 +481,7 @@ WORKSPACE_HTML = """
                 if (response.ok) {
                     let html = "";
                     if (data.filter_text) {
-                        html += `<div style="padding: 14px 16px; border-bottom: 1px solid rgba(0,0,0,0.06); background: rgba(255,255,255,0.8);">${data.filter_text}</div>`;
+                        html += `<div style="padding: 14px 20px; border-bottom: 1px solid rgba(0,0,0,0.06); background: rgba(255,255,255,0.8);">${data.filter_text}</div>`;
                     }
                     html += data.table_html;
                     document.getElementById('table-wrapper').innerHTML = html;
@@ -706,7 +522,6 @@ WORKSPACE_HTML = """
         });
         document.querySelectorAll('#config-form input[type="date"]').forEach(el => {
             el.addEventListener('blur', () => {
-                document.getElementById('dr_custom').checked = true;
                 updateDashboard();
             });
         });
@@ -715,16 +530,18 @@ WORKSPACE_HTML = """
             const body = document.body;
             if (window.innerWidth <= 768) { body.classList.add('mobile-mode'); document.getElementById('viewToggleBtn').innerHTML = "📱 Mobile Site"; } 
             else { body.classList.add('desktop-mode'); document.getElementById('viewToggleBtn').innerHTML = "💻 Desktop Site"; }
-            updateDashboard();
         });
         
+        // Accurate JPEG Download Logic for Scrolled Tables
         function exportImage() {
             const captureArea = document.getElementById('capture-area');
             const scrollArea = document.getElementById('table-wrapper');
             
+            // Save original styles
             const origMaxHeight = scrollArea.style.maxHeight;
             const origOverflow = scrollArea.style.overflow;
             
+            // Temporarily expand the container to full height so html2canvas sees everything
             scrollArea.style.maxHeight = 'none';
             scrollArea.style.overflow = 'visible';
             
@@ -779,6 +596,7 @@ WORKSPACE_HTML = """
                         link.click();
                     }
                     
+                    // Restore original styles
                     scrollArea.style.maxHeight = origMaxHeight;
                     scrollArea.style.overflow = origOverflow;
                 });
@@ -837,100 +655,36 @@ def get_date_bounds(df, date_col):
 
 # --- ROUTES ---
 
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    if request.method == 'POST':
-        user_id = request.form.get('user_id')
-        otp = str(random.randint(100000, 999999))
-        session['pending_user'] = user_id
-        session['expected_otp'] = otp
-        
-        # --- SEND LIVE EMAIL VIA GMAIL ---
-        sender_email = os.environ.get('EMAIL_ADDRESS')
-        sender_password = os.environ.get('EMAIL_PASSWORD')
-        
-        if sender_email and sender_password and '@' in user_id:
-            try:
-                msg = EmailMessage()
-                msg.set_content(f"Your Analytics Pro verification code is: {otp}\n\nPlease do not share this code with anyone.")
-                msg['Subject'] = 'Your Analytics Pro OTP'
-                msg['From'] = f"Analytics Pro <{sender_email}>"
-                msg['To'] = user_id
-
-                server = smtplib.SMTP_SSL('smtp.gmail.com', 465)
-                server.login(sender_email, sender_password)
-                server.send_message(msg)
-                server.quit()
-                print(f"[EMAIL] Sent to {user_id}")
-            except Exception as e:
-                print(f"[EMAIL ERROR] Failed to send: {e}")
-        else:
-            # Fallback
-            print(f"\n\n[SECURITY] 🔒 OTP generated for {user_id}: {otp}\n\n")
-            
-        return redirect(url_for('verify'))
-    return render_template_string(LOGIN_HTML)
-
-@app.route("/verify", methods=["GET", "POST"])
-def verify():
-    error = None
-    if request.method == 'POST':
-        user_otp = request.form.get('otp')
-        if user_otp == session.get('expected_otp'):
-            session['authenticated'] = True
-            session.pop('expected_otp', None)
-            return redirect(url_for('home'))
-        else:
-            error = "Invalid or expired OTP. Please try again."
-    return render_template_string(VERIFY_HTML, error=error)
-
-@app.route("/logout")
-def logout():
-    session.clear()
-    return redirect(url_for('login'))
-
-@app.route("/", methods=["GET"])
-@login_required
+@app.route("/", methods=["GET", "POST"])
 def home():
     df = load_data()
     if df is not None:
-        return redirect(url_for('workspace'))
-    return redirect(url_for('upload_page'))
+        all_cols = df.columns.tolist()
+        default_date_col = 'Customized Sales Date' if 'Customized Sales Date' in all_cols else ('Sale Date' if 'Sale Date' in all_cols else next((c for c in all_cols if 'date' in str(c).lower()), ""))
+        
+        grouping_cols = df.select_dtypes(exclude=['number']).columns.tolist()
+        
+        spc_list, seg1_list, family_list, status_col, filter_mapping_json = get_filter_lists(df)
+        unique_statuses = df[status_col].dropna().unique().tolist() if status_col else []
+        upload_time = get_metadata()
+        min_sale_date, max_sale_date = get_date_bounds(df, default_date_col)
+
+        return render_template_string(WORKSPACE_HTML, all_cols=all_cols, grouping_cols=grouping_cols, default_date_col=default_date_col, status_col=status_col, unique_statuses=unique_statuses, spc_list=spc_list, seg1_list=seg1_list, family_list=family_list, upload_time=upload_time, min_sale_date=min_sale_date, max_sale_date=max_sale_date, filter_mapping_json=filter_mapping_json)
+    return render_template_string(UPLOAD_HTML)
 
 @app.route("/upload", methods=["GET"])
-@login_required
 def upload_page():
     return render_template_string(UPLOAD_HTML)
 
-@app.route("/workspace", methods=["GET"])
-@login_required
-def workspace():
-    df = load_data()
-    if df is None: return redirect(url_for('upload_page'))
-    
-    all_cols = df.columns.tolist()
-    default_date_col = 'Customized Sales Date' if 'Customized Sales Date' in all_cols else ('Sale Date' if 'Sale Date' in all_cols else next((c for c in all_cols if 'date' in str(c).lower()), ""))
-    
-    grouping_cols = df.select_dtypes(exclude=['number']).columns.tolist()
-    
-    spc_list, seg1_list, family_list, status_col, filter_mapping_json = get_filter_lists(df)
-    unique_statuses = df[status_col].dropna().unique().tolist() if status_col else []
-    upload_time = get_metadata()
-    min_sale_date, max_sale_date = get_date_bounds(df, default_date_col)
-
-    return render_template_string(WORKSPACE_HTML, all_cols=all_cols, grouping_cols=grouping_cols, default_date_col=default_date_col, status_col=status_col, unique_statuses=unique_statuses, spc_list=spc_list, seg1_list=seg1_list, family_list=family_list, upload_time=upload_time, min_sale_date=min_sale_date, max_sale_date=max_sale_date, filter_mapping_json=filter_mapping_json)
-
 @app.route("/dashboard", methods=["POST"])
-@login_required
 def dashboard():
     if 'file' in request.files and request.files['file'].filename != '':
         file = request.files['file']
         df = pd.read_csv(file) if file.filename.endswith('.csv') else pd.read_excel(file)
         save_data(df)
-    return redirect(url_for('workspace'))
+    return redirect(url_for('home'))
 
 @app.route("/calculate", methods=["POST"])
-@login_required
 def calculate():
     df = load_data()
     if df is None: return jsonify({"error": "No data available."}), 400
@@ -1044,6 +798,7 @@ def calculate():
         
         new_cols = []
         agg_map = {'sum': 'Value', 'count': 'Qty', 'mean': 'Avg'}
+        
         for col in pivot_df.columns:
             if isinstance(col, tuple):
                 if col[0] in index_cols and all(x == '' for x in col[1:]):
@@ -1060,20 +815,24 @@ def calculate():
                         if len(item_str) >= 6 and any(char.isdigit() for char in item_str):
                             try: parts.append(pd.to_datetime(item_str, errors='raise').strftime('%d-%b-%y'))
                             except Exception: parts.append(item_str)
-                        else: parts.append(item_str)
+                        else:
+                            parts.append(item_str)
                 new_cols.append(" - ".join(parts) if parts else " - ".join(str(c) for c in col if str(c).strip()))
             else:
-                if col in index_cols: new_cols.append(str(col))
+                if col in index_cols:
+                    new_cols.append(str(col))
                 else:
                     col_str = str(col)
                     if len(col_str) >= 6 and any(char.isdigit() for char in col_str):
                         try: new_cols.append(pd.to_datetime(col_str, errors='raise').strftime('%d-%b-%y'))
                         except Exception: new_cols.append(col_str.replace('sum - ', '').replace('count - ', '').replace('mean - ', ''))
-                    else: new_cols.append(col_str.replace('sum - ', '').replace('count - ', '').replace('mean - ', ''))
+                    else:
+                        new_cols.append(col_str.replace('sum - ', '').replace('count - ', '').replace('mean - ', ''))
         
         pivot_df.columns = [str(c) for c in new_cols]
 
         metric_columns = [col for col in pivot_df.columns if col not in index_cols]
+        
         contrib_data = {}
         if calc_contrib:
             for c in metric_columns:
@@ -1107,7 +866,8 @@ def calculate():
         if not pivot_df.empty:
             total_row = pd.DataFrame([{c: '' for c in pivot_df.columns}])
             total_row.iloc[0, 0] = 'GRAND TOTAL'
-            for c in metric_columns: total_row.at[0, c] = pivot_df[c].sum()
+            for c in metric_columns:
+                total_row.at[0, c] = pivot_df[c].sum()
             pivot_df = pd.concat([pivot_df, total_row], ignore_index=True)
             
         pivot_df.to_pickle(os.path.join(UPLOAD_DIR, "summary_data.pkl"))
@@ -1131,7 +891,7 @@ def calculate():
                             s = s[:-2]
                         s = s + ',' + res
                     return '-' + s if num < 0 else s
-            except: return str(x)
+            except (ValueError, TypeError): return str(x)
                 
         for c in pivot_df.columns:
             if c not in index_cols:
@@ -1148,7 +908,6 @@ def calculate():
         return jsonify({"error": f"An error occurred: {str(e)}"}), 500
 
 @app.route("/download", methods=["GET"])
-@login_required
 def download():
     summary_path = os.path.join(UPLOAD_DIR, "summary_data.pkl")
     if not os.path.exists(summary_path): return "No data to download", 400
