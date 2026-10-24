@@ -198,7 +198,9 @@ WORKSPACE_HTML = """
             
             <div style="background: rgba(255,255,255,0.7); padding: 10px 12px; border-radius: 12px; margin-bottom: 14px; font-size: 12px; color: var(--text-secondary); border: 1px solid rgba(0,0,0,0.04);">
                 <div><b>Uploaded:</b> {{ upload_time }}</div>
+                {% if min_sale_date != 'N/A' %}
                 <div style="margin-top: 4px;"><b>Sale Data Range:</b> <span style="color: var(--blue-apple); font-weight: 600;">{{ min_sale_date }} to {{ max_sale_date }}</span></div>
+                {% endif %}
             </div>
 
             <form id="config-form">
@@ -322,7 +324,7 @@ WORKSPACE_HTML = """
             let end = new Date(maxIso);
 
             if (range === 'today') {
-                // Keep start and end as max date
+                // Keep both start and end as max date
             } else if (range === 'week') {
                 start.setDate(end.getDate() - 7);
             } else if (range === 'month') {
@@ -480,10 +482,11 @@ def get_metadata(df):
     max_sale_date_iso = ""
     
     all_cols = df.columns.tolist()
+    # Strictly target the customized 'Sale Date' column first
     date_col = 'Sale Date' if 'Sale Date' in all_cols else next((c for c in all_cols if 'date' in str(c).lower()), "")
+    
     if date_col:
         try:
-            # Safely coerce dates, handling mixed formats or Excel timestamps
             parsed_dates = pd.to_datetime(df[date_col], errors='coerce', dayfirst=True)
             min_dt = parsed_dates.min()
             max_dt = parsed_dates.max()
@@ -674,4 +677,4 @@ def download():
     )
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run
