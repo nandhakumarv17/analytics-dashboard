@@ -60,7 +60,7 @@ GLOBAL_HEAD = """
     .btn-micro { background: rgba(0,0,0,0.04); border: none; color: var(--blue-apple); font-size: 10px; font-weight: 600; cursor: pointer; padding: 4px 8px; border-radius: 6px; transition: 0.2s; }
     .btn-micro:hover { background: rgba(0,113,227,0.1); }
     
-    .form-input { width: 100%; padding: 12px 14px; font-size: 14px; border: 1px solid rgba(0,0,0,0.1); border-radius: 12px; background-color: rgba(255,255,255,0.9); color: var(--text-primary); box-sizing: border-box; transition: all 0.2s ease; margin-bottom: 8px; }
+    .form-input { width: 100%; padding: 10px 12px; font-size: 13px; border: 1px solid rgba(0,0,0,0.1); border-radius: 8px; background-color: rgba(255,255,255,0.9); color: var(--text-primary); box-sizing: border-box; transition: all 0.2s ease; margin-bottom: 8px; }
     .form-input:focus { border-color: var(--blue-apple); outline: none; box-shadow: 0 0 0 4px rgba(0, 113, 227, 0.15); }
     
     .checkbox-group { background: rgba(255,255,255,0.6); border: 1px solid rgba(0,0,0,0.08); border-radius: 10px; padding: 8px; max-height: 160px; overflow-y: auto; }
@@ -69,13 +69,14 @@ GLOBAL_HEAD = """
     .checkbox-item:last-child { margin-bottom: 0; }
     .checkbox-item input { margin-right: 10px; width: 16px; height: 16px; accent-color: var(--blue-apple); cursor: pointer; flex-shrink: 0; }
     
-    .btn-primary { background-color: var(--blue-apple); color: white; border: none; border-radius: 980px; padding: 14px 20px; font-size: 15px; font-weight: 600; cursor: pointer; text-align: center; display: inline-flex; align-items: center; justify-content: center; text-decoration: none; box-sizing: border-box; transition: background 0.2s, transform 0.1s; width: 100%; }
+    .btn-primary { background-color: var(--blue-apple); color: white; border: none; border-radius: 980px; padding: 12px 20px; font-size: 14px; font-weight: 600; cursor: pointer; text-align: center; display: inline-flex; align-items: center; justify-content: center; text-decoration: none; box-sizing: border-box; transition: background 0.2s, transform 0.1s; width: 100%; }
     .btn-primary:hover { background-color: var(--blue-hover); }
     
-    .btn-segmented { display: flex; background: rgba(0,0,0,0.04); border-radius: 8px; padding: 3px; gap: 3px; }
-    .btn-segmented label { flex: 1; text-align: center; font-size: 12px; font-weight: 500; padding: 6px 0; border-radius: 6px; cursor: pointer; color: var(--text-secondary); transition: 0.2s; }
-    .btn-segmented input { display: none; }
-    .btn-segmented input:checked + label { background: #ffffff; color: var(--text-primary); box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+    /* Date Preset Grid */
+    .date-preset-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 12px; }
+    .date-preset-btn { background: rgba(0,0,0,0.03); border: 1px solid rgba(0,0,0,0.05); color: var(--text-primary); padding: 8px; font-size: 11px; font-weight: 600; border-radius: 8px; cursor: pointer; transition: 0.2s; text-align: center; }
+    .date-preset-btn:hover { background: rgba(0,113,227,0.1); color: var(--blue-apple); }
+    .date-preset-btn.active { background: var(--blue-apple); color: #ffffff; border-color: var(--blue-apple); }
     
     /* KPI Ribbon Styles */
     .kpi-ribbon { display: flex; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; animation: fadeIn 0.4s ease; }
@@ -91,7 +92,7 @@ GLOBAL_HEAD = """
     .dropdown-item:hover { background-color: rgba(0,113,227,0.08); color: var(--blue-apple); }
     @keyframes fadeIn { from { opacity: 0; transform: translateY(-10px); } to { opacity: 1; transform: translateY(0); } }
 
-    /* TABLE CSS FIXES FOR "STUFFED" DATES */
+    /* TABLE CSS */
     .table-container { background: var(--glass-bg); backdrop-filter: blur(25px); border-radius: 20px; box-shadow: var(--shadow-glass); border: 1px solid var(--glass-border); overflow: hidden; width: 100%; box-sizing: border-box; display: flex; flex-direction: column; animation: fadeIn 0.5s ease; }
     .filter-text-bar { padding: 14px 20px; border-bottom: 1px solid rgba(0,0,0,0.06); background: rgba(255,255,255,0.6); }
     .table-scroll { max-height: calc(100vh - 280px); overflow-y: auto; overflow-x: auto; -webkit-overflow-scrolling: touch; position: relative; }
@@ -153,7 +154,7 @@ GLOBAL_HEAD = """
     body.desktop-mode { overflow: hidden; }
     body.desktop-mode .app-layout { display: flex; flex-direction: row; height: 100vh; padding-top: 60px; box-sizing: border-box; }
     
-    body.desktop-mode .sidebar { width: 340px; background: var(--glass-sidebar); backdrop-filter: blur(40px) saturate(180%); padding: 24px 20px; overflow-y: auto; flex-shrink: 0; box-sizing: border-box; height: calc(100vh - 60px); }
+    body.desktop-mode .sidebar { width: 320px; background: var(--glass-sidebar); backdrop-filter: blur(40px) saturate(180%); padding: 24px 20px; overflow-y: auto; flex-shrink: 0; box-sizing: border-box; height: calc(100vh - 60px); }
     
     .sidebar-resizer { width: 5px; background: rgba(0,0,0,0.02); cursor: col-resize; z-index: 100; transition: background 0.2s; flex-shrink: 0; border-right: 1px solid rgba(0,0,0,0.06); }
     .sidebar-resizer:hover, .sidebar-resizer.resizing { background: var(--blue-apple); }
@@ -173,7 +174,7 @@ GLOBAL_HEAD = """
     ::-webkit-scrollbar-track { background: transparent; }
     ::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.2); border-radius: 10px; }
 </style>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/dom-to-image/2.6.0/dom-to-image.min.js"></script>
 <script>
     function toggleViewMode() {
         const body = document.body;
@@ -253,11 +254,20 @@ WORKSPACE_HTML = """
             <form id="config-form">
                 <input type="hidden" name="date_col" value="{{ default_date_col }}">
 
-                <!-- DATE & WEEKS -->
+                <!-- TIMELINE -->
                 <div class="sidebar-section">
                     <h3 class="section-title">Timeline</h3>
                     {% if default_date_col %}
-                    <div style="display: flex; gap: 8px; margin-bottom: 12px;">
+                    <div class="date-preset-grid">
+                        <div class="date-preset-btn" onclick="setDateRange('today', this)">Today</div>
+                        <div class="date-preset-btn" onclick="setDateRange('last7', this)">Last 7 Days</div>
+                        <div class="date-preset-btn" onclick="setDateRange('last30', this)">Last 30 Days</div>
+                        <div class="date-preset-btn" onclick="setDateRange('mtd', this)">Month-to-Date</div>
+                        <div class="date-preset-btn" onclick="setDateRange('prev_month', this)">Prev Month</div>
+                        <div class="date-preset-btn" onclick="setDateRange('ytd', this)">Year-to-Date</div>
+                    </div>
+                    
+                    <div style="display: flex; gap: 8px;">
                         <div style="flex:1;">
                             <label class="form-label">FROM</label>
                             <input type="date" name="start_date" id="start_date" class="form-input">
@@ -267,20 +277,6 @@ WORKSPACE_HTML = """
                             <input type="date" name="end_date" id="end_date" class="form-input">
                         </div>
                     </div>
-                    
-                    <div class="form-label-header">
-                        <label class="form-label">SPECIFIC WEEKS</label>
-                        <div>
-                            <button type="button" class="btn-micro" onclick="selectAll('week_num', true)">All</button>
-                            <button type="button" class="btn-micro" onclick="selectAll('week_num', false)">Clear</button>
-                        </div>
-                    </div>
-                    <div style="display: flex; gap: 12px; margin-bottom: 8px;">
-                        <label style="font-size:12px; cursor:pointer; display:flex; align-items:center;"><input type="checkbox" name="week_num" value="1" onchange="updateDashboard()" style="margin-right:6px;"> W1</label>
-                        <label style="font-size:12px; cursor:pointer; display:flex; align-items:center;"><input type="checkbox" name="week_num" value="2" onchange="updateDashboard()" style="margin-right:6px;"> W2</label>
-                        <label style="font-size:12px; cursor:pointer; display:flex; align-items:center;"><input type="checkbox" name="week_num" value="3" onchange="updateDashboard()" style="margin-right:6px;"> W3</label>
-                        <label style="font-size:12px; cursor:pointer; display:flex; align-items:center;"><input type="checkbox" name="week_num" value="4" onchange="updateDashboard()" style="margin-right:6px;"> W4</label>
-                    </div>
                     {% endif %}
                 </div>
 
@@ -288,23 +284,6 @@ WORKSPACE_HTML = """
                 <div class="sidebar-section">
                     <h3 class="section-title">Filters</h3>
                     
-                    {% if status_col %}
-                    <div class="form-group">
-                        <div class="form-label-header">
-                            <label class="form-label">STATUS</label>
-                            <div>
-                                <button type="button" class="btn-micro" onclick="selectAll('status_filters', true)">All</button>
-                                <button type="button" class="btn-micro" onclick="selectAll('status_filters', false)">Clear</button>
-                            </div>
-                        </div>
-                        <div class="checkbox-group" style="max-height: 100px;">
-                            {% for status in unique_statuses %}
-                            <label class="checkbox-item"><input type="checkbox" name="status_filters" value="{{ status }}"> <span style="overflow:hidden; text-overflow:ellipsis;">{{ status }}</span></label>
-                            {% endfor %}
-                        </div>
-                    </div>
-                    {% endif %}
-
                     {% if spc_list %}
                     <div class="form-group">
                         <div class="form-label-header">
@@ -369,45 +348,13 @@ WORKSPACE_HTML = """
                                 <button type="button" class="btn-micro" onclick="selectAll('index_cols', false)">Clear</button>
                             </div>
                         </div>
-                        <div class="checkbox-group" id="row-grouping-container">
+                        <div class="checkbox-group" id="row-grouping-container" style="max-height: none;">
                             {% for col in grouping_cols %}
                             <label class="checkbox-item">
                                 <input type="checkbox" name="index_cols" value="{{ col }}"> 
                                 <span style="overflow: hidden; text-overflow: ellipsis;">{{ col }}</span>
                             </label>
                             {% endfor %}
-                        </div>
-                    </div>
-
-                    <div class="form-group">
-                        <div class="form-label-header">
-                            <label class="form-label">COLUMN SPLIT</label>
-                            <div>
-                                <button type="button" class="btn-micro" onclick="selectAll('columns_cols', true)">All</button>
-                                <button type="button" class="btn-micro" onclick="selectAll('columns_cols', false)">Clear</button>
-                            </div>
-                        </div>
-                        <div class="checkbox-group" id="col-grouping-container">
-                            {% for col in grouping_cols %}
-                            <label class="checkbox-item">
-                                <input type="checkbox" name="columns_cols" value="{{ col }}"> 
-                                <span style="overflow: hidden; text-overflow: ellipsis;">{{ col }}</span>
-                            </label>
-                            {% endfor %}
-                        </div>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label class="form-label">COMPARE VIEW</label>
-                        <div class="btn-segmented">
-                            <input type="radio" id="cv_none" name="spc_compare" value="none" checked onchange="updateDashboard()">
-                            <label for="cv_none">None</label>
-                            
-                            <input type="radio" id="cv_day" name="spc_compare" value="day" onchange="updateDashboard()">
-                            <label for="cv_day">Daily</label>
-                            
-                            <input type="radio" id="cv_week" name="spc_compare" value="week" onchange="updateDashboard()">
-                            <label for="cv_week">Weekly</label>
                         </div>
                     </div>
                 </div>
@@ -493,6 +440,39 @@ WORKSPACE_HTML = """
                 document.body.style.cursor = 'default';
             }
         });
+        
+        // Date Presets Logic
+        function setDateRange(range, btnElement) {
+            document.querySelectorAll('.date-preset-btn').forEach(btn => btn.classList.remove('active'));
+            if(btnElement) btnElement.classList.add('active');
+            
+            const today = new Date();
+            let start = new Date();
+            let end = new Date();
+            
+            if (range === 'today') {
+                // start and end stay as today
+            } else if (range === 'last7') {
+                start.setDate(today.getDate() - 6);
+            } else if (range === 'last30') {
+                start.setDate(today.getDate() - 29);
+            } else if (range === 'mtd') {
+                start = new Date(today.getFullYear(), today.getMonth(), 1);
+            } else if (range === 'prev_month') {
+                start = new Date(today.getFullYear(), today.getMonth() - 1, 1);
+                end = new Date(today.getFullYear(), today.getMonth(), 0);
+            } else if (range === 'ytd') {
+                start = new Date(today.getFullYear(), 0, 1);
+            }
+            
+            start.setMinutes(start.getMinutes() - start.getTimezoneOffset());
+            end.setMinutes(end.getMinutes() - end.getTimezoneOffset());
+            
+            document.getElementById('start_date').value = start.toISOString().split('T')[0];
+            document.getElementById('end_date').value = end.toISOString().split('T')[0];
+            
+            updateDashboard();
+        }
 
         function selectAll(name, checked) {
             const checkboxes = document.querySelectorAll(`input[name="${name}"]`);
@@ -506,6 +486,7 @@ WORKSPACE_HTML = """
 
         function clearAll() {
             document.getElementById('config-form').reset();
+            document.querySelectorAll('.date-preset-btn').forEach(btn => btn.classList.remove('active'));
             document.querySelectorAll('.checkbox-item').forEach(el => el.style.display = 'flex');
             document.getElementById('table-wrapper').innerHTML = '<div style="padding: 100px 20px; text-align: center;"><p style="color: #86868b; font-size: 15px; font-weight: 500;">Select at least one <b>Row</b> and one <b>Metric</b> from the sidebar to compile intelligence.</p></div>';
             document.getElementById('kpi-banner').style.display = 'none';
@@ -608,11 +589,17 @@ WORKSPACE_HTML = """
 
         document.querySelectorAll('#config-form input').forEach(el => {
             if(el.type !== 'date') {
-                el.addEventListener('change', updateDashboard);
+                el.addEventListener('change', () => {
+                    if (el.name !== 'start_date' && el.name !== 'end_date') {
+                        updateDashboard();
+                    }
+                });
             }
         });
+        
         document.querySelectorAll('#config-form input[type="date"]').forEach(el => {
-            el.addEventListener('blur', () => {
+            el.addEventListener('change', () => {
+                document.querySelectorAll('.date-preset-btn').forEach(btn => btn.classList.remove('active'));
                 updateDashboard();
             });
         });
@@ -624,7 +611,7 @@ WORKSPACE_HTML = """
             updateDashboard();
         });
         
-        // Bulletproof Solid Color Export Mode
+        // Solid Color Screenshot Fix via dom-to-image
         function exportImage() {
             const captureArea = document.querySelector('.main-content');
             const scrollArea = document.getElementById('table-wrapper');
@@ -639,63 +626,69 @@ WORKSPACE_HTML = """
             
             document.body.classList.add('export-mode');
             
-            // Wait 500ms for browser to completely repaint solid colors
             setTimeout(() => {
-                html2canvas(captureArea, { scale: 2, backgroundColor: '#ffffff', useCORS: true, logging: false }).then(canvas => {
-                    const imgData = canvas.toDataURL('image/jpeg', 1.0);
-                    
-                    if (/Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent)) {
-                        const modal = document.createElement('div');
-                        modal.style.position = 'fixed';
-                        modal.style.top = '0'; modal.style.left = '0'; 
-                        modal.style.width = '100%'; modal.style.height = '100%';
-                        modal.style.backgroundColor = 'rgba(0,0,0,0.95)'; 
-                        modal.style.zIndex = '99999';
-                        modal.style.display = 'flex'; 
-                        modal.style.flexDirection = 'column'; 
-                        modal.style.alignItems = 'center'; 
-                        modal.style.justifyContent = 'center';
+                domtoimage.toJpeg(captureArea, { quality: 1.0, bgcolor: '#ffffff' })
+                    .then(function (dataUrl) {
+                        if (/Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent)) {
+                            const modal = document.createElement('div');
+                            modal.style.position = 'fixed';
+                            modal.style.top = '0'; modal.style.left = '0'; 
+                            modal.style.width = '100%'; modal.style.height = '100%';
+                            modal.style.backgroundColor = 'rgba(0,0,0,0.95)'; 
+                            modal.style.zIndex = '99999';
+                            modal.style.display = 'flex'; 
+                            modal.style.flexDirection = 'column'; 
+                            modal.style.alignItems = 'center'; 
+                            modal.style.justifyContent = 'center';
+                            
+                            const closeBtn = document.createElement('button');
+                            closeBtn.innerText = 'Close Preview';
+                            closeBtn.style.padding = '12px 24px'; 
+                            closeBtn.style.marginBottom = '20px'; 
+                            closeBtn.style.borderRadius = '980px';
+                            closeBtn.style.border = 'none';
+                            closeBtn.style.backgroundColor = '#ffffff';
+                            closeBtn.style.color = '#1d1d1f';
+                            closeBtn.style.fontWeight = '600';
+                            closeBtn.onclick = () => document.body.removeChild(modal);
+                            
+                            const inst = document.createElement('p');
+                            inst.innerText = 'Long-press the image below to save it to your Photos.';
+                            inst.style.color = '#ffffff'; 
+                            inst.style.marginBottom = '20px';
+                            inst.style.fontSize = '14px';
+                            
+                            const img = document.createElement('img');
+                            img.src = dataUrl;
+                            img.style.maxWidth = '90%'; 
+                            img.style.maxHeight = '70%'; 
+                            img.style.borderRadius = '12px';
+                            img.style.boxShadow = '0 10px 30px rgba(0,0,0,0.5)';
+                            
+                            modal.appendChild(closeBtn);
+                            modal.appendChild(inst);
+                            modal.appendChild(img);
+                            document.body.appendChild(modal);
+                        } else {
+                            let link = document.createElement('a');
+                            link.download = 'Executive_Report.jpeg';
+                            link.href = dataUrl;
+                            link.click();
+                        }
                         
-                        const closeBtn = document.createElement('button');
-                        closeBtn.innerText = 'Close Preview';
-                        closeBtn.style.padding = '12px 24px'; 
-                        closeBtn.style.marginBottom = '20px'; 
-                        closeBtn.style.borderRadius = '980px';
-                        closeBtn.style.border = 'none';
-                        closeBtn.style.backgroundColor = '#ffffff';
-                        closeBtn.style.color = '#1d1d1f';
-                        closeBtn.style.fontWeight = '600';
-                        closeBtn.onclick = () => document.body.removeChild(modal);
-                        
-                        const inst = document.createElement('p');
-                        inst.innerText = 'Long-press the image below to save it to your Photos.';
-                        inst.style.color = '#ffffff'; 
-                        inst.style.marginBottom = '20px';
-                        inst.style.fontSize = '14px';
-                        
-                        const img = document.createElement('img');
-                        img.src = imgData;
-                        img.style.maxWidth = '90%'; 
-                        img.style.maxHeight = '70%'; 
-                        img.style.borderRadius = '12px';
-                        img.style.boxShadow = '0 10px 30px rgba(0,0,0,0.5)';
-                        
-                        modal.appendChild(closeBtn);
-                        modal.appendChild(inst);
-                        modal.appendChild(img);
-                        document.body.appendChild(modal);
-                    } else {
-                        let link = document.createElement('a');
-                        link.download = 'Executive_Report.jpeg';
-                        link.href = imgData;
-                        link.click();
-                    }
-                    
-                    scrollArea.style.maxHeight = origMaxHeight;
-                    scrollArea.style.overflow = origOverflow;
-                    exportBtn.style.display = 'inline-block';
-                    document.body.classList.remove('export-mode');
-                });
+                        scrollArea.style.maxHeight = origMaxHeight;
+                        scrollArea.style.overflow = origOverflow;
+                        exportBtn.style.display = 'inline-block';
+                        document.body.classList.remove('export-mode');
+                    })
+                    .catch(function (error) {
+                        console.error('Export failed:', error);
+                        scrollArea.style.maxHeight = origMaxHeight;
+                        scrollArea.style.overflow = origOverflow;
+                        exportBtn.style.display = 'inline-block';
+                        document.body.classList.remove('export-mode');
+                        alert("Could not export image. Please check console logs.");
+                    });
             }, 500);
         }
     </script>
@@ -727,7 +720,6 @@ def get_filter_lists(df):
     spc_col = next((c for c in df.columns if 'spc' in str(c).lower() and 'name' in str(c).lower()), 'SPC Name' if 'SPC Name' in df.columns else '')
     seg1_col = next((c for c in df.columns if 'seg1' in str(c).lower()), 'SEG1' if 'SEG1' in df.columns else '')
     family_col = next((c for c in df.columns if 'family' in str(c).lower()), 'Family Name' if 'Family Name' in df.columns else '')
-    status_col = next((c for c in ['FinalStatus', 'Final Record Status', 'Validation Remarks'] if c in df.columns), "")
     
     spc_list = df[spc_col].dropna().unique().tolist() if spc_col and spc_col in df.columns else []
     seg1_list = df[seg1_col].dropna().unique().tolist() if seg1_col and seg1_col in df.columns else []
@@ -737,7 +729,7 @@ def get_filter_lists(df):
     mapping_df.columns = ['spc' if c == spc_col else 'seg' if c == seg1_col else 'fam' if c == family_col else c for c in mapping_df.columns]
     filter_mapping_json = json.dumps(mapping_df.to_dict(orient='records'))
     
-    return sorted([str(x) for x in spc_list]), sorted([str(x) for x in seg1_list]), sorted([str(x) for x in family_list]), status_col, filter_mapping_json
+    return sorted([str(x) for x in spc_list]), sorted([str(x) for x in seg1_list]), sorted([str(x) for x in family_list]), filter_mapping_json
 
 def get_date_bounds(df, date_col):
     min_date, max_date = "N/A", "N/A"
@@ -775,12 +767,11 @@ def home():
         
         grouping_cols = df.select_dtypes(exclude=['number']).columns.tolist()
         
-        spc_list, seg1_list, family_list, status_col, filter_mapping_json = get_filter_lists(df)
-        unique_statuses = df[status_col].dropna().unique().tolist() if status_col else []
+        spc_list, seg1_list, family_list, filter_mapping_json = get_filter_lists(df)
         upload_time = get_metadata()
         min_sale_date, max_sale_date = get_date_bounds(df, default_date_col)
 
-        return render_template_string(WORKSPACE_HTML, all_cols=all_cols, grouping_cols=grouping_cols, default_date_col=default_date_col, status_col=status_col, unique_statuses=unique_statuses, spc_list=spc_list, seg1_list=seg1_list, family_list=family_list, upload_time=upload_time, min_sale_date=min_sale_date, max_sale_date=max_sale_date, filter_mapping_json=filter_mapping_json)
+        return render_template_string(WORKSPACE_HTML, all_cols=all_cols, grouping_cols=grouping_cols, default_date_col=default_date_col, spc_list=spc_list, seg1_list=seg1_list, family_list=family_list, upload_time=upload_time, min_sale_date=min_sale_date, max_sale_date=max_sale_date, filter_mapping_json=filter_mapping_json)
     return render_template_string(UPLOAD_HTML)
 
 @app.route("/upload", methods=["GET"])
@@ -803,13 +794,9 @@ def calculate():
     date_col = request.form.get('date_col')
     start_date = request.form.get('start_date')
     end_date = request.form.get('end_date')
-    week_nums = request.form.getlist('week_num')
-    spc_compare = request.form.get('spc_compare', 'none')
     index_cols = request.form.getlist('index_cols')
-    columns_cols = request.form.getlist('columns_cols')
     agg_funcs = request.form.getlist('agg_funcs')
     
-    status_filters = request.form.getlist('status_filters')
     spc_filters = request.form.getlist('spc_filters')
     seg1_filters = request.form.getlist('seg1_filters')
     family_filters = request.form.getlist('family_filters')
@@ -832,37 +819,12 @@ def calculate():
         
         if date_col and date_col in df_filtered.columns:
             df_filtered[date_col] = pd.to_datetime(df_filtered[date_col], errors='coerce', dayfirst=True)
-            if week_nums:
-                valid_dates = df_filtered[date_col].dropna()
-                if not valid_dates.empty:
-                    base_date = pd.to_datetime(start_date) if start_date else valid_dates.min()
-                    month_start = datetime(base_date.year, base_date.month, 1)
-                    valid_masks = []
-                    for w in week_nums:
-                        w_idx = int(w)
-                        if w_idx == 1: w_start, w_end = month_start, datetime(base_date.year, base_date.month, 7, 23, 59, 59)
-                        elif w_idx == 2: w_start, w_end = datetime(base_date.year, base_date.month, 8), datetime(base_date.year, base_date.month, 14, 23, 59, 59)
-                        elif w_idx == 3: w_start, w_end = datetime(base_date.year, base_date.month, 15), datetime(base_date.year, base_date.month, 21, 23, 59, 59)
-                        else:
-                            w_start = datetime(base_date.year, base_date.month, 22)
-                            nm = datetime(base_date.year, base_date.month + 1, 1) if base_date.month < 12 else datetime(base_date.year + 1, 1, 1)
-                            w_end = nm - timedelta(seconds=1)
-                        valid_masks.append((df_filtered[date_col] >= w_start) & (df_filtered[date_col] <= w_end))
-                    if valid_masks:
-                        df_filtered = df_filtered[pd.concat(valid_masks, axis=1).any(axis=1)]
-                        filter_texts.append(f"<b>{date_col}</b>: Weeks {', '.join(week_nums)}")
-            else:
-                if start_date: df_filtered = df_filtered[df_filtered[date_col] >= pd.to_datetime(start_date)]
-                if end_date: df_filtered = df_filtered[df_filtered[date_col] <= pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)]
-                if start_date or end_date:
-                    s_str = pd.to_datetime(start_date).strftime('%d-%b-%y') if start_date else 'Start'
-                    e_str = pd.to_datetime(end_date).strftime('%d-%b-%y') if end_date else 'End'
-                    filter_texts.append(f"<b>{date_col}</b>: {s_str} to {e_str}")
-
-        status_col = next((c for c in ['FinalStatus', 'Final Record Status', 'Validation Remarks'] if c in df_filtered.columns), "")
-        if status_col and status_filters:
-            df_filtered = df_filtered[df_filtered[status_col].isin(status_filters)]
-            filter_texts.append(f"<b>{status_col}</b>: {', '.join(status_filters)}")
+            if start_date: df_filtered = df_filtered[df_filtered[date_col] >= pd.to_datetime(start_date)]
+            if end_date: df_filtered = df_filtered[df_filtered[date_col] <= pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)]
+            if start_date or end_date:
+                s_str = pd.to_datetime(start_date).strftime('%d-%b-%y') if start_date else 'Start'
+                e_str = pd.to_datetime(end_date).strftime('%d-%b-%y') if end_date else 'End'
+                filter_texts.append(f"<b>{date_col}</b>: {s_str} to {e_str}")
 
         spc_col = next((c for c in df_filtered.columns if 'spc' in str(c).lower() and 'name' in str(c).lower()), 'SPC Name' if 'SPC Name' in df_filtered.columns else '')
         if spc_col and spc_filters and spc_col in df_filtered.columns:
@@ -891,21 +853,6 @@ def calculate():
                 <div class="kpi-card"><div class="kpi-label">Active Entities</div><div class="kpi-val">{active_spcs}</div></div>
             """
 
-        if spc_compare in ['day', 'week'] and spc_col and date_col:
-            if spc_compare == 'day':
-                df_filtered['_Day_Comp'] = df_filtered[date_col].dt.strftime('%d-%b-%y')
-                if spc_col not in index_cols: index_cols.append(spc_col)
-                if '_Day_Comp' not in columns_cols: columns_cols.append('_Day_Comp')
-            elif spc_compare == 'week':
-                def gw(dt):
-                    if pd.isna(dt): return 'Unknown'
-                    w = (dt.day - 1) // 7 + 1
-                    return f"W{w} ({dt.strftime('%b')})"
-                df_filtered['_Week_Comp'] = df_filtered[date_col].apply(gw)
-                if spc_col not in index_cols: index_cols.append(spc_col)
-                if '_Week_Comp' not in columns_cols: columns_cols.append('_Week_Comp')
-            filter_texts.append(f"<b>Compare</b>: {spc_compare.capitalize()}-wise")
-
         filter_text = f"<p style='color:#86868b; font-size:12px; margin:0;'>{' | '.join(filter_texts)}</p>" if filter_texts else ""
 
         if df_filtered.empty:
@@ -916,7 +863,6 @@ def calculate():
                 df_filtered[col] = df_filtered[col].dt.strftime('%d-%b-%y')
 
         pivot_kwargs = {'data': df_filtered, 'index': index_cols, 'values': value_cols, 'aggfunc': base_aggs}
-        if columns_cols: pivot_kwargs['columns'] = columns_cols
         pivot_df = pd.pivot_table(**pivot_kwargs).reset_index().fillna(0)
         
         new_cols = []
@@ -935,22 +881,14 @@ def calculate():
                     elif item_str in value_cols:
                         if len(value_cols) > 1: parts.append(item_str)
                     elif item_str and item_str.lower() != 'nan':
-                        if len(item_str) >= 6 and any(char.isdigit() for char in item_str):
-                            try: parts.append(pd.to_datetime(item_str, errors='raise').strftime('%d-%b-%y'))
-                            except Exception: parts.append(item_str)
-                        else:
-                            parts.append(item_str)
+                        parts.append(item_str)
                 new_cols.append(" - ".join(parts) if parts else " - ".join(str(c) for c in col if str(c).strip()))
             else:
                 if col in index_cols:
                     new_cols.append(str(col))
                 else:
                     col_str = str(col)
-                    if len(col_str) >= 6 and any(char.isdigit() for char in col_str):
-                        try: new_cols.append(pd.to_datetime(col_str, errors='raise').strftime('%d-%b-%y'))
-                        except Exception: new_cols.append(col_str.replace('sum - ', '').replace('count - ', '').replace('mean - ', ''))
-                    else:
-                        new_cols.append(col_str.replace('sum - ', '').replace('count - ', '').replace('mean - ', ''))
+                    new_cols.append(col_str.replace('sum - ', '').replace('count - ', '').replace('mean - ', ''))
         
         pivot_df.columns = [str(c) for c in new_cols]
 
@@ -979,7 +917,7 @@ def calculate():
                 pivot_df[f"{c} Growth %"] = growth_data[f"{c} Growth %"]
                 final_cols.append(f"{c} Growth %")
         
-        if show_row_total:
+        if show_row_total and len(metric_columns) > 1:
             pivot_df['TOTAL'] = pivot_df[metric_columns].sum(axis=1)
             final_cols.append('TOTAL')
             metric_columns.append('TOTAL')
