@@ -2,7 +2,7 @@
 Analytics Pro - upload a sheet, slice it, pivot it, chart it, export it.
 
 Single-file Flask app.   python app.py
-Needs: flask, pandas, openpyxl
+Needs: flask, pandas, openpyxl, requests
 """
 import hashlib
 import html
@@ -15,6 +15,7 @@ import warnings
 from datetime import datetime
 
 import pandas as pd
+import requests
 from flask import (Flask, Response, jsonify, redirect, render_template_string,
                    request, send_file, url_for)
 
@@ -25,6 +26,9 @@ UPLOAD_DIR = os.environ.get("DASHBOARD_UPLOAD_DIR", "/tmp/dashboard_uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 DATA_FILE_PATH = os.path.join(UPLOAD_DIR, "shared_data.pkl")
 META_FILE_PATH = os.path.join(UPLOAD_DIR, "metadata.json")
+
+# Your deployed Google Apps Script Web App URL
+APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbw-sAJDOKYuIcknXVcMYhuXe1BXW-EgHnjpaIO0J5yneQutV7bIeNkTuY0I1eUoxIa4lg/exec"
 
 RAW_ROW_LIMIT = 3000
 PIVOT_ROW_LIMIT = 5000
@@ -447,8 +451,6 @@ def spc_review_data(dff, ctx, value_col):
     g["share"] = (g["value"] / total) * 100
     g = g.sort_values(["value", "share"], ascending=False).reset_index(drop=True)
 
-    pros = g.head(5).to_dict(orient="records")
-    cons = g.tail(5).sort_values(["value", "share"], ascending=True).to_dict(orient="records")
     return {
         "pros": [{"label": r["spc"], "value": format_indian_number(r["value"]), "share": f"{r['share']:.1f}%"} for _, r in g.head(5).iterrows()],
         "cons": [{"label": r["spc"], "value": format_indian_number(r["value"]), "share": f"{r['share']:.1f}%"} for _, r in g.tail(5).sort_values(["value", "share"], ascending=True).iterrows()],
@@ -739,6 +741,30 @@ def write_excel(payload, export):
     return out
 
 
+@app.route("/save-to-drive", methods=["POST"])
+def save_to_drive():
+    import base64
+    try:
+        st = get_state()
+        if st is None:
+            return jsonify({"error": "No data available."}), 400
+        payload, export, _ = build_view(st, request.form, want_export=True)
+        if export is None:
+            return jsonify({"error": "Nothing to export"}), 400
+        out = write_excel(payload, export)
+        
+        encoded_file = base64.b64encode(out.read()).decode('utf-8')
+        payload_data = {
+            "fileName": f"{slug(payload['title'])}.xlsx",
+            "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "fileData": encoded_file
+        }
+        res = requests.post(APPS_SCRIPT_URL, json=payload_data)
+        return jsonify(res.json())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.get("/")
 def home():
     st = get_state()
@@ -866,6 +892,8 @@ MACROS = """
     <span class="net-sep"></span>
     <span class="net-text" id="netSpeed">Up 0MB/s · Down 0MB/s</span>
   </div>
+
+  <button type="button" class="icon-btn" id="saveDriveBtn" title="Save Master Report to Google Drive" aria-label="Save to Google Drive">☁️</button>
 
   <div class="seg seg-icons" id="themeSeg" data-n="2" role="radiogroup" aria-label="Appearance">
     <span class="seg-thumb"></span>
@@ -1635,6 +1663,26 @@ function toast(msg){
   setTimeout(() => { t.classList.remove('in'); setTimeout(() => t.remove(), 400); }, 3200);
 }
 
+const saveDriveBtn = $('#saveDriveBtn');
+if (saveDriveBtn) {
+  saveDriveBtn.addEventListener('click', async () => {
+    if (!confirm('Save and sync the current master report to Google Drive?')) return;
+    toast('Syncing to Google Drive...');
+    const fd = buildParams('pivot');
+    try {
+      const res = await fetch('/save-to-drive', { method: 'POST', body: fd });
+      const data = await res.json();
+      if (data.status === 'success') {
+        toast('Master report successfully saved to Google Drive!');
+      } else {
+        alert('Failed to save to Drive: ' + (data.error || data.message || 'Unknown error'));
+      }
+    } catch (err) {
+      alert('Network error while saving to Google Drive.');
+    }
+  });
+}
+
 function fmtMb(v){
   if (!Number.isFinite(v) || v <= 0) return '0MB/s';
   if (v >= 1) return `${v.toFixed(1)}MB/s`;
@@ -2289,34 +2337,3 @@ ASSET_VERSION = hashlib.md5((APP_CSS + APP_JS).encode()).hexdigest()[:8]
 
 if __name__ == "__main__":
     app.run(debug=os.environ.get("FLASK_DEBUG", "1") == "1")
-
-@app.route("/upload", methods=["POST"])
-def upload():
-    uploaded = request.files.get("file")
-    if uploaded is None or uploaded.filename == "":
-        return jsonify({"error": "No file uploaded."}), 400
-
-    filename = uploaded.filename.lower()
-    content = uploaded.read()
-
-    try:
-        if filename.endswith(".csv"):
-            df = pd.read_csv(io.BytesIO(content))
-        elif filename.endswith((".xlsx", ".xls")):
-            df = pd.read_excel(io.BytesIO(content))
-        else:
-            return jsonify({"error": "Unsupported file type. Upload CSV or Excel."}), 400
-    except Exception as exc:
-        return jsonify({"error": f"Failed to read file: {exc}"}), 400
-
-    preview = df.head(5).to_dict(orient="records")
-    return jsonify({
-        "rows": int(len(df)),
-        "columns": list(df.columns),
-        "preview": preview,
-    })
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
