@@ -26,18 +26,15 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 DATA_FILE_PATH = os.path.join(UPLOAD_DIR, "shared_data.pkl")
 META_FILE_PATH = os.path.join(UPLOAD_DIR, "metadata.json")
 
-RAW_ROW_LIMIT = 3000      # rows drawn in Raw view (Excel export is always complete)
-PIVOT_ROW_LIMIT = 5000    # groups drawn in the Pivot table (Excel export is complete)
-CHART_MAX = 120           # categories sent to the chart
+RAW_ROW_LIMIT = 3000
+PIVOT_ROW_LIMIT = 5000
+CHART_MAX = 120
 AGG_NAME = {"sum": "Sum", "count": "Count", "mean": "Avg"}
 AGG_WORD = {"sum": "Sum", "count": "Count", "mean": "Average"}
 DERIVED_FMT = {"Week of": "%d %b %y", "Month": "%b %Y"}
 NON_ADDITIVE = re.compile(
     r"(^|[\s_\-])(id|no|num|number|code|sku|pin|pincode|phone|mobile|year|month|week|day|qtr|quarter)($|[\s_\-])", re.I)
 
-# ════════════════════════════════════════════════════════════════════
-#  DATA LAYER  (parse once on upload, cache in memory by file mtime)
-# ════════════════════════════════════════════════════════════════════
 _lock = threading.Lock()
 _state = {"mtime": None, "df": None, "ctx": None}
 
@@ -49,14 +46,43 @@ def pick_date_col(cols):
     return next((c for c in cols if "date" in c.lower()), "")
 
 
+def detect_columns(df):
+    cols = list(df.columns)
+    low = {c: c.lower() for c in cols}
+    date = pick_date_col(cols)
+    if date and not pd.api.types.is_datetime64_any_dtype(df[date]):
+        date = ""
+
+    num = df.select_dtypes(include="number").columns.tolist()
+
+    qty = next(
+        (c for c in cols if any(k in low[c] for k in ("qty", "quantity", "volume", "vol"))),
+        ""
+    )
+    seg2 = next(
+        (c for c in cols if any(k in low[c] for k in ("seg2", "segment2", "segment 2"))),
+        ""
+    )
+
+    return {
+        "date": date,
+        "spc": next((c for c in cols if "spc" in low[c] and "name" in low[c]), ""),
+        "seg": next((c for c in cols if "seg1" in low[c] or "segment 1" in low[c] or "segment1" in low[c]), ""),
+        "seg2": seg2,
+        "fam": next((c for c in cols if "family" in low[c]), ""),
+        "qty": qty,
+        "num_cols": num,
+    }
+
+
 def prepare_df(df):
-    """Normalise once at upload so every request afterwards is cheap."""
     df.columns = [str(c).strip() for c in df.columns]
     d = pick_date_col(list(df.columns))
     if d and not pd.api.types.is_numeric_dtype(df[d]):
         df[d] = pd.to_datetime(df[d], errors="coerce", dayfirst=True)
+
     c = detect_columns(df)
-    for key in ("spc", "seg", "fam"):
+    for key in ("spc", "seg", "seg2", "fam"):
         col = c[key]
         if col:
             s = df[col]
@@ -64,24 +90,7 @@ def prepare_df(df):
     return df
 
 
-def detect_columns(df):
-    cols = list(df.columns)
-    low = {c: c.lower() for c in cols}
-    date = pick_date_col(cols)
-    if date and not pd.api.types.is_datetime64_any_dtype(df[date]):
-        date = ""
-    num = df.select_dtypes(include="number").columns.tolist()
-    return {
-        "date": date,
-        "spc": next((c for c in cols if "spc" in low[c] and "name" in low[c]), ""),
-        "seg": next((c for c in cols if "seg1" in low[c]), ""),
-        "fam": next((c for c in cols if "family" in low[c]), ""),
-        "num_cols": num,
-    }
-
-
 def derived_names(columns, date):
-    """Week / Month buckets are offered as extra X-axis choices when a date column exists."""
     if not date:
         return []
     return [n for n in ("Week of", "Month") if n not in columns]
@@ -101,8 +110,8 @@ def build_context(df):
     num = c["num_cols"]
 
     lists = {k: (sorted(df[c[k]].dropna().unique().tolist()) if c[k] else [])
-             for k in ("spc", "seg", "fam")}
-    keys = [(k, c[k]) for k in ("spc", "seg", "fam") if c[k]]
+             for k in ("spc", "seg", "seg2")}
+    keys = [(k, c[k]) for k in ("spc", "seg", "seg2") if c[k]]
     mapping = []
     if keys:
         m = df[[col for _, col in keys]].fillna("N/A").drop_duplicates()
@@ -128,8 +137,11 @@ def build_context(df):
                 months.append({"key": f"{y:04d}-{mo:02d}", "label": f"{pd.Timestamp(y, mo, 1):%b} {y}"})
 
     non_num = [x for x in cols if x not in num and x != c["date"]]
-    default_x = next((c[k] for k in ("spc", "fam", "seg") if c[k]), non_num[0] if non_num else cols[0])
-    default_y = "Tentative DP" if "Tentative DP" in num else (num[0] if num else "")
+    default_x = next((c[k] for k in ("spc", "seg", "seg2") if c[k]), non_num[0] if non_num else cols[0])
+
+    default_y = "Tentative DP" if "Tentative DP" in num else (c["qty"] if c["qty"] in num else num[0] if num else "")
+    if c["qty"] and c["qty"] not in num:
+        num = num + [c["qty"]]
 
     x_opts = [{"name": n, "hint": "date", "checked": False} for n in derived_names(cols, c["date"])]
     for col in cols:
@@ -139,14 +151,25 @@ def build_context(df):
     def label(d):
         return f"{d.day:02d} {d:%b %Y}" if d is not None else "N/A"
 
-    boot = {"map": mapping,
-            "dmin": dmin.strftime("%Y-%m-%d") if dmin is not None else "",
-            "dmax": dmax.strftime("%Y-%m-%d") if dmax is not None else "",
-            "all": f"All time · {label(dmin)} – {label(dmax)}" if dmin is not None else "All records"}
+    boot = {
+        "map": mapping,
+        "dmin": dmin.strftime("%Y-%m-%d") if dmin is not None else "",
+        "dmax": dmax.strftime("%Y-%m-%d") if dmax is not None else "",
+        "all": f"All time · {label(dmin)} – {label(dmax)}" if dmin is not None else "All records",
+    }
+
     return {
-        **c, "dmin": dmin, "dmax": dmax, "weeks": weeks, "months": months,
-        "spc_opts": opts(lists["spc"]), "seg_opts": opts(lists["seg"]), "fam_opts": opts(lists["fam"]),
-        "x_opts": x_opts, "y_opts": opts(num, "number", {default_y}),
+        **c,
+        "dmin": dmin,
+        "dmax": dmax,
+        "weeks": weeks,
+        "months": months,
+        "spc_opts": opts(lists["spc"]),
+        "seg_opts": opts(lists["seg"]),
+        "seg2_opts": opts(lists["seg2"]),
+        "qty_col": c["qty"],
+        "x_opts": x_opts,
+        "y_opts": opts(num, "number", {default_y}),
         "boot_json": json.dumps(boot).replace("<", "\\u003c"),
         "range_label": f"{label(dmin)} – {label(dmax)}" if dmin is not None else "",
     }
@@ -184,9 +207,7 @@ def get_upload_time():
         return ""
 
 
-# ════════════════════════════════════════════════════════════════════
-#  FORMATTING / RENDERING
-# ════════════════════════════════════════════════════════════════════
+# formatting
 _GROUP = re.compile(r"(\d)(?=(\d\d)+$)")
 
 
@@ -248,9 +269,22 @@ def format_pct_share(v):
     if x != x:
         return ""
     x = max(0.0, min(100.0, x))
-    intensity = x / 100.0
-    color = f"rgba(0, 113, 227, {0.45 + intensity * 0.55})"
-    return f'<span class="pct-share" style="--share:{intensity:.3f}; color:{color}; font-weight:700;">{x:.1f}%</span>'
+    if x >= 50:
+        color = "#1f8a3c"
+        bg = "rgba(31,138,60,0.12)"
+    elif x >= 25:
+        color = "#0071e3"
+        bg = "rgba(0,113,227,0.12)"
+    elif x >= 10:
+        color = "#5f6f8f"
+        bg = "rgba(95,111,143,0.10)"
+    else:
+        color = "#7d8594"
+        bg = "rgba(125,133,148,0.08)"
+    return (
+        f'<span class="pct-share" '
+        f'style="color:{color};background:{bg};font-weight:700;">{x:.1f}%</span>'
+    )
 
 
 def col_cells(s, fmt=None, esc=True):
@@ -301,7 +335,7 @@ def nice_join(items):
 def pivot_title(ys, aggs, xs):
     y = nice_join(ys[:3]) + (f" +{len(ys) - 3}" if len(ys) > 3 else "")
     x = " › ".join(xs[:3]) + (f" +{len(xs) - 3}" if len(xs) > 3 else "")
-    return f"{nice_join([AGG_WORD[a] for a in aggs])} of {y} by {x}"
+    return f"{y} by {x}"
 
 
 def slug(text):
@@ -316,9 +350,6 @@ def num_or_none(v):
     return None if f != f or f in (float("inf"), float("-inf")) else round(f, 2)
 
 
-# ════════════════════════════════════════════════════════════════════
-#  FILTERS & PERIOD TEXT
-# ════════════════════════════════════════════════════════════════════
 def parse_date(s):
     if not s:
         return None
@@ -357,7 +388,7 @@ def apply_filters(df, ctx, p):
         if months:
             add((d.dt.year * 100 + d.dt.month).isin(months))
 
-    for key, field in (("spc", "spc_filters"), ("seg", "seg1_filters"), ("fam", "family_filters")):
+    for key, field in (("spc", "spc_filters"), ("seg", "seg1_filters"), ("seg2", "seg2_filters")):
         col, vals = ctx[key], p.getlist(field)
         if col and vals:
             add(df[col].isin(vals))
@@ -366,8 +397,7 @@ def apply_filters(df, ctx, p):
 
 def filter_pills(ctx, p):
     out = []
-    for key, field, label in (("spc", "spc_filters", "SPC"), ("seg", "seg1_filters", "Segment"),
-                              ("fam", "family_filters", "Family")):
+    for key, field, label in (("spc", "spc_filters", "SPC"), ("seg", "seg1_filters", "Segment 1"), ("seg2", "seg2_filters", "Segment 2")):
         vals = p.getlist(field)
         if ctx[key] and vals:
             out.append([label, ", ".join(vals[:4]) + (f" +{len(vals) - 4}" if len(vals) > 4 else "")])
@@ -403,23 +433,55 @@ def period_text(ctx, p):
     return f"{label} · {rng}" if label else rng
 
 
-# ════════════════════════════════════════════════════════════
-#  QUERY ENGINE
-# ════════════════════════════════════════════════════════════
+def spc_review_data(dff, ctx, value_col):
+    if not ctx.get("spc") or not value_col or value_col not in dff.columns:
+        return {"pros": [], "cons": []}
+    s = dff[[ctx["spc"], value_col]].dropna()
+    if s.empty:
+        return {"pros": [], "cons": []}
+    total = s[value_col].sum()
+    if total == 0:
+        return {"pros": [], "cons": []}
+    g = s.groupby(ctx["spc"], observed=True)[value_col].sum().reset_index()
+    g.columns = ["spc", "value"]
+    g["share"] = (g["value"] / total) * 100
+    g = g.sort_values(["value", "share"], ascending=False).reset_index(drop=True)
+
+    pros = g.head(5).to_dict(orient="records")
+    cons = g.tail(5).sort_values(["value", "share"], ascending=True).to_dict(orient="records")
+    return {
+        "pros": [{"label": r["spc"], "value": format_indian_number(r["value"]), "share": f"{r['share']:.1f}%"} for _, r in g.head(5).iterrows()],
+        "cons": [{"label": r["spc"], "value": format_indian_number(r["value"]), "share": f"{r['share']:.1f}%"} for _, r in g.tail(5).sort_values(["value", "share"], ascending=True).iterrows()],
+    }
+
+
 def build_view(state, p, want_export=False):
-    """Returns (payload, export, http_status)."""
     df, ctx = state["df"], state["ctx"]
     mode = "raw" if p.get("view_mode") == "raw" else "pivot"
     dff = apply_filters(df, ctx, p)
-    base = {"period": period_text(ctx, p), "filters": filter_pills(ctx, p)}
+    default_value = "Tentative DP" if "Tentative DP" in dff.columns else (ctx.get("qty") if ctx.get("qty") in dff.columns else dff.select_dtypes(include="number").columns.tolist()[0] if len(dff.select_dtypes(include="number").columns) else "")
+    chosen_value = p.get("value_cols") or [default_value]
+    value_col = chosen_value[0] if chosen_value and chosen_value[0] else default_value
+    base = {
+        "period": period_text(ctx, p),
+        "filters": filter_pills(ctx, p),
+        "spc_review": spc_review_data(dff, ctx, value_col),
+    }
     if mode == "raw":
         return build_raw(dff, ctx, base, want_export)
     return build_pivot(dff, ctx, p, base, want_export)
 
 
 def empty_payload(base, title, head, msg):
-    return {**base, "title": title, "table_html": empty_block(head, msg), "status": "0 results",
-            "kpis": [], "chart": None}
+    return {
+        **base,
+        "title": title,
+        "table_html": empty_block(head, msg),
+        "status": "0 results",
+        "kpis": [],
+        "chart": None,
+        "spc_review": {"pros": [], "cons": []},
+    }
 
 
 def build_raw(dff, ctx, base, want_export):
@@ -467,6 +529,12 @@ def build_raw(dff, ctx, base, want_export):
     return payload, export, 200
 
 
+def metric_display_name(y, a):
+    if a == "sum":
+        return y
+    return f"{y} {AGG_NAME[a]}" if AGG_NAME[a] != "Sum" else y
+
+
 def build_pivot(dff, ctx, p, base, want_export):
     cols_set = set(dff.columns)
     dc = ctx["date"]
@@ -474,6 +542,7 @@ def build_pivot(dff, ctx, p, base, want_export):
     idx_cols = clean_list(p, "index_cols", cols_set | derived_ok)
     ycols = [c for c in clean_list(p, "value_cols", set(ctx["num_cols"])) if c not in idx_cols]
     aggs = [a for a in ("sum", "count", "mean") if a in p.getlist("agg_funcs")]
+
     if not idx_cols or not ycols or not aggs:
         return {"error": "Pick at least one X column, one Y column and one measure."}, None, 400
 
@@ -490,12 +559,14 @@ def build_pivot(dff, ctx, p, base, want_export):
             derived["Week of"] = week_start(d)
         if "Month" in idx_cols and "Month" in derived_ok:
             derived["Month"] = d.dt.normalize() - pd.to_timedelta(d.dt.day - 1, unit="D")
+
     need = [c for c in dict.fromkeys(idx_cols + ycols) if c not in derived]
     sub = dff[need].assign(**derived)
 
     g = sub.groupby(idx_cols, observed=True, sort=True)[ycols].agg(aggs)
     if g.empty:
         return empty_payload(base, title, "No groups to show", "The chosen X columns only contain empty values."), None, 200
+
     res = g.index.to_frame(index=False)
     vals = g.reset_index(drop=True)
     metas = [("idx", "")] * len(idx_cols)
@@ -506,22 +577,22 @@ def build_pivot(dff, ctx, p, base, want_export):
 
     for y in ycols:
         for a in aggs:
-            name = f"{y} · {AGG_NAME[a]}"
+            name = metric_display_name(y, a)
             col = vals[(y, a)].astype(float)
             put(name, col.to_numpy(), ("metric", a))
             if share and a != "mean":
                 tot = col.sum()
-                put(f"{name} · Share %", (col / tot * 100).to_numpy() if tot else 0.0, ("pct", a))
+                put(f"{name} Share", (col / tot * 100).to_numpy() if tot else 0.0, ("pct", a))
             if growth:
                 prev = col.shift()
-                put(f"{name} · Growth %", ((col - prev) / prev.where(prev != 0) * 100).to_numpy(), ("pct", a))
+                put(f"{name} Growth", ((col - prev) / prev.where(prev != 0) * 100).to_numpy(), ("pct", a))
 
     total_cols = {}
     if row_total and len(ycols) > 1:
         for a in ("sum", "count"):
             if a in aggs:
-                parts = [f"{y} · {AGG_NAME[a]}" for y in ycols]
-                name = f"Total · {AGG_NAME[a]}"
+                parts = [metric_display_name(y, a) for y in ycols]
+                name = f"Total {AGG_NAME[a]}"
                 put(name, res[parts].sum(axis=1).to_numpy(), ("total", a))
                 total_cols[name] = parts
 
@@ -530,13 +601,13 @@ def build_pivot(dff, ctx, p, base, want_export):
     for y in ycols:
         for a in aggs:
             s = valid[y]
-            foot[f"{y} · {AGG_NAME[a]}"] = {"sum": s.sum, "count": s.count, "mean": s.mean}[a]()
+            foot[metric_display_name(y, a)] = {"sum": s.sum, "count": s.count, "mean": s.mean}[a]()
     for name, parts in total_cols.items():
         foot[name] = sum(foot[x] for x in parts)
 
     headers = list(res.columns)
     n = len(res)
-    fmt_first = lambda c: DERIVED_FMT.get(c)  # noqa: E731
+    fmt_first = lambda c: DERIVED_FMT.get(c)
     labels_all = [" · ".join(parts) for parts in zip(*[
         col_cells(res[c], fmt_first(c), esc=False) for c in idx_cols])]
 
@@ -548,17 +619,18 @@ def build_pivot(dff, ctx, p, base, want_export):
             columns.append(col_cells(s, fmt_first(h)))
             foot_cells.append("Grand total" if i == 0 else "")
         elif kind == "pct":
-            if h.endswith("Share %"):
+            if h.endswith("Share"):
                 columns.append([format_pct_share(v) for v in s])
             else:
                 columns.append([format_pct(v) for v in s])
-            foot_cells.append("100%" if h.endswith("Share %") else "")
+            foot_cells.append("100%" if h.endswith("Share") else "")
             numeric.add(i)
         else:
             f = format_avg if a == "mean" else format_indian_number
             columns.append([f(v) for v in s])
             foot_cells.append(f(foot[h]))
             numeric.add(i)
+
     total_idx = {i for i, m in enumerate(metas) if m[0] == "total"}
     table_html = render_table(headers, columns, "pivot", numeric, len(idx_cols), foot_cells, total_idx)
 
@@ -568,10 +640,13 @@ def build_pivot(dff, ctx, p, base, want_export):
         h, a = headers[i], metas[i][1]
         f = format_avg if a == "mean" else format_indian_number
         top = int(res.iloc[:, i].to_numpy().argmax()) if n else 0
-        group = [i] + [j for j, m in enumerate(metas) if m[0] == "pct" and headers[j].startswith(h + " · ")]
-        kpis.append({"label": h, "value": f(foot[h]),
-                     "sub": "Top · " + (labels_all[top][:26] + ("…" if len(labels_all[top]) > 26 else "")),
-                     "cols": group})
+        group = [i] + [j for j, m in enumerate(metas) if m[0] == "pct" and headers[j].startswith(h + " ")]
+        kpis.append({
+            "label": h,
+            "value": f(foot[h]),
+            "sub": "Top · " + (labels_all[top][:26] + ("…" if len(labels_all[top]) > 26 else "")),
+            "cols": group,
+        })
     kpis.append({"label": "Groups", "value": format_indian_number(n),
                  "sub": " › ".join(idx_cols)[:30], "cols": list(range(len(idx_cols)))})
 
@@ -583,6 +658,7 @@ def build_pivot(dff, ctx, p, base, want_export):
         else:
             sel = sorted(res.iloc[:, metric_idx[0]].nlargest(CHART_MAX).index.tolist())
             note = f"Showing the top {CHART_MAX} of {format_indian_number(n)} groups"
+
     chart = {
         "labels": [labels_all[i] for i in sel],
         "series": [{"name": headers[i], "agg": metas[i][1], "col": i,
@@ -617,9 +693,6 @@ def build_pivot(dff, ctx, p, base, want_export):
     return payload, export, 200
 
 
-# ════════════════════════════════════════════════════════════
-#  EXCEL EXPORT (title, period, filters, styled header + footer)
-# ════════════════════════════════════════════════════════════
 def write_excel(payload, export):
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
     from openpyxl.utils import get_column_letter
@@ -666,9 +739,6 @@ def write_excel(payload, export):
     return out
 
 
-# ════════════════════════════════════════════════════════════════════
-#  ROUTES
-# ════════════════════════════════════════════════════════════════════
 @app.get("/")
 def home():
     st = get_state()
@@ -698,7 +768,7 @@ def dashboard():
         if df.empty:
             raise ValueError("the file has no rows")
         save_data(df)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return render_template_string(UPLOAD_HTML, error=f"Couldn't read that file: {exc}"), 400
     return redirect(url_for("home"))
 
@@ -710,7 +780,7 @@ def calculate():
         return jsonify({"error": "No data available."}), 400
     try:
         payload, _, code = build_view(st, request.form)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return jsonify({"error": f"An error occurred: {exc}"}), 500
     return jsonify(payload), code
 
@@ -725,7 +795,7 @@ def download():
         if export is None:
             return payload.get("error", "Nothing to export"), 400
         out = write_excel(payload, export)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return f"Export failed: {exc}", 500
     return send_file(out, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                      download_name=f"{slug(payload['title'])}.xlsx", as_attachment=True)
@@ -747,9 +817,6 @@ def inject_assets():
     return {"asset_v": ASSET_VERSION, "sprite": SPRITE}
 
 
-# ════════════════════════════════════════════════════════════════════
-#  FRONT END  (iOS 27 "Liquid Glass" language)
-# ════════════════════════════════════════════════════════════════════
 SPRITE = """
 <svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
 <symbol id="i-chev" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></symbol>
@@ -767,8 +834,6 @@ SPRITE = """
 <symbol id="i-glass" viewBox="0 0 24 24"><path d="M12 3s6 6.2 6 10.5a6 6 0 01-12 0C6 9.2 12 3 12 3z"/></symbol>
 <symbol id="i-cal" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="16" rx="3.5"/><path d="M8 3v4M16 3v4M3 10h18"/></symbol>
 <symbol id="i-table" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M3 10h18M9 10v10"/></symbol>
-<symbol id="i-rows" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></symbol>
-<symbol id="i-bars" viewBox="0 0 24 24"><path d="M6 20v-7M12 20V5M18 20v-10"/></symbol>
 <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
 </defs></svg>
 """
@@ -807,6 +872,7 @@ MACROS = """
     <input type="radio" name="theme" id="th_light" value="light"><label for="th_light" title="Light" aria-label="Light"><svg class="ic"><use href="#i-sun"/></svg></label>
     <input type="radio" name="theme" id="th_dark" value="dark"><label for="th_dark" title="Dark" aria-label="Dark"><svg class="ic"><use href="#i-moon"/></svg></label>
   </div>
+
   {% if layout %}
   <label class="ios-switch" title="Switch between desktop and mobile layout">
     <span class="sw-text">Mobile</span>
@@ -842,7 +908,9 @@ UPLOAD_HTML = """<!doctype html>
 WORKSPACE_HTML = """<!doctype html>
 <html lang="en"><head><title>Analytics Pro</title>""" + HEAD + """</head>
 <body>
-<script>(function(){var w=window.innerWidth,mode=w<=768?'mobile':w<=1024?'tablet':'desktop';document.body.classList.add(mode+'-mode');})();</script>
+<script>(function(){var m=null;try{m=localStorage.getItem('ap-mobile')}catch(e){}
+var mob=m===null?innerWidth<=768:m==='1';document.body.classList.add(mob?'mobile-mode':'desktop-mode');
+if(mob)document.body.classList.add('sidebar-collapsed');})();</script>
 """ + MACROS + """
 {{ sprite|safe }}
 
@@ -935,11 +1003,6 @@ WORKSPACE_HTML = """<!doctype html>
         {% else %}<p class="muted">No date column was detected in this file.</p>{% endif %}
       {% endcall %}
 
-      {% if ctx.spc_opts or ctx.seg_opts or ctx.fam_opts %}<h3 class="group-cap">Filters</h3>{% endif %}
-      {% if ctx.spc_opts %}{% call acc('SPC name', 'spc_filters') %}{{ checklist('spc_filters', ctx.spc_opts) }}{% endcall %}{% endif %}
-      {% if ctx.seg_opts %}{% call acc('Segment 1', 'seg1_filters') %}{{ checklist('seg1_filters', ctx.seg_opts) }}{% endcall %}{% endif %}
-      {% if ctx.fam_opts %}{% call acc('Family name', 'family_filters') %}{{ checklist('family_filters', ctx.fam_opts) }}{% endcall %}{% endif %}
-
       <h3 class="group-cap">Table</h3>
       {% call acc('X axis · group by', 'index_cols', True, True) %}{{ checklist('index_cols', ctx.x_opts, True) }}{% endcall %}
       {% call acc('Y axis · values', 'value_cols', True, True) %}{{ checklist('value_cols', ctx.y_opts, True) }}{% endcall %}
@@ -949,6 +1012,7 @@ WORKSPACE_HTML = """<!doctype html>
           <label class="chip-check"><input type="checkbox" name="agg_funcs" value="count"><span>Count</span></label>
           <label class="chip-check"><input type="checkbox" name="agg_funcs" value="mean"><span>Average</span></label>
         </div>
+
         <div class="list static">
           <label class="row switch"><span class="label">Share %<small>Contribution to the total</small></span><input type="checkbox" name="share" value="1"><span class="track"><span class="knob"></span></span></label>
           <label class="row switch"><span class="label">Growth %<small>Change versus previous row</small></span><input type="checkbox" name="growth" value="1"><span class="track"><span class="knob"></span></span></label>
@@ -986,7 +1050,24 @@ WORKSPACE_HTML = """<!doctype html>
           <span class="pills" id="filterPills"></span>
         </div>
       </header>
+
       <div id="kpi-banner" class="kpis" hidden></div>
+
+      <section id="spcReview" class="card review-card" hidden>
+        <div class="review-head">
+          <h3>SPC overview</h3>
+        </div>
+        <div class="review-grid">
+          <div class="review-panel">
+            <h4>Pros</h4>
+            <ul id="spcPros"></ul>
+          </div>
+          <div class="review-panel">
+            <h4>Cons</h4>
+            <ul id="spcCons"></ul>
+          </div>
+        </div>
+      </section>
 
       <section id="tableCard" class="card table-card">
         <div class="table-bar" id="table-bar" hidden><span id="statusText"></span><span class="no-export">Tap a header to sort</span></div>
@@ -1041,7 +1122,6 @@ WORKSPACE_HTML = """<!doctype html>
 </body></html>"""
 
 APP_CSS = r"""
-/* ═══════ tokens ═══════ */
 :root{
   color-scheme:light;
   --glass:72;
@@ -1122,7 +1202,6 @@ body.loading #loadbar{opacity:1}
 body.loading #loadbar::after{animation:slide 1.1s var(--ease) infinite}
 @keyframes slide{from{transform:translateX(-100%)}to{transform:translateX(250%)}}
 
-/* popover */
 .menu-wrap{position:relative}
 .popover{position:absolute;right:0;top:calc(100% + 10px);z-index:60;width:240px;padding:14px 16px 12px;border-radius:var(--r-md);background:var(--surface);box-shadow:0 0 0 .5px var(--hairline),inset 0 1px 0 var(--spec),var(--shadow-2);-webkit-backdrop-filter:saturate(190%) blur(30px);backdrop-filter:saturate(190%) blur(30px);transform-origin:top right;opacity:0;visibility:hidden;pointer-events:none;transform:scale(.88) translateY(-8px);transition:opacity .2s,transform .4s var(--spring),visibility 0s .4s}
 .popover.show{opacity:1;visibility:visible;pointer-events:auto;transform:none;transition-delay:0s}
@@ -1136,7 +1215,6 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:26px;heigh
 input[type=range]::-moz-range-thumb{width:26px;height:26px;border:0;border-radius:50%;background:#fff;box-shadow:0 2px 6px rgba(0,0,0,.3)}
 input[type=range]:active::-webkit-slider-thumb{transform:scale(1.12)}
 
-/* network status */
 .net-status{
   display:inline-flex;
   align-items:center;
@@ -1171,11 +1249,8 @@ input[type=range]:active::-webkit-slider-thumb{transform:scale(1.12)}
   opacity:.7;
 }
 .net-status.offline{color:var(--neg)}
-@media (max-width: 860px){
-  .net-status{display:none}
-}
+@media (max-width: 860px){ .net-status{display:none} }
 
-/* segmented */
 .seg{--n:2;--i:0;position:relative;display:inline-grid;grid-auto-flow:column;grid-auto-columns:1fr;padding:2px;border-radius:12px;background:var(--fill);isolation:isolate}
 .seg[data-n="3"]{--n:3}
 .seg:has(input:nth-of-type(2):checked){--i:1}
@@ -1191,25 +1266,21 @@ input[type=range]:active::-webkit-slider-thumb{transform:scale(1.12)}
 .seg input:checked+label{color:var(--label)}
 .seg input:focus-visible+label{outline:3px solid color-mix(in srgb,var(--blue) 50%,transparent)}
 
-/* smaller ios toggle */
 .ios-switch{display:flex;align-items:center;gap:8px;cursor:pointer;font-size:12px;font-weight:500;color:var(--label-2);user-select:none}
 .ios-switch input,.row.switch input{position:absolute;opacity:0;pointer-events:none}
 .ios-switch .track{position:relative;flex:none;width:36px;height:22px;border-radius:999px;background:var(--fill);transition:background .3s var(--ease)}
 .ios-switch .knob{position:absolute;top:2px;left:2px;width:18px;height:18px;border-radius:50%;background:#fff;box-shadow:0 2px 6px rgba(0,0,0,.22);transition:transform .35s var(--spring)}
-.ios-switch input:checked + .track{background:var(--green)}
-.ios-switch input:checked + .track .knob{transform:translateX(14px)}
+.ios-switch input:checked+.track{background:var(--green)}
+.ios-switch input:checked+.track .knob{transform:translateX(14px)}
 .ios-switch:active .knob{transform:scale(.96)}
 .nav .ios-switch .track{width:36px;height:22px}
 .nav .ios-switch .knob{width:18px;height:18px}
-.nav .ios-switch input:checked + .track .knob{transform:translateX(14px)}
+.nav .ios-switch input:checked+.track .knob{transform:translateX(14px)}
 
-/* layouts */
 body.desktop-mode{overflow:hidden}
 .desktop-mode .app{display:flex;height:100vh;padding-top:var(--nav-h)}
-.tablet-mode .app{display:flex;height:100vh;padding-top:var(--nav-h)}
 .mobile-mode .app{display:block;padding-top:var(--nav-h);max-width:520px;margin:0 auto}
 .sidebar{display:flex;flex-direction:column;flex:none;width:var(--sidebar-w,350px);min-width:270px;margin:12px 0 12px 12px;height:calc(100vh - var(--nav-h) - 24px);border-radius:var(--r-xl);background:var(--surface);box-shadow:0 0 0 .5px var(--hairline),inset 0 1px 0 var(--spec),var(--shadow-1);overflow:hidden}
-.tablet-mode .sidebar{width:320px;min-width:300px}
 .sidebar-head{padding:20px 20px 10px}
 .head-row{display:flex;align-items:center;justify-content:space-between}
 .sidebar-head h2{margin:0;font-size:26px;font-weight:700;letter-spacing:-.03em;line-height:1.1}
@@ -1223,7 +1294,6 @@ body.desktop-mode{overflow:hidden}
 .main{flex:1;min-width:0;height:calc(100vh - var(--nav-h));overflow-y:auto;padding:16px 28px 40px 6px}
 .page-head{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:18px}
 
-/* accordion */
 .acc{margin-bottom:8px;border-radius:var(--r-md);background:var(--surface-solid);box-shadow:0 0 0 .5px var(--hairline);overflow:hidden;transition:opacity .3s,filter .3s}
 .acc.is-disabled{opacity:.4;filter:saturate(.3);pointer-events:none}
 .acc-head{display:flex;align-items:center;gap:8px;width:100%;padding:13px 14px;border:0;background:none;text-align:left;font-size:14px;font-weight:600;transition:background .2s}
@@ -1239,7 +1309,6 @@ body.desktop-mode{overflow:hidden}
 .badge{min-width:22px;height:22px;padding:0 7px;display:grid;place-items:center;border-radius:11px;background:var(--blue);color:#fff;font-size:12px;font-weight:600;animation:pop .4s var(--spring)}
 @keyframes pop{from{transform:scale(.4);opacity:0}to{transform:none;opacity:1}}
 
-/* list controls */
 .tools{display:flex;align-items:center;gap:8px;margin:0 0 10px}
 .tools.end{justify-content:flex-end}
 .tool-btns{display:flex;gap:6px}
@@ -1269,7 +1338,6 @@ body.desktop-mode{overflow:hidden}
 .row:active .box{transform:scale(.84)}
 .row.switch{padding:10px 14px}.row.switch::before{display:none}.row.switch+.row.switch::before{display:block;left:14px}
 
-/* period */
 .anchor{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:12px;font-size:12px;color:var(--label-3)}
 .mini-seg{display:inline-flex;padding:2px;border-radius:9px;background:var(--fill)}
 .mini-seg button{height:24px;padding:0 10px;border:0;border-radius:7px;background:none;font-size:12px;font-weight:500;color:var(--label-2);transition:background .3s var(--ease),color .2s,box-shadow .3s}
@@ -1301,7 +1369,6 @@ body.desktop-mode{overflow:hidden}
 .wk input:checked+.wk-chip small{color:rgba(255,255,255,.8)}
 .wk input:focus-visible+.wk-chip{outline:3px solid color-mix(in srgb,var(--blue) 50%,transparent);outline-offset:1px}
 
-/* buttons */
 .btn-primary{display:inline-flex;align-items:center;justify-content:center;gap:8px;height:40px;padding:0 22px;border:0;border-radius:980px;background:var(--blue);color:#fff;font-size:14px;font-weight:500;box-shadow:inset 0 1px 0 rgba(255,255,255,.3),0 4px 14px color-mix(in srgb,var(--blue) 30%,transparent);transition:background .2s,transform .35s var(--spring),box-shadow .2s}
 .btn-primary:hover{background:var(--blue-h)} .btn-primary:active{background:var(--blue-a);transform:scale(.95)}
 .btn-primary:disabled{opacity:.35;cursor:not-allowed;box-shadow:none;transform:none}
@@ -1311,7 +1378,6 @@ body.desktop-mode{overflow:hidden}
 .btn-text:hover{background:var(--blue-tint)} .btn-text:active{transform:scale(.94)}
 .btn-text .ic{width:14px;height:14px}
 
-/* export menu */
 .menu{position:absolute;right:0;top:calc(100% + 8px);z-index:50;min-width:230px;padding:6px;border-radius:var(--r-md);background:var(--surface);box-shadow:0 0 0 .5px var(--hairline),inset 0 1px 0 var(--spec),var(--shadow-2);transform-origin:top right;opacity:0;visibility:hidden;pointer-events:none;transform:scale(.88) translateY(-8px);transition:opacity .2s,transform .4s var(--spring),visibility 0s .4s}
 .menu.show{opacity:1;visibility:visible;pointer-events:auto;transform:none;transition-delay:0s}
 .menu-cap{padding:7px 10px 5px;font-size:11px;font-weight:600;letter-spacing:.03em;text-transform:uppercase;color:var(--label-3)}
@@ -1319,7 +1385,6 @@ body.desktop-mode{overflow:hidden}
 .menu-item:hover{background:var(--blue);color:#fff}
 .menu-item:disabled{opacity:.4;pointer-events:none}
 
-/* report */
 #report-area{max-width:1500px}
 .report-head{margin-bottom:16px}
 .report-title{margin:0 0 10px;font-size:30px;font-weight:700;letter-spacing:-.032em;line-height:1.12;text-wrap:balance}
@@ -1340,13 +1405,33 @@ body.desktop-mode{overflow:hidden}
 .kpi.active .kpi-label{color:var(--blue)}
 .kpi.static{cursor:default}.kpi.static:hover,.kpi.static:active{transform:none}
 
+.review-card{
+  margin-bottom:16px;
+  padding:18px;
+  border-radius:var(--r-lg);
+  background:var(--table-bg);
+  box-shadow:0 0 0 .5px var(--hairline),var(--shadow-1);
+}
+.review-head h3{margin:0 0 14px;font-size:18px;font-weight:700;letter-spacing:-.02em}
+.review-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.review-panel{padding:12px 14px;border-radius:16px;background:var(--fill-2);border:1px solid var(--hairline)}
+.review-panel h4{margin:0 0 10px;font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--label-3)}
+.review-panel ul{list-style:none;padding:0;margin:0;display:grid;gap:10px}
+.review-panel li{
+  display:flex;justify-content:space-between;gap:12px;padding:9px 10px;border-radius:10px;background:var(--surface-solid);border:1px solid var(--hairline);
+  font-size:13px;color:var(--label-2);
+}
+.review-panel li strong{font-weight:700;color:var(--label)}
+.review-panel .meta{display:flex;flex-direction:column;gap:2px;align-items:flex-end;white-space:nowrap}
+.review-panel .chip-share{display:inline-block;padding:4px 8px;border-radius:999px;background:rgba(0,113,227,.08);font-size:11px;font-weight:700;color:var(--blue)}
+
 .card{border-radius:var(--r-lg);background:var(--table-bg);box-shadow:0 0 0 .5px var(--hairline),var(--shadow-1);overflow:hidden}
 .table-card{display:flex;flex-direction:column}
 .table-bar{display:flex;justify-content:space-between;gap:16px;padding:11px 18px;font-size:12px;font-weight:500;color:var(--label-2);background:var(--th-bg);border-bottom:.5px solid var(--hairline)}
 .table-bar span:last-child{color:var(--label-3);font-weight:400}
 .table-scroll{max-height:calc(100vh - 330px);min-height:180px;height:clamp(220px,58vh,760px);overflow:auto;-webkit-overflow-scrolling:touch;transition:opacity .25s}
 .table-card.updating .table-scroll,.chart-card.updating .chart-body{opacity:.5}
-.excel-table{width:max-content;min-width:100%;border-collapse:separate;border-spacing:0;font-size:13.5px;font-variant-numeric:tabular-nums;table-layout:auto}
+.excel-table{width:max-content;min-width:100%;border-collapse:separate;border-spacing:0;font-size:13.5px;font-variant-numeric:tabular-nums}
 .excel-table th,.excel-table td{padding:12px 18px;border-bottom:.5px solid var(--hairline);text-align:left;white-space:nowrap}
 .excel-table td{background-color:var(--table-bg)}
 .excel-table .num{text-align:right}
@@ -1366,16 +1451,16 @@ body.desktop-mode{overflow:hidden}
 .excel-table tbody tr:last-child td{border-bottom:0}
 .excel-table th.total-col{color:var(--blue)}
 .excel-table td.total-col{font-weight:600;border-left:.5px solid var(--hairline);background-image:linear-gradient(var(--blue-tint),var(--blue-tint))}
-.excel-table thead th.highlight,
-.excel-table tfoot td.highlight,
-.excel-table td.total-col.highlight{
-  background-image:linear-gradient(var(--hl),var(--hl));
-  color:var(--blue);
-}
-.excel-table thead th.highlight{color:var(--blue)}
-.excel-table tfoot td.highlight{color:var(--blue)}
 .pct-positive{color:var(--pos);font-weight:600}.pct-negative{color:var(--neg);font-weight:600}.pct-neutral{color:var(--label-3)}
-.pct-share{display:inline-block;padding:1px 4px;border-radius:8px;background:color-mix(in srgb, var(--blue) calc(var(--share) * 100%), transparent);opacity:.92}
+.pct-share{
+  display:inline-block;
+  padding:3px 7px;
+  border-radius:999px;
+  font-weight:700;
+  letter-spacing:-.01em;
+  min-width:54px;
+  text-align:center;
+}
 .resizer{position:absolute;top:0;right:0;bottom:0;width:10px;cursor:col-resize;touch-action:none}
 .resizer::after{content:"";position:absolute;right:4px;top:28%;bottom:28%;width:1px;background:var(--hairline-strong);transition:background .2s,width .2s}
 .resizer:hover::after{background:var(--blue);width:2px}
@@ -1387,7 +1472,6 @@ tr.hl-row td{background-image:linear-gradient(var(--hl),var(--hl))!important}
 .empty.err{border-color:color-mix(in srgb,var(--neg) 35%,transparent);background:color-mix(in srgb,var(--neg) 8%,transparent)}
 .empty.err h3{color:var(--neg)}
 
-/* chart more options */
 .chart-more{position:relative}
 .chart-more-menu{
   position:absolute;
@@ -1429,7 +1513,6 @@ tr.hl-row td{background-image:linear-gradient(var(--hl),var(--hl))!important}
 .chart-more-item:hover{background:var(--fill-2)}
 .chart-more-item .small{font-size:11px;color:var(--label-3)}
 
-/* chart */
 .chart-bar{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;padding:14px 18px 6px}
 .legend{display:flex;flex-wrap:wrap;gap:6px}
 .lg{display:inline-flex;align-items:center;gap:7px;height:28px;padding:0 12px;border:0;border-radius:14px;background:var(--fill-2);box-shadow:inset 0 0 0 .5px var(--hairline);font-size:12px;font-weight:500;transition:opacity .25s,background .2s,transform .3s var(--spring)}
@@ -1472,7 +1555,6 @@ tr.hl-row td{background-image:linear-gradient(var(--hl),var(--hl))!important}
 .chart-note{padding:0 18px 14px;font-size:12px;color:var(--label-3);min-height:14px}
 .chart-note:empty{padding:0}
 
-/* upload page */
 .upload-wrap{max-width:540px;margin:0 auto;padding:calc(var(--nav-h) + 72px) 20px 48px;animation:rise .7s var(--ease) both}
 .hero-title{margin:0 0 10px;text-align:center;font-size:clamp(38px,8vw,60px);font-weight:700;letter-spacing:-.04em;line-height:1.04}
 .hero-sub{margin:0 0 34px;text-align:center;font-size:18px;color:var(--label-3)}
@@ -1480,13 +1562,12 @@ tr.hl-row td{background-image:linear-gradient(var(--hl),var(--hl))!important}
 .dropzone{display:grid;justify-items:center;gap:6px;padding:40px 20px;border:1.5px dashed var(--hairline-strong);border-radius:22px;background:var(--fill-2);color:var(--label-3);text-align:center;cursor:pointer;transition:border-color .3s var(--ease),background .3s,transform .45s var(--spring)}
 .dropzone:hover{border-color:var(--blue);color:var(--blue)}
 .dropzone.drag{border-color:var(--blue);background:var(--blue-tint);color:var(--blue);transform:scale(1.02)}
-.dropzone.has-file{border-style:solid;border-color:var(--blue);background:var(--blue-tint);color:var(--blue);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--blue) 30%, transparent)}
+.dropzone.has-file{border-style:solid;border-color:var(--blue);background:var(--blue-tint);color:var(--blue)}
 .dz-title{margin-top:6px;font-size:17px;font-weight:600;color:var(--label);word-break:break-all}
 .dz-sub{font-size:13px}
 .alert{padding:12px 14px;border-radius:14px;background:color-mix(in srgb,var(--neg) 12%,transparent);color:var(--neg);font-size:13px;font-weight:500}
 @keyframes rise{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:none}}
 
-/* toast + mobile preview */
 .toast{position:fixed;left:50%;bottom:28px;z-index:3000;padding:12px 20px;border-radius:980px;background:rgba(40,40,44,.92);color:#fff;font-size:13px;font-weight:500;transform:translate(-50%,16px);opacity:0;transition:opacity .3s,transform .45s var(--spring)}
 .toast.in{opacity:1;transform:translate(-50%,0)}
 .preview-modal{position:fixed;inset:0;z-index:5000;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;padding:20px;background:rgba(0,0,0,.92);animation:fadeIn .25s}
@@ -1495,7 +1576,6 @@ tr.hl-row td{background-image:linear-gradient(var(--hl),var(--hl))!important}
 .preview-modal .btn-primary{background:#fff;color:#1d1d1f}
 @keyframes fadeIn{from{opacity:0}to{opacity:1}}
 
-/* mobile */
 .mobile-mode .sidebar{width:auto;min-width:0;height:auto;max-height:5000px;margin:10px 12px 0;transition:max-height .6s var(--ease),opacity .3s,margin .5s var(--ease),visibility 0s}
 .mobile-mode.sidebar-collapsed .sidebar{max-height:0;opacity:0;visibility:hidden;margin-top:0;box-shadow:none;transition:max-height .5s var(--ease),opacity .3s,margin .5s var(--ease),visibility 0s .5s}
 .mobile-mode .sidebar-scroll{overflow:visible}
@@ -1512,14 +1592,12 @@ tr.hl-row td{background-image:linear-gradient(var(--hl),var(--hl))!important}
 .mobile-mode .kpis{grid-auto-columns:minmax(150px,46%)}
 .mobile-mode .kpi-val{font-size:23px}
 .mobile-mode .nav .sw-text{display:none}
-.tablet-mode .nav .sw-text{display:none}
 @media (max-width:560px){.nav .sw-text,#glassWrap{display:none}.nav{padding:0 12px}.brand{font-size:14px}}
 
 ::-webkit-scrollbar{width:8px;height:8px}
 ::-webkit-scrollbar-track{background:transparent}
 ::-webkit-scrollbar-thumb{background:var(--hairline-strong);border-radius:8px;border:2px solid transparent;background-clip:content-box}
 
-/* export mode */
 body.exporting{--surface:var(--surface-solid)}
 body.exporting::before{display:none}
 body.exporting *{-webkit-backdrop-filter:none!important;backdrop-filter:none!important;animation:none!important;transition:none!important}
@@ -1557,22 +1635,40 @@ function toast(msg){
   setTimeout(() => { t.classList.remove('in'); setTimeout(() => t.remove(), 400); }, 3200);
 }
 
-function applyViewportMode(){
-  const w = window.innerWidth;
-  const mode = w <= 768 ? 'mobile' : w <= 1024 ? 'tablet' : 'desktop';
-  body.classList.remove('mobile-mode','tablet-mode','desktop-mode');
-  body.classList.add(mode + '-mode');
-
-  if (window.matchMedia('(pointer: coarse)').matches) {
-    body.classList.add('touch-device');
-  } else {
-    body.classList.remove('touch-device');
-  }
+function fmtMb(v){
+  if (!Number.isFinite(v) || v <= 0) return '0MB/s';
+  if (v >= 1) return `${v.toFixed(1)}MB/s`;
+  return `${(v * 1024).toFixed(0)}KB/s`;
 }
-window.addEventListener('resize', applyViewportMode);
-applyViewportMode();
 
-/* theme */
+function setNetState(online, ping, up, down){
+  const dot = $('#netDot');
+  const text = $('#netText');
+  const pingEl = $('#netPing');
+  const speedEl = $('#netSpeed');
+  const wrap = $('#netStatus');
+
+  if (!dot || !text || !pingEl || !speedEl || !wrap) return;
+
+  dot.classList.toggle('offline', !online);
+  wrap.classList.toggle('offline', !online);
+  text.textContent = online ? 'Online' : 'Offline';
+  pingEl.textContent = `Ping ${ping || 0}ms`;
+  speedEl.textContent = `Up ${fmtMb(up || 0)} · Down ${fmtMb(down || 0)}`;
+}
+
+function updateNetworkInfo(){
+  const conn = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+  const online = navigator.onLine;
+  const ping = conn && Number.isFinite(conn.rtt) ? Math.max(1, Math.round(conn.rtt)) : 0;
+  const downlink = conn && Number.isFinite(conn.downlink) ? conn.downlink : 0;
+  const uplink = conn && Number.isFinite(conn.downlink) ? conn.downlink * 0.25 : 0;
+  setNetState(online, ping, uplink, downlink);
+}
+window.addEventListener('online', updateNetworkInfo);
+window.addEventListener('offline', updateNetworkInfo);
+updateNetworkInfo();
+
 const themeNow = store.get('ap-theme') || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
 $$('#themeSeg input').forEach(i => {
   i.checked = i.value === themeNow;
@@ -1590,14 +1686,7 @@ if (gRange) {
 }
 
 const popovers = [['#glassBtn', '#glassPop'], ['#exportBtn', '#exportMenu']].map(([b, p]) => [$(b), $(p)]).filter(([b, p]) => b && p);
-function closePops(except){
-  popovers.forEach(([b, p]) => {
-    if (p !== except) {
-      p.classList.remove('show');
-      b.setAttribute('aria-expanded', 'false');
-    }
-  });
-}
+function closePops(except){ popovers.forEach(([b, p]) => { if (p !== except) { p.classList.remove('show'); b.setAttribute('aria-expanded', 'false'); } }); }
 popovers.forEach(([b, p]) => b.addEventListener('click', e => {
   e.stopPropagation(); const open = !p.classList.contains('show');
   closePops(open ? p : null); p.classList.toggle('show', open); b.setAttribute('aria-expanded', String(open));
@@ -1609,44 +1698,6 @@ document.addEventListener('click', e => {
 });
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closePops(); });
 
-/* network status */
-function fmtMb(v){
-  if (!Number.isFinite(v) || v <= 0) return '0MB/s';
-  if (v >= 1) return `${v.toFixed(1)}MB/s`;
-  return `${(v * 1024).toFixed(0)}KB/s`;
-}
-function setNetState(online, ping, up, down){
-  const dot = $('#netDot'), text = $('#netText'), pingEl = $('#netPing'), speedEl = $('#netSpeed'), wrap = $('#netStatus');
-  if (!dot || !text || !pingEl || !speedEl || !wrap) return;
-  dot.classList.toggle('offline', !online);
-  wrap.classList.toggle('offline', !online);
-  text.textContent = online ? 'Online' : 'Offline';
-  pingEl.textContent = `Ping ${ping || 0}ms`;
-  speedEl.textContent = `Up ${fmtMb(up || 0)} · Down ${fmtMb(down || 0)}`;
-}
-function estimateRate(bytes, ms){
-  const secs = ms <= 0 ? 1 : ms / 1000;
-  return Math.max(0, bytes / secs / (1024 * 1024));
-}
-let net = {ping:0, up:0, down:0};
-async function measurePing(){
-  const start = performance.now();
-  try {
-    await fetch('/assets/app.js?ts=' + Date.now(), { method: 'GET', cache: 'no-store' });
-    const elapsed = Math.max(1, Math.round(performance.now() - start));
-    net.ping = elapsed;
-    setNetState(navigator.onLine, elapsed, net.up, net.down);
-  } catch {
-    setNetState(false, 0, net.up, net.down);
-  }
-}
-window.addEventListener('online', () => { setNetState(true, net.ping || 0, net.up, net.down); measurePing(); });
-window.addEventListener('offline', () => { setNetState(false, 0, net.up, net.down); });
-setNetState(navigator.onLine, 0, 0, 0);
-measurePing();
-setInterval(measurePing, 15000);
-
-/* upload */
 const dz = $('#dropzone');
 if (dz) {
   const input = $('#file'), title = $('#dzTitle'), sub = $('#dzSub'), btn = $('#launchBtn');
@@ -1668,75 +1719,47 @@ if (dz) {
 const form = $('#config-form');
 if (!form) return;
 
-/* mobile switch */
 const sw = $('#mobileSwitch');
-const sidebarToggle = $('#sidebarToggle');
-
-function syncMobileState() {
-  const on = body.classList.contains('mobile-mode');
-  if (sw) sw.checked = on;
-  if (sidebarToggle) {
-    sidebarToggle.setAttribute('aria-expanded', String(!body.classList.contains('sidebar-collapsed')));
-  }
-}
-
-if (sw) {
-  sw.checked = body.classList.contains('mobile-mode');
-  sw.addEventListener('change', () => {
-    const on = sw.checked;
-    body.classList.toggle('mobile-mode', on);
-    body.classList.toggle('desktop-mode', !on);
-    body.classList.toggle('tablet-mode', !on && window.innerWidth <= 1024);
-    body.classList.toggle('sidebar-collapsed', on);
-    store.set('ap-mobile', on ? '1' : '0');
-    syncMobileState();
-    redrawSoon();
-  });
-}
-
-if (sidebarToggle) {
-  sidebarToggle.addEventListener('click', () => {
-    const collapsed = !body.classList.contains('sidebar-collapsed');
-    body.classList.toggle('sidebar-collapsed', collapsed);
-    sidebarToggle.setAttribute('aria-expanded', String(!collapsed));
-    if (body.classList.contains('mobile-mode')) {
-      store.set('ap-mobile', collapsed ? '0' : '1');
-    }
-  });
-}
+sw.checked = body.classList.contains('mobile-mode');
+sw.addEventListener('change', () => {
+  const on = sw.checked;
+  body.classList.toggle('mobile-mode', on); body.classList.toggle('desktop-mode', !on);
+  body.classList.toggle('sidebar-collapsed', on);
+  $('#sidebarToggle').setAttribute('aria-expanded', String(!on));
+  store.set('ap-mobile', on ? '1' : '0');
+  redrawSoon();
+});
+$('#sidebarToggle').addEventListener('click', e => {
+  const c = body.classList.toggle('sidebar-collapsed');
+  e.currentTarget.setAttribute('aria-expanded', String(!c));
+});
 
 const rz = $('#sidebarResizer');
 const savedW = store.get('ap-sidebar-w');
 if (savedW) root.style.setProperty('--sidebar-w', savedW + 'px');
-if (rz) {
-  rz.addEventListener('pointerdown', e => { rz.setPointerCapture(e.pointerId); rz.classList.add('resizing'); body.style.cursor = 'col-resize'; body.style.userSelect = 'none'; });
-  rz.addEventListener('pointermove', e => { if (rz.hasPointerCapture(e.pointerId)) root.style.setProperty('--sidebar-w', Math.min(560, Math.max(270, e.clientX - 12)) + 'px'); });
-  const endResize = () => {
-    rz.classList.remove('resizing'); body.style.cursor = ''; body.style.userSelect = '';
-    const w = parseInt(getComputedStyle(root).getPropertyValue('--sidebar-w'), 10); if (w) store.set('ap-sidebar-w', w);
-    redrawSoon();
-  };
-  rz.addEventListener('pointerup', endResize); rz.addEventListener('pointercancel', endResize);
-  rz.addEventListener('dblclick', () => { root.style.removeProperty('--sidebar-w'); store.set('ap-sidebar-w', ''); redrawSoon(); });
-}
+rz.addEventListener('pointerdown', e => { rz.setPointerCapture(e.pointerId); rz.classList.add('resizing'); body.style.cursor = 'col-resize'; body.style.userSelect = 'none'; });
+rz.addEventListener('pointermove', e => { if (rz.hasPointerCapture(e.pointerId)) root.style.setProperty('--sidebar-w', Math.min(560, Math.max(270, e.clientX - 12)) + 'px'); });
+const endResize = () => {
+  rz.classList.remove('resizing'); body.style.cursor = ''; body.style.userSelect = '';
+  const w = parseInt(getComputedStyle(root).getPropertyValue('--sidebar-w'), 10); if (w) store.set('ap-sidebar-w', w);
+  redrawSoon();
+};
+rz.addEventListener('pointerup', endResize); rz.addEventListener('pointercancel', endResize);
+rz.addEventListener('dblclick', () => { root.style.removeProperty('--sidebar-w'); store.set('ap-sidebar-w', ''); redrawSoon(); });
 
 const boot = JSON.parse($('#boot').textContent || '{}');
 const filterMap = boot.map || [];
 const tableWrap = $('#table-wrapper'), tableCard = $('#tableCard'), chartCard = $('#chartCard');
 const bar = $('#table-bar'), kpiEl = $('#kpi-banner'), chartBody = $('#chartBody');
 const dlExcel = $('#dlExcel');
+const spcReview = $('#spcReview');
+const spcPros = $('#spcPros');
+const spcCons = $('#spcCons');
 const view = () => $('input[name="view_mode_toggle"]:checked').value;
 const order = { index_cols: [], value_cols: [] };
 let data = null, dataMode = null, lastParams = null, ctrl = null, timer = null;
 let periodLabel = '', activePreset = null, activeKpi = null, kpis = [];
-
-const emptyBlock = (t, m, err) => `
-  <div class="empty${err ? ' err' : ''}">
-    <svg class="ic"><use href="#i-chart"/></svg>
-    <h3>${esc(t)}</h3>
-    <p>${m}</p>
-  </div>
-`;
+const emptyBlock = (t, m, err) => `<div class="empty${err ? ' err' : ''}"><svg class="ic"><use href="#i-chart"/></svg><h3>${esc(t)}</h3><p>${m}</p></div>`;
 const PROMPT = emptyBlock('Build your report', 'Pick at least one <b>X column</b>, one <b>Y column</b> and one <b>measure</b> in the sidebar.');
 
 const checked = name => $$(`input[name="${name}"]:checked`);
@@ -1762,7 +1785,6 @@ function updateBadges(){
   });
 }
 
-/* presets */
 const parseISO = s => { const [y, m, d] = s.split('-').map(Number); return new Date(y, m - 1, d); };
 const iso = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 const addD = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x; };
@@ -1786,14 +1808,7 @@ paintAnchor();
 
 function clearWM(){ $$('input[name="weeks"], input[name="months"]').forEach(i => { i.checked = false; }); }
 function clearDates(){ const s = $('#start_date'), e = $('#end_date'); if (s) { s.value = ''; e.value = ''; } }
-function setActiveChip(key){
-  activePreset = key;
-  $$('.chip').forEach(c => {
-    const selected = c.dataset.preset === key && key !== 'all';
-    c.classList.toggle('active', selected);
-    c.setAttribute('aria-pressed', selected ? 'true' : 'false');
-  });
-}
+function setActiveChip(key){ activePreset = key; $$('.chip').forEach(c => c.classList.toggle('active', c.dataset.preset === key && key !== 'all')); }
 function applyPreset(key){
   clearWM(); setActiveChip(key);
   const chip = $(`.chip[data-preset="${key}"]`); periodLabel = key === 'all' ? '' : (chip ? chip.textContent : '');
@@ -1812,7 +1827,6 @@ function buildParams(server){
 function schedule(delay = 90){ clearTimeout(timer); timer = setTimeout(update, delay); }
 
 async function update(){
-  const requestStart = performance.now();
   const server = view() === 'raw' ? 'raw' : 'pivot';
   const fd = buildParams(server);
   $$('[data-structural]').forEach(el => el.classList.toggle('is-disabled', server === 'raw'));
@@ -1826,9 +1840,6 @@ async function update(){
   body.classList.add('loading'); tableCard.classList.add('updating'); chartCard.classList.add('updating');
   try {
     const res = await fetch('/calculate', { method: 'POST', body: fd, signal: mine.signal });
-    const elapsed = performance.now() - requestStart;
-    net.up = estimateRate(Math.max(1, Array.from(fd.entries()).reduce((s, [, v]) => s + (typeof v === 'string' ? v.length : 0), 0)), elapsed);
-    setNetState(navigator.onLine, net.ping || 0, net.up, net.down);
     const d = await res.json();
     data = res.ok ? d : { error: d.error || 'Unknown error' };
     dataMode = server; lastParams = res.ok ? new URLSearchParams(fd).toString() : null;
@@ -1841,6 +1852,31 @@ async function update(){
   }
 }
 
+function renderReview(payload){
+  const review = payload && payload.spc_review ? payload.spc_review : { pros: [], cons: [] };
+  const has = review.pros.length || review.cons.length;
+  spcReview.hidden = !has;
+  if (!has) return;
+  spcPros.innerHTML = review.pros.map(item => `
+    <li>
+      <strong>${esc(item.label)}</strong>
+      <div class="meta">
+        <span class="chip-share">${esc(item.share)}</span>
+        <span>${esc(item.value)}</span>
+      </div>
+    </li>
+  `).join('');
+  spcCons.innerHTML = review.cons.map(item => `
+    <li>
+      <strong>${esc(item.label)}</strong>
+      <div class="meta">
+        <span class="chip-share">${esc(item.share)}</span>
+        <span>${esc(item.value)}</span>
+      </div>
+    </li>
+  `).join('');
+}
+
 function setHead(title, period, filters){
   $('#reportTitle').textContent = title; document.title = title + ' · Analytics Pro';
   $('#periodText').textContent = period || ''; $('#periodPill').hidden = !period;
@@ -1849,33 +1885,15 @@ function setHead(title, period, filters){
 
 function render(){
   const mode = view(), d = data;
-  tableCard.hidden = mode === 'chart';
-  chartCard.hidden = mode !== 'chart';
-
-  $('#exportCap').textContent = `Exports the ${mode === 'raw' ? 'raw data' : mode === 'chart' ? 'chart' : 'pivot'} · ${body.classList.contains('mobile-mode') ? 'mobile' : body.classList.contains('tablet-mode') ? 'tablet' : 'desktop'} layout`;
+  tableCard.hidden = mode === 'chart'; chartCard.hidden = mode !== 'chart';
+  $('#exportCap').textContent = `Exports the ${mode === 'raw' ? 'raw data' : mode === 'chart' ? 'chart' : 'pivot'} · ${body.classList.contains('mobile-mode') ? 'mobile' : 'desktop'} layout`;
   dlExcel.disabled = !(d && !d.error && lastParams);
 
   const block = html => {
-    kpiEl.hidden = true;
-    bar.hidden = true;
-    tableWrap.innerHTML = html;
-    chartBody.innerHTML = html;
-    $('#legend').innerHTML = '';
-    $('#chartNote').textContent = '';
-    kpis = [];
-    activeKpi = null;
+    kpiEl.hidden = true; bar.hidden = true; tableWrap.innerHTML = html; chartBody.innerHTML = html; $('#legend').innerHTML = ''; $('#chartNote').textContent = ''; kpis = []; activeKpi = null; spcReview.hidden = true;
   };
-
-  if (!d) {
-    setHead('Build your report', boot.all, []);
-    block(PROMPT);
-    return;
-  }
-  if (d.error) {
-    setHead('Something went wrong', '', []);
-    block(emptyBlock('Something went wrong', esc(d.error), true));
-    return;
-  }
+  if (!d) { setHead('Build your report', boot.all, []); block(PROMPT); return; }
+  if (d.error) { setHead('Something went wrong', '', []); block(emptyBlock('Something went wrong', esc(d.error), true)); return; }
   setHead(d.title, d.period, d.filters);
 
   const prevLabel = kpis[activeKpi] && kpis[activeKpi].label;
@@ -1883,6 +1901,8 @@ function render(){
   activeKpi = Math.max(-1, kpis.findIndex(k => k.label === prevLabel)); if (activeKpi < 0) activeKpi = null;
   kpiEl.hidden = !kpis.length;
   kpiEl.innerHTML = kpis.map((k, i) => `<button type="button" class="kpi${k.cols && k.cols.length ? '' : ' static'}" data-i="${i}"><span class="kpi-label">${esc(k.label)}</span><span class="kpi-val" title="${esc(k.value)}">${esc(k.value)}</span><span class="kpi-sub">${esc(k.sub || '')}</span></button>`).join('');
+
+  renderReview(d);
 
   if (mode === 'chart') { drawLegend(); drawChart(true); }
   else {
@@ -1905,35 +1925,18 @@ function applyHighlight(){
   $$('.kpi', kpiEl).forEach((b, i) => b.classList.toggle('active', i === activeKpi));
   const tbl = $('.excel-table', tableWrap);
   let css = '';
-
   if (tbl) {
     tbl.classList.toggle('hl', !!k);
-
-    $$('.excel-table thead th', tableWrap).forEach(th => th.classList.remove('highlight'));
-    $$('.excel-table tfoot td', tableWrap).forEach(td => td.classList.remove('highlight'));
-
     if (k) {
       const nidx = Math.max(+tbl.dataset.nidx || 0, 1);
       const sel = k.cols.map(c => `:nth-child(${c + 1})`).join(',');
-
-      css = `
-        .excel-table.hl :is(td,th):not(:nth-child(-n+${nidx})){color:var(--label-3)!important}
-        .excel-table.hl td:not(:nth-child(-n+${nidx})) span{opacity:.5}
-        .excel-table.hl :is(td,th):is(${sel}){color:var(--label)!important;background-image:linear-gradient(var(--hl),var(--hl))}
-        .excel-table.hl th:is(${sel}){color:var(--blue)!important}
-        .excel-table.hl td:is(${sel}) span{opacity:1}
-      `;
-
-      $$('.excel-table thead th', tableWrap).forEach((th, idx) => {
-        if (k.cols.includes(idx)) th.classList.add('highlight');
-      });
-
-      $$('.excel-table tfoot td', tableWrap).forEach((td, idx) => {
-        if (k.cols.includes(idx)) td.classList.add('highlight');
-      });
+      css = `.excel-table.hl :is(td,th):not(:nth-child(-n+${nidx})){color:var(--label-3)!important}` +
+            `.excel-table.hl td:not(:nth-child(-n+${nidx})) span{opacity:.5}` +
+            `.excel-table.hl :is(td,th):is(${sel}){color:var(--label)!important;background-image:linear-gradient(var(--hl),var(--hl))}` +
+            `.excel-table.hl th:is(${sel}){color:var(--blue)!important}` +
+            `.excel-table.hl td:is(${sel}) span{opacity:1}`;
     }
   }
-
   hlStyle.textContent = css;
   const set = k ? new Set(k.cols) : null;
   const match = !!(set && chartData && chartData.series.some(s => set.has(s.col)));
@@ -1953,7 +1956,6 @@ form.addEventListener('change', e => {
     clearDates(); setActiveChip(null); periodLabel = '';
   } else if (t.type === 'date') { clearWM(); setActiveChip(null); periodLabel = ''; }
   if (n === 'index_cols' || n === 'value_cols') syncOrder(n);
-  if (n === 'spc_filters' || n === 'seg1_filters') cascade();
   schedule();
 });
 form.addEventListener('input', e => {
@@ -1970,7 +1972,6 @@ form.addEventListener('click', e => {
     $$(`input[name="${name}"]`).forEach(i => { if (!on || isShown(i.closest('.row'))) i.checked = on; });
     if (name === 'weeks' || name === 'months') { clearDates(); setActiveChip(null); periodLabel = ''; }
     if (name === 'index_cols' || name === 'value_cols') syncOrder(name);
-    if (name === 'spc_filters' || name === 'seg1_filters') cascade();
     schedule(0); return;
   }
   const lat = e.target.closest('[data-latest]');
@@ -1989,17 +1990,6 @@ $$('input[name="view_mode_toggle"]').forEach(r => r.addEventListener('change', (
   $$('[data-structural]').forEach(el => el.classList.toggle('is-disabled', server === 'raw'));
 }));
 
-function cascade(){
-  const spc = new Set(checked('spc_filters').map(i => i.value));
-  const apply = (name, valid) => $$('.row', $(`[data-list="${name}"]`) || document.createElement('div')).forEach(r => {
-    const hide = !valid.has(r.dataset.val); r.dataset.casc = hide ? '1' : '0';
-    if (hide) r.querySelector('input').checked = false;
-  });
-  apply('seg1_filters', new Set(filterMap.filter(r => !spc.size || spc.has(r.spc)).map(r => r.seg)));
-  const seg = new Set(checked('seg1_filters').map(i => i.value));
-  apply('family_filters', new Set(filterMap.filter(r => (!spc.size || spc.has(r.spc)) && (!seg.size || seg.has(r.seg))).map(r => r.fam)));
-}
-
 $('#resetBtn').addEventListener('click', () => {
   form.reset(); setActiveChip(null); periodLabel = ''; activeKpi = null;
   $$('.row').forEach(r => { delete r.dataset.casc; delete r.dataset.srch; });
@@ -2008,7 +1998,6 @@ $('#resetBtn').addEventListener('click', () => {
   $('#view_pivot').checked = true; schedule(0);
 });
 
-/* table: sortable headers, resizable columns */
 function addResizers(){
   $$('.excel-table th', tableWrap).forEach(th => { if (!th.querySelector('.resizer')) th.appendChild(Object.assign(document.createElement('div'), { className: 'resizer' })); });
 }
@@ -2043,7 +2032,6 @@ tableWrap.addEventListener('pointerdown', e => {
   e.preventDefault(); e.stopPropagation();
 });
 
-/* chart */
 let ctype = 'bar', csort = 'natural', hidden = new Set(), chartData = null, chartSig = '', chartX = '', redrawT = null, uid = 0;
 let chartLabelVisible = true;
 let chartMaxRows = null;
@@ -2106,7 +2094,7 @@ if (chartMoreBtn && chartMoreMenu) {
       const mode = btn.dataset.chartMode;
       if (mode === 'labels') {
         chartLabelVisible = !chartLabelVisible;
-        const state = document.getElementById('chartLabelState'); if (state) state.textContent = chartLabelVisible ? 'On' : 'Off';
+        document.getElementById('chartLabelState').textContent = chartLabelVisible ? 'On' : 'Off';
         drawChart(false);
       }
       if (mode === 'top20') { chartMaxRows = 20; drawChart(false); }
@@ -2194,130 +2182,3 @@ function drawChart(animate){
   ser.forEach(x => {
     s += `<g class="ser" data-col="${x.s.col}" style="--sc:var(--c${x.i % 8 + 1})">`;
     if (ctype === 'bar') {
-      const gw = Math.min(step * .72, ns * 44), bw = gw / ns;
-      x.v.forEach((v, i) => {
-        if (v == null) return; const j = ser.indexOf(x), bx = X(i) - gw / 2 + j * bw + (ns > 1 ? 1 : 0), top = Y(Math.max(v, 0)), bot = Y(Math.min(v, 0));
-        s += `<rect class="bar" style="--k:${i}" x="${bx}" y="${top}" width="${Math.max(bw - (ns > 1 ? 2 : 0), 2)}" height="${Math.max(bot - top, 1.5)}" rx="${Math.min(6, bw / 2)}"/>`;
-        if (showVals) s += `<text class="vlabel" x="${bx + (bw - 2) / 2}" y="${top - 6}">${fmtAxis(v)}</text>`;
-      });
-    } else {
-      const pts = x.v.map((v, i) => v == null ? null : [X(i), Y(v)]).filter(Boolean);
-      if (pts.length) {
-        const path = monoPath(pts);
-        if (ctype === 'area') s += `<path class="area" d="${path}L${pts[pts.length - 1][0]},${Y(0)}L${pts[0][0]},${Y(0)}Z" fill="url(#g${id}_${x.i})"/>`;
-        s += `<path class="line" pathLength="1" d="${path}"/>`;
-        if (n <= 60) pts.forEach(p => { s += `<circle class="dot" cx="${p[0]}" cy="${p[1]}" r="3.5"/>`; });
-        x.v.forEach((v, i) => { if (v != null) s += `<circle class="hdot" data-s="${x.i}" data-i="${i}" cx="${X(i)}" cy="${Y(v)}" r="5.5"/>`; });
-      }
-    }
-    s += '</g>';
-  });
-  s += `<rect class="hit" id="hit" x="0" y="0" width="${W}" height="${H}"/></svg>`;
-  chartBody.innerHTML = `${ya}<div class="plot-scroll">${s}</div><div class="tip" id="tip"></div>`;
-
-  const hit = $('#hit'), band = $('#band'), rule = $('#rule'), tip = $('#tip'), scroller = $('.plot-scroll', chartBody);
-  const hdots = $$('.hdot', chartBody);
-  const hide = () => { band.style.opacity = 0; rule.style.opacity = 0; tip.classList.remove('show'); hdots.forEach(c => { c.style.opacity = 0; }); };
-  hit.addEventListener('pointermove', e => {
-    const r = hit.getBoundingClientRect(), i = Math.min(n - 1, Math.max(0, Math.floor((e.clientX - r.left - m.l) / step)));
-    if (ctype === 'bar') { band.setAttribute('x', m.l + step * i); band.style.opacity = 1; rule.style.opacity = 0; }
-    else { rule.setAttribute('x1', X(i)); rule.setAttribute('x2', X(i)); rule.style.opacity = 1; band.style.opacity = 0; }
-    hdots.forEach(c => { c.style.opacity = +c.dataset.i === i ? 1 : 0; });
-    tip.innerHTML = `<div class="tip-title">${esc(labels[i])}</div>` + ser.map(x => `<div class="tip-row"><i style="background:var(--c${x.i % 8 + 1})"></i><span>${esc(x.s.name)}</span><b>${fmtFull(x.v[i])}</b></div>`).join('');
-    const cb = chartBody.getBoundingClientRect(); let left = e.clientX - cb.left + 16;
-    if (left + tip.offsetWidth > cb.width - 6) left = e.clientX - cb.left - tip.offsetWidth - 16;
-    tip.style.left = Math.max(4, left) + 'px'; tip.classList.add('show');
-  });
-  hit.addEventListener('pointerleave', hide);
-  scroller.scrollLeft = 0;
-
-  if ('ResizeObserver' in window) {
-    const ro = new ResizeObserver(() => {
-      if (!chartCard.hidden && chartData) {
-        drawChart(false);
-        applyHighlight();
-      }
-    });
-    try { ro.observe(chartBody); } catch (e) {}
-  }
-}
-function drawLegendFor(d){ chartData = d; drawLegend(); }
-
-/* export image */
-dlExcel.addEventListener('click', () => { closePops(); if (lastParams) location.href = '/download?' + lastParams; });
-
-let d2i = null;
-const loadD2I = () => d2i || (d2i = new Promise((ok, fail) => {
-  const s = document.createElement('script');
-  s.src = 'https://cdnjs.cloudflare.com/ajax/libs/dom-to-image/2.6.0/dom-to-image.min.js';
-  s.onload = ok; s.onerror = () => { d2i = null; fail(new Error('load')); }; document.head.appendChild(s);
-}));
-
-$('#dlImage').addEventListener('click', async () => {
-  closePops();
-  const area = $('#report-area'), mode = view();
-  const titleText = ($('#reportTitle').textContent || 'Report').replace(/[^A-Za-z0-9]+/g, '_').replace(/^_|_$/g, '').slice(0, 70) || 'Report';
-  const fileName = `${titleText}_${mode}.png`;
-
-  try {
-    await loadD2I();
-    body.classList.add('exporting');
-    if (mode === 'chart') { drawChart(false); applyHighlight(); }
-    await sleep(260);
-
-    const rect = area.getBoundingClientRect();
-    const scale = Math.max(1.5, Math.min(2.5, 1800 / Math.max(rect.width, 1)));
-    const width = Math.max(1200, Math.ceil(rect.width * scale));
-    const height = Math.max(900, Math.ceil(rect.height * scale));
-    const bg = getComputedStyle(body).backgroundColor;
-
-    const start = performance.now();
-    const blob = await domtoimage.toBlob(area, {
-      bgcolor: bg,
-      cacheBust: true,
-      width,
-      height,
-      style: {
-        transform: `scale(${scale})`,
-        transformOrigin: 'top left',
-        width: `${rect.width}px`,
-        height: `${rect.height}px`
-      }
-    });
-    const down = estimateRate(blob.size, performance.now() - start);
-    net.down = down;
-    setNetState(navigator.onLine, net.ping || 0, net.up, net.down);
-
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = fileName;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 2000);
-
-    toast('Image saved');
-  } catch (err) {
-    console.error(err);
-    toast('Could not export the image. Please try again.');
-  } finally {
-    area.style.width = '';
-    body.classList.remove('exporting');
-    if (mode === 'chart') { drawChart(false); applyHighlight(); }
-  }
-});
-
-if (body.classList.contains('mobile-mode')) {
-  body.classList.add('sidebar-collapsed');
-}
-
-syncMobileState();
-syncOrder('index_cols'); syncOrder('value_cols'); updateBadges(); update();
-})();
-"""
-
-ASSET_VERSION = hashlib.md5((APP_CSS + APP_JS).encode()).hexdigest()[:8]
-
-if __name__ == "__main__":
-    app.run(debug=os.environ.get("FLASK_DEBUG", "1") == "1")
