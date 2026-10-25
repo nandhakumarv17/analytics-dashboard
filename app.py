@@ -90,9 +90,6 @@ GLOBAL_HEAD = """
     .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
     .chip { padding: 6px 12px; border-radius: 8px; background: rgba(120,120,128,0.1); font-size: 12px; font-weight: 600; cursor: pointer; transition: 0.2s; border: none; color: var(--text-primary); }
     .chip.active { background: var(--blue-apple); color: #fff; }
-
-    .modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.4); backdrop-filter: blur(4px); z-index: 2000; align-items: center; justify-content: center; }
-    .modal-card { background: var(--card-bg); border: 1px solid var(--glass-border); padding: 24px; border-radius: 20px; width: 300px; box-shadow: var(--shadow-glass); }
 </style>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/dom-to-image/2.6.0/dom-to-image.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
@@ -134,23 +131,6 @@ WORKSPACE_HTML = """
             <button class="btn-liquid" onclick="toggleDarkMode()" id="dm-btn">🌙 Dark</button>
             <button class="btn-liquid btn-primary" onclick="exportImage()">📸 Save Image</button>
             <button class="btn-liquid" id="dlExcel">📊 Download Excel</button>
-        </div>
-    </div>
-    
-    <div class="modal-overlay" id="weekModal">
-        <div class="modal-card">
-            <div style="font-weight: 700; margin-bottom: 14px; font-size: 16px;">Select Weeks</div>
-            <div class="checkbox-group" style="margin-bottom: 16px;">
-                <label class="checkbox-item"><input type="checkbox" name="week_num" value="1"> <span>Week 1 (Days 1–7)</span></label>
-                <label class="checkbox-item"><input type="checkbox" name="week_num" value="2"> <span>Week 2 (Days 8–14)</span></label>
-                <label class="checkbox-item"><input type="checkbox" name="week_num" value="3"> <span>Week 3 (Days 15–21)</span></label>
-                <label class="checkbox-item"><input type="checkbox" name="week_num" value="4"> <span>Week 4 (Days 22–28)</span></label>
-                <label class="checkbox-item"><input type="checkbox" name="week_num" value="5"> <span>Week 5 (Days 29+)</span></label>
-            </div>
-            <div style="display: flex; gap: 8px;">
-                <button type="button" class="btn-liquid btn-primary" style="flex: 1;" onclick="applyWeeks()">Apply Weeks</button>
-                <button type="button" class="btn-liquid" style="flex: 1;" onclick="toggleWeekModal()">Cancel</button>
-            </div>
         </div>
     </div>
 
@@ -203,23 +183,36 @@ WORKSPACE_HTML = """
                 <div style="display:flex; gap:8px; margin-bottom: 12px;">
                     <div style="flex:1;">
                         <label style="font-size:10px; color:var(--text-secondary); font-weight:700;">FROM</label>
-                        <input type="date" name="start_date" id="start_date" class="btn-liquid" style="width:100%; box-sizing:border-box;">
+                        <input type="date" name="start_date" id="start_date" class="btn-liquid" style="width:100%; box-sizing:border-box;" onchange="updateDashboard()">
                     </div>
                     <div style="flex:1;">
                         <label style="font-size:10px; color:var(--text-secondary); font-weight:700;">TO</label>
-                        <input type="date" name="end_date" id="end_date" class="btn-liquid" style="width:100%; box-sizing:border-box;">
+                        <input type="date" name="end_date" id="end_date" class="btn-liquid" style="width:100%; box-sizing:border-box;" onchange="updateDashboard()">
                     </div>
                 </div>
 
                 <div class="checkbox-group" style="margin-bottom: 12px;">
                     <label class="switch-container">
-                        <span style="font-size: 13px; font-weight: 600;">Enable MTD vs LMTD Comparison</span>
+                        <span style="font-size: 13px; font-weight: 600;">Enable Period Comparison</span>
                         <input type="checkbox" name="compare_mode" value="lmtd" class="ios-switch" onchange="updateDashboard()">
                         <div class="switch"></div>
                     </label>
                 </div>
                 
-                <button type="button" class="btn-liquid" style="width: 100%; text-align: center; margin-bottom: 8px;" onclick="toggleWeekModal()">📅 Select Weeks <span id="weekBadge" style="color:var(--blue-apple); font-weight:700;"></span></button>
+                <div class="section-title">Filter by Weeks</div>
+                <div class="checkbox-group" style="margin-bottom: 12px;">
+                    <label class="switch-container">
+                        <span style="font-size: 13px; font-weight: 500;">Select All Weeks</span>
+                        <input type="checkbox" class="ios-switch" onchange="toggleAll('week_num', this.checked)">
+                        <div class="switch"></div>
+                    </label>
+                    <div style="height: 1px; background: var(--glass-border); margin: 4px 0;"></div>
+                    <label class="checkbox-item"><input type="checkbox" name="week_num" value="1" onchange="updateDashboard()"> <span>Week 1 (Days 1–7)</span></label>
+                    <label class="checkbox-item"><input type="checkbox" name="week_num" value="2" onchange="updateDashboard()"> <span>Week 2 (Days 8–14)</span></label>
+                    <label class="checkbox-item"><input type="checkbox" name="week_num" value="3" onchange="updateDashboard()"> <span>Week 3 (Days 15–21)</span></label>
+                    <label class="checkbox-item"><input type="checkbox" name="week_num" value="4" onchange="updateDashboard()"> <span>Week 4 (Days 22–28)</span></label>
+                    <label class="checkbox-item"><input type="checkbox" name="week_num" value="5" onchange="updateDashboard()"> <span>Week 5 (Days 29+)</span></label>
+                </div>
 
                 <div id="pivot-controls">
                     <div class="section-title">Rows (Y-Axis)</div>
@@ -308,18 +301,6 @@ WORKSPACE_HTML = """
     </div>
 
     <script>
-        function toggleWeekModal() {
-            const modal = document.getElementById('weekModal');
-            modal.style.display = modal.style.display === 'flex' ? 'none' : 'flex';
-        }
-        
-        function applyWeeks() {
-            const count = document.querySelectorAll('input[name="week_num"]:checked').length;
-            document.getElementById('weekBadge').innerText = count > 0 ? `(${count} selected)` : '';
-            toggleWeekModal();
-            updateDashboard();
-        }
-
         function updateAxisVisibility() {
             const selectedFields = Array.from(document.querySelectorAll('input[name="master_fields"]:checked')).map(cb => cb.value);
             
@@ -506,10 +487,7 @@ def get_master_data():
         try:
             with open(DATA_FILE_PATH, 'rb') as f:
                 saved = pd.read_pickle(f)
-            if isinstance(saved, dict) and 'df' in saved:
-                df = saved['df']
-            else:
-                df = saved
+            df = saved['df'] if isinstance(saved, dict) and 'df' in saved else saved
             df.rename(columns=lambda x: str(x).replace('SPC Name', 'BA Name').replace('SPC', 'BA'), inplace=True)
             return df
         except Exception:
@@ -544,7 +522,10 @@ def home():
         num_cols = df.select_dtypes(include='number').columns.tolist()
         
         status_col = next((c for c in cols if 'status' in c.lower() or 'remarks' in c.lower()), None)
-        status_list = sorted(df[status_col].dropna().astype(str).unique().tolist()) if status_col else []
+        status_list = []
+        if status_col:
+            raw_vals = df[status_col].dropna().astype(str).unique().tolist()
+            status_list = sorted([v for v in raw_vals if v.lower() != 'finalstatus' and v.strip() != ''])
         
         return render_template_string(WORKSPACE_HTML, all_cols=cols, grouping_cols=grouping, num_cols=num_cols, status_list=status_list)
     return render_template_string(UPLOAD_HTML, error=None)
@@ -562,20 +543,37 @@ def dashboard():
         name = f.filename.lower()
         if name.endswith('.csv'):
             df = pd.read_csv(f)
-            df['Month'] = 'Current'
         elif name.endswith(('.xlsx', '.xls')):
             xls = pd.ExcelFile(f)
             dfs = []
             for sheet in xls.sheet_names:
                 temp_df = pd.read_excel(xls, sheet_name=sheet)
                 if not temp_df.empty:
-                    temp_df['Month'] = sheet
                     dfs.append(temp_df)
             df = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
         else:
             return render_template_string(UPLOAD_HTML, error="Unsupported file type."), 400
         
         if df.empty: return render_template_string(UPLOAD_HTML, error="File contains no data."), 400
+
+        # Dynamically Extract Month Name from Master Date Column
+        date_col_name = ""
+        for c in ("Customized Sales Date", "Sale Date", "Sales Date"):
+            if c in df.columns:
+                date_col_name = c
+                break
+        if not date_col_name:
+            for c in df.columns:
+                if "date" in c.lower() and "activation" not in c.lower() and "tertiary" not in c.lower():
+                    date_col_name = c
+                    break
+        
+        if date_col_name:
+            parsed_dates = pd.to_datetime(df[date_col_name], errors='coerce')
+            df['Month'] = parsed_dates.dt.strftime('%b %Y').fillna('Unknown')
+        else:
+            df['Month'] = 'Current'
+
         df.to_pickle(DATA_FILE_PATH)
         return redirect(url_for('home'))
     except Exception as e:
@@ -605,8 +603,7 @@ def calculate():
                 break
         if not date_col_name:
             for c in date_cols:
-                cl = c.lower()
-                if "date" in cl and "activation" not in cl and "tertiary" not in cl:
+                if "date" in c.lower() and "activation" not in c.lower() and "tertiary" not in c.lower():
                     date_col_name = c
                     break
                     
@@ -621,17 +618,18 @@ def calculate():
             if compare_mode == 'lmtd' and start_date and end_date:
                 s_dt = pd.to_datetime(start_date)
                 e_dt = pd.to_datetime(end_date)
+                delta = (e_dt - s_dt).days + 1
                 
-                ls_dt = s_dt - pd.DateOffset(months=1)
-                le_dt = e_dt - pd.DateOffset(months=1)
+                ls_dt = s_dt - pd.Timedelta(days=delta)
+                le_dt = e_dt - pd.Timedelta(days=delta)
                 
                 df_curr = df[(df[date_col_name] >= s_dt) & (df[date_col_name] <= e_dt + pd.Timedelta(days=1) - pd.Timedelta(seconds=1))]
                 df_prev = df[(df[date_col_name] >= ls_dt) & (df[date_col_name] <= le_dt + pd.Timedelta(days=1) - pd.Timedelta(seconds=1))]
                 
-                df_curr['Period'] = 'Current'
-                df_prev['Period'] = 'Last Period (LMTD)'
+                df_curr['Period'] = f"Current ({s_dt.strftime('%d-%b')} - {e_dt.strftime('%d-%b')})"
+                df_prev['Period'] = f"Previous ({ls_dt.strftime('%d-%b')} - {le_dt.strftime('%d-%b')})"
                 df = pd.concat([df_curr, df_prev], ignore_index=True)
-                filter_texts.append(f"Comparison: Current ({s_dt.strftime('%d-%b-%y')} - {e_dt.strftime('%d-%b-%y')}) vs LMTD")
+                filter_texts.append(f"Comparison Mode Active")
             else:
                 if start_date: 
                     df = df[df[date_col_name] >= pd.to_datetime(start_date)]
@@ -683,7 +681,7 @@ def calculate():
             return jsonify({"table_html": '<div style="padding:60px; text-align:center;">No data found for selected filters.</div>', "summary_text": f"<b>Date</b> {date_subtitle} · 0 groups", "kpi_html": kpi_html})
 
         cols = request.form.getlist('columns_cols')
-        show_total = request.form.get('show_row_total') == 'true'
+        show_total = request.form.get('show_row_total'] == 'true'
 
         if not idx or not aggs: return jsonify({"error": "Select rows and metrics from the sidebar."})
         if not val_col: return jsonify({"error": "No numeric data found to aggregate."})
