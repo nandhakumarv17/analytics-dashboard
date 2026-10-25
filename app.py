@@ -37,9 +37,12 @@ GLOBAL_HEAD = """
     
     .nav { background: var(--glass-sidebar); backdrop-filter: saturate(180%) blur(20px); border-bottom: 1px solid var(--glass-border); padding: 0 16px; height: 60px; display: flex; justify-content: space-between; align-items: center; position: fixed; top: 0; width: 100%; z-index: 1000; box-sizing: border-box; }
     .nav-brand { font-weight: 700; font-size: 17px; letter-spacing: -0.5px; display: flex; align-items: center; gap: 10px; }
-    .nav-controls { display: flex; gap: 8px; align-items: center; }
+    .nav-controls { display: flex; gap: 6px; align-items: center; }
     
     .menu-btn { display: none; background: none; border: none; font-size: 22px; cursor: pointer; color: var(--text-primary); padding: 4px; }
+    
+    .btn-icon { background: rgba(120, 120, 128, 0.1); border: 1px solid var(--glass-border); color: var(--text-primary); border-radius: 50%; width: 36px; height: 36px; display: flex; align-items: center; justify-content: center; font-size: 15px; cursor: pointer; transition: 0.2s; flex-shrink: 0; }
+    .btn-icon:hover { background: rgba(120, 120, 128, 0.2); transform: scale(1.05); }
     
     .btn-liquid { background: rgba(120, 120, 128, 0.1); border: 1px solid var(--glass-border); color: var(--text-primary); border-radius: 980px; padding: 8px 14px; font-size: 12px; font-weight: 600; cursor: pointer; transition: 0.2s; white-space: nowrap; }
     .btn-liquid:hover { background: rgba(120, 120, 128, 0.15); transform: scale(1.02); }
@@ -48,9 +51,7 @@ GLOBAL_HEAD = """
     
     .app-layout { display: flex; height: 100vh; padding-top: 60px; box-sizing: border-box; position: relative; overflow: hidden; }
     
-    /* Apple-style smooth sidebar transition */
     .sidebar { width: 340px; background: var(--glass-sidebar); backdrop-filter: blur(40px); border-right: 1px solid var(--glass-border); padding: 20px 16px; overflow-y: auto; flex-shrink: 0; transition: transform 0.4s cubic-bezier(0.25, 1, 0.5, 1); z-index: 900; box-sizing: border-box; }
-    
     .main-content { flex: 1; padding: 20px; overflow: hidden; display: flex; flex-direction: column; box-sizing: border-box; }
     
     .section-title { font-size: 11px; font-weight: 700; color: var(--text-secondary); text-transform: uppercase; margin: 20px 0 8px; letter-spacing: 0.5px; }
@@ -107,7 +108,7 @@ GLOBAL_HEAD = """
         .kpi-val { font-size: 20px; }
     }
 </style>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/dom-to-image/2.6.0/dom-to-image.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 """
 
@@ -147,9 +148,9 @@ WORKSPACE_HTML = """
             <span>Analytics Pro</span>
         </div>
         <div class="nav-controls">
-            <button class="btn-liquid" onclick="toggleDarkMode()" id="dm-btn">🌙 Dark</button>
-            <button class="btn-liquid btn-primary" onclick="exportImage()">📸 Save Image</button>
-            <button class="btn-liquid" id="dlExcel">📊 Excel</button>
+            <button class="btn-icon" onclick="toggleDarkMode()" id="dm-btn" title="Toggle Theme">🌙</button>
+            <button class="btn-icon" onclick="exportImage()" title="Save Image">📸</button>
+            <button class="btn-icon" id="dlExcel" title="Download Excel">📊</button>
         </div>
     </div>
 
@@ -199,14 +200,15 @@ WORKSPACE_HTML = """
                     <button type="button" class="chip" onclick="preset('lytd', this)">LYTD</button>
                 </div>
                 
-                <div style="display:flex; gap:8px; margin-bottom: 12px;">
-                    <div style="flex:1;">
-                        <label style="font-size:10px; color:var(--text-secondary); font-weight:700;">FROM</label>
-                        <input type="date" name="start_date" id="start_date" class="btn-liquid" style="width:100%; box-sizing:border-box;" onchange="updateDashboard()">
+                <!-- Non-overlapping Date Grid -->
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px;">
+                    <div>
+                        <label style="font-size: 10px; color: var(--text-secondary); font-weight: 700; display: block; margin-bottom: 2px;">FROM</label>
+                        <input type="date" name="start_date" id="start_date" class="btn-liquid" style="width: 100%; box-sizing: border-box;" onchange="updateDashboard()">
                     </div>
-                    <div style="flex:1;">
-                        <label style="font-size:10px; color:var(--text-secondary); font-weight:700;">TO</label>
-                        <input type="date" name="end_date" id="end_date" class="btn-liquid" style="width:100%; box-sizing:border-box;" onchange="updateDashboard()">
+                    <div>
+                        <label style="font-size: 10px; color: var(--text-secondary); font-weight: 700; display: block; margin-bottom: 2px;">TO</label>
+                        <input type="date" name="end_date" id="end_date" class="btn-liquid" style="width: 100%; box-sizing: border-box;" onchange="updateDashboard()">
                     </div>
                 </div>
 
@@ -351,14 +353,13 @@ WORKSPACE_HTML = """
             radio.addEventListener('change', function() {
                 const thumb = document.querySelector('.seg-thumb');
                 thumb.style.transform = this.value === 'chart' ? 'translateX(100%)' : 'translateX(0)';
-                document.getElementById('dlExcel').style.display = this.value === 'chart' ? 'none' : 'flex';
                 updateDashboard();
             });
         });
 
         function toggleDarkMode() { 
             const isDark = document.body.classList.toggle('dark-mode'); 
-            document.getElementById('dm-btn').innerText = isDark ? '☀️ Light' : '🌙 Dark';
+            document.getElementById('dm-btn').innerText = isDark ? '☀️' : '🌙';
             if(document.querySelector('input[name="view_mode_toggle"]:checked').value === 'chart') updateDashboard();
         }
 
@@ -465,23 +466,15 @@ WORKSPACE_HTML = """
             } else {
                 const area = document.getElementById('capture-area');
                 const bgColor = document.body.classList.contains('dark-mode') ? '#151516' : '#ffffff';
-                const scrollEl = area.querySelector('.table-scroll');
-                const origOverflow = scrollEl.style.overflow;
-                const origHeight = scrollEl.style.height;
-                scrollEl.style.overflow = 'visible';
-                scrollEl.style.height = 'auto';
                 
-                domtoimage.toJpeg(area, { quality: 0.95, bgcolor: bgColor, width: area.scrollWidth, height: area.scrollHeight })
-                    .then(url => {
-                        const a = document.createElement('a'); a.download = 'Executive_Report.jpeg'; a.href = url; a.click();
-                        scrollEl.style.overflow = origOverflow;
-                        scrollEl.style.height = origHeight;
+                html2canvas(area, { backgroundColor: bgColor, scale: 2, logging: false, useCORS: true })
+                    .then(canvas => {
+                        const link = document.createElement('a');
+                        link.download = 'Executive_Report.png';
+                        link.href = canvas.toDataURL('image/png');
+                        link.click();
                     })
-                    .catch(err => { 
-                        console.error(err); 
-                        scrollEl.style.overflow = origOverflow;
-                        scrollEl.style.height = origHeight;
-                    });
+                    .catch(err => { console.error("Image Export Failed:", err); alert("Image export failed. Try taking a screenshot."); });
             }
         }
         
