@@ -2,6 +2,7 @@ import os
 import io
 import json
 import re
+import traceback
 from datetime import datetime
 from flask import Flask, request, render_template_string, send_file, jsonify, redirect, url_for
 import pandas as pd
@@ -252,6 +253,12 @@ WORKSPACE_HTML = """
             });
         });
 
+        function checkValue(name, val) {
+            document.querySelectorAll(`input[name="${name}"]`).forEach(cb => {
+                if(cb.value === val || cb.value === val.replace('BA Name', 'SPC Name')) cb.checked = true;
+            });
+        }
+
         let chartInstance = null;
 
         async function updateDashboard() {
@@ -260,7 +267,7 @@ WORKSPACE_HTML = """
             const mode = document.querySelector('input[name="view_mode_toggle"]:checked').value;
             formData.append('view_mode', mode);
 
-            // Smart Totals Logic: Disable if mixing sum (₹) and count (qty)
+            // Smart Totals Logic
             const metrics = formData.getAll('agg_funcs');
             const totalCb = document.getElementById('show_total_cb');
             const totalWrap = document.getElementById('total_wrapper');
@@ -278,7 +285,23 @@ WORKSPACE_HTML = """
 
             try {
                 const res = await fetch('/calculate', { method: 'POST', body: formData });
-                const data = await res.json();
+                
+                // Advanced Error Catching
+                let data;
+                try {
+                    data = await res.json();
+                } catch (e) {
+                    const text = await res.text();
+                    document.getElementById('table-wrapper').innerHTML = `<div style="padding:40px; color:#ff3b30; text-align:center; font-weight:600;">Server crashed. (500 Error)<br><span style="font-size:12px; font-weight:normal;">${text.substring(0,250)}</span></div>`;
+                    return;
+                }
+                
+                if (data.error) {
+                    document.getElementById('chart-wrapper').style.display = 'none';
+                    document.getElementById('table-wrapper').style.display = 'block';
+                    document.getElementById('table-wrapper').innerHTML = `<div style="padding:40px; color:#ff3b30; text-align:center; font-weight:600;">${data.error}</div>`;
+                    return;
+                }
                 
                 document.getElementById('dashTitle').innerText = data.dyn_title || "Executive Dashboard";
                 document.getElementById('dashDate').innerText = data.dyn_date || "All Time";
@@ -297,9 +320,12 @@ WORKSPACE_HTML = """
                 } else {
                     cw.style.display = 'none';
                     tw.style.display = 'block';
-                    tw.innerHTML = data.table_html || `<div style="padding:40px; color:#ff3b30; text-align:center;">${data.error}</div>`;
+                    tw.innerHTML = data.table_html;
                 }
-            } catch(e) { console.error(e); }
+            } catch(e) { 
+                console.error(e);
+                document.getElementById('table-wrapper').innerHTML = `<div style="padding:40px; color:#ff3b30; text-align:center; font-weight:600;">Network Request Failed: ${e.message}</div>`;
+            }
         }
 
         function renderChart(data) {
@@ -420,156 +446,165 @@ def dashboard():
 
 @app.route("/calculate", methods=["POST"])
 def calculate():
-    df = get_data()
-    if df is None: return jsonify({"error": "No data available."}), 400
-    
-    mode = request.form.get('view_mode', 'dashboard')
-    
-    # 1. PERMANENT STATUS FILTER: Final Status == Ok
-    status_cols = [c for c in df.columns if c.lower() in ['finalstatus', 'final record status', 'validation remarks', 'status']]
-    filter_texts = []
-    if status_cols:
-        status_col = status_cols[0]
-        df = df[df[status_col].astype(str).str.lower().str.strip() == 'ok']
-        filter_texts.append("Status: Ok")
-
-    # Global Date Formatting (dd-MMM-yy) & Filtering setup
-    date_cols = df.select_dtypes(include=['datetime64', 'object']).columns
-    date_col_name = None
-    for c in date_cols:
-        try: 
-            if pd.api.types.is_datetime64_any_dtype(df[c]) or "Date" in c:
-                df[c] = pd.to_datetime(df[c])
-                date_col_name = c
-        except: pass
-
-    # Filter by Date & Weeks
-    start_date = request.form.get('start_date')
-    end_date = request.form.get('end_date')
-    weeks = request.form.getlist("week_num")
-    
-    if date_col_name:
-        if start_date: 
-            df = df[df[date_col_name] >= pd.to_datetime(start_date)]
-            filter_texts.append(f"From {pd.to_datetime(start_date).strftime('%d-%b-%y')}")
-        if end_date: 
-            df = df[df[date_col_name] <= pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)]
-            filter_texts.append(f"To {pd.to_datetime(end_date).strftime('%d-%b-%y')}")
-            
-        if weeks:
-            week_masks = []
-            for w in weeks:
-                w = int(w)
-                if w == 1: week_masks.append(df[date_col_name].dt.day <= 7)
-                elif w == 2: week_masks.append((df[date_col_name].dt.day > 7) & (df[date_col_name].dt.day <= 14))
-                elif w == 3: week_masks.append((df[date_col_name].dt.day > 14) & (df[date_col_name].dt.day <= 21))
-                elif w == 4: week_masks.append((df[date_col_name].dt.day > 21) & (df[date_col_name].dt.day <= 28))
-                elif w == 5: week_masks.append(df[date_col_name].dt.day > 28)
-            if week_masks:
-                combined = week_masks[0]
-                for wm in week_masks[1:]: combined = combined | wm
-                df = df[combined]
-            filter_texts.append(f"Weeks: {', '.join([f'W{w}' for w in weeks])}")
-
-    for c in date_cols:
-        try:
-            if pd.api.types.is_datetime64_any_dtype(df[c]):
-                df[c] = df[c].dt.strftime('%d-%b-%y')
-        except: pass
-
-    idx = request.form.getlist('index_cols')
-    dynamic_title = f"Sales Analysis by {' & '.join(idx)}" if idx else "Executive Dashboard"
-    date_subtitle = " · ".join(filter_texts) if filter_texts else "All Time"
-    
-    num_cols = df.select_dtypes(include='number').columns.tolist()
-    val_col = 'Tentative DP' if 'Tentative DP' in num_cols else (num_cols[0] if num_cols else None)
-
-    # Set up KPIs
-    kpi_html = ""
-    if not df.empty and val_col:
-        active = format_indian_number(df[idx[0]].nunique()) if idx and idx[0] in df.columns else "N/A"
-        kpi_html = f"""
-            <div class="kpi"><div class="kpi-label">Total Volume</div><div class="kpi-val">{format_indian_number(df[val_col].sum())}</div></div>
-            <div class="kpi"><div class="kpi-label">Records</div><div class="kpi-val">{format_indian_number(len(df))}</div></div>
-            <div class="kpi"><div class="kpi-label">Active Entities</div><div class="kpi-val">{active}</div></div>
-        """
-
-    if df.empty:
-        return jsonify({"table_html": '<div style="padding:40px; text-align:center;">No data found for selected dates/weeks.</div>', "dyn_title": dynamic_title, "dyn_date": date_subtitle, "kpi_html": kpi_html})
-
-    # --- PIVOT / CHART VIEW ---
-    cols = request.form.getlist('columns_cols')
-    aggs = request.form.getlist('agg_funcs')
-    show_total = request.form.get('show_row_total') == 'true'
-
-    if not idx or not aggs: return jsonify({"error": "Select rows and metrics from the sidebar."})
-    if not val_col: return jsonify({"error": "No numeric data found to aggregate."})
-
-    kwargs = {'data': df, 'index': idx, 'values': [val_col], 'aggfunc': aggs}
-    if cols: kwargs['columns'] = cols
-    
-    pivot = pd.pivot_table(**kwargs).reset_index().fillna(0)
-    
-    # Clean, Prefix-Free Headers
-    new_headers = []
-    for c in pivot.columns:
-        if isinstance(c, tuple):
-            if c[0] in idx and all(x == '' for x in c[1:]): 
-                new_headers.append(str(c[0]))
-            else:
-                parts = [str(x) for x in c if str(x) and str(x) not in [val_col, 'sum', 'count', 'mean']]
-                new_headers.append(" - ".join(parts) if parts else str(c[-1]))
-        else: 
-            new_headers.append(str(c))
-    
-    pivot.columns = new_headers
-    metric_cols = [c for c in pivot.columns if c not in idx]
-
-    # Smart Totals
-    if show_total and len(metric_cols) > 1 and not ('sum' in aggs and 'count' in aggs):
-        pivot['TOTAL'] = pivot[metric_cols].sum(axis=1)
-        metric_cols.append('TOTAL')
+    try:
+        df = get_data()
+        if df is None: return jsonify({"error": "No data available. Please re-upload your file."}), 400
         
-    # Prepare Chart.js Data
-    chart_data = None
-    if mode == 'chart':
-        chart_df = pivot.sort_values(by=metric_cols[0], ascending=False).head(15) if metric_cols else pivot.head(15)
-        labels = chart_df[idx[0]].astype(str).tolist() if idx else ["Total"]
-        datasets = [{"label": m, "data": chart_df[m].tolist(), "backgroundColor": "#0071e3", "borderRadius": 4} for m in metric_cols if m != "TOTAL"]
-        chart_data = {"labels": labels, "datasets": datasets}
+        mode = request.form.get('view_mode', 'dashboard')
+        
+        # 1. PERMANENT STATUS FILTER: Final Status == Ok
+        status_cols = [c for c in df.columns if c.lower() in ['finalstatus', 'final record status', 'validation remarks', 'status']]
+        filter_texts = []
+        if status_cols:
+            status_col = status_cols[0]
+            df = df[df[status_col].astype(str).str.lower().str.strip() == 'ok']
+            filter_texts.append("Status: Ok")
 
-    # Grand Total Footer
-    if not pivot.empty:
-        totals = {c: pivot[c].sum() if c in metric_cols else ('' if c != idx[0] else 'GRAND TOTAL') for c in pivot.columns}
-        pivot = pd.concat([pivot, pd.DataFrame([totals])], ignore_index=True)
+        # Global Date Setup
+        date_cols = df.select_dtypes(include=['datetime64', 'object']).columns
+        date_col_name = None
+        for c in date_cols:
+            try: 
+                if pd.api.types.is_datetime64_any_dtype(df[c]) or "Date" in c:
+                    df[c] = pd.to_datetime(df[c], errors='coerce')
+                    date_col_name = c
+            except: pass
 
-    # Format numbers
-    for c in metric_cols: pivot[c] = pivot[c].apply(format_indian_number)
+        # Filter by Date & Weeks
+        start_date = request.form.get('start_date')
+        end_date = request.form.get('end_date')
+        weeks = request.form.getlist("week_num")
+        
+        if date_col_name:
+            if start_date: 
+                df = df[df[date_col_name] >= pd.to_datetime(start_date)]
+                filter_texts.append(f"From {pd.to_datetime(start_date).strftime('%d-%b-%y')}")
+            if end_date: 
+                df = df[df[date_col_name] <= pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)]
+                filter_texts.append(f"To {pd.to_datetime(end_date).strftime('%d-%b-%y')}")
+                
+            if weeks:
+                week_masks = []
+                for w in weeks:
+                    w = int(w)
+                    if w == 1: week_masks.append(df[date_col_name].dt.day <= 7)
+                    elif w == 2: week_masks.append((df[date_col_name].dt.day > 7) & (df[date_col_name].dt.day <= 14))
+                    elif w == 3: week_masks.append((df[date_col_name].dt.day > 14) & (df[date_col_name].dt.day <= 21))
+                    elif w == 4: week_masks.append((df[date_col_name].dt.day > 21) & (df[date_col_name].dt.day <= 28))
+                    elif w == 5: week_masks.append(df[date_col_name].dt.day > 28)
+                if week_masks:
+                    combined = week_masks[0]
+                    for wm in week_masks[1:]: combined = combined | wm
+                    df = df[combined]
+                filter_texts.append(f"Weeks: {', '.join([f'W{w}' for w in weeks])}")
 
-    html = pivot.to_html(classes='excel-table', border=0, index=False)
-    html = html.replace('<th>TOTAL</th>', '<th class="total-col">TOTAL</th>')
-    
-    if 'TOTAL' in metric_cols:
-        html = re.sub(r'(<td>)([\d,-]+)(</td></tr>)', r'<td class="total-col">\2\3', html)
-    
-    # Save export version in memory
-    pivot.to_pickle(os.path.join(UPLOAD_DIR, "summary_data.pkl"))
-    
-    return jsonify({
-        "table_html": html, "chart_data": chart_data,
-        "dyn_title": dynamic_title, "dyn_date": date_subtitle, "kpi_html": kpi_html
-    })
+        idx = request.form.getlist('index_cols')
+        dynamic_title = f"Sales Analysis by {' & '.join(idx)}" if idx else "Executive Dashboard"
+        date_subtitle = " · ".join(filter_texts) if filter_texts else "All Time"
+        
+        # Ensure Numeric Safety
+        if 'Tentative DP' in df.columns:
+            df['Tentative DP'] = pd.to_numeric(df['Tentative DP'].astype(str).str.replace(',', ''), errors='coerce')
+            val_col = 'Tentative DP'
+        else:
+            num_cols = df.select_dtypes(include='number').columns.tolist()
+            val_col = num_cols[0] if num_cols else None
+
+        kpi_html = ""
+        if not df.empty and val_col:
+            active = format_indian_number(df[idx[0]].nunique()) if idx and idx[0] in df.columns else "N/A"
+            kpi_html = f"""
+                <div class="kpi"><div class="kpi-label">Total Volume</div><div class="kpi-val">{format_indian_number(df[val_col].sum())}</div></div>
+                <div class="kpi"><div class="kpi-label">Records</div><div class="kpi-val">{format_indian_number(len(df))}</div></div>
+                <div class="kpi"><div class="kpi-label">Active Entities</div><div class="kpi-val">{active}</div></div>
+            """
+
+        if df.empty:
+            return jsonify({"table_html": '<div style="padding:40px; text-align:center;">No data found for selected dates/weeks.</div>', "dyn_title": dynamic_title, "dyn_date": date_subtitle, "kpi_html": kpi_html})
+
+        cols = request.form.getlist('columns_cols')
+        aggs = request.form.getlist('agg_funcs')
+        show_total = request.form.get('show_row_total') == 'true'
+
+        if not idx or not aggs: return jsonify({"error": "Select rows and metrics from the sidebar."})
+        if not val_col: return jsonify({"error": "No numeric data found to aggregate."})
+
+        kwargs = {'data': df, 'index': idx, 'values': [val_col], 'aggfunc': aggs}
+        if cols: kwargs['columns'] = cols
+        
+        pivot = pd.pivot_table(**kwargs).reset_index().fillna(0)
+        
+        new_headers = []
+        for c in pivot.columns:
+            if isinstance(c, tuple):
+                if c[0] in idx and all(x == '' for x in c[1:]): 
+                    new_headers.append(str(c[0]))
+                else:
+                    parts = []
+                    for x in c:
+                        if str(x) and str(x) not in [val_col, 'sum', 'count', 'mean']:
+                            if isinstance(x, pd.Timestamp):
+                                parts.append(x.strftime('%d-%b-%y'))
+                            else:
+                                parts.append(str(x))
+                    new_headers.append(" - ".join(parts) if parts else str(c[-1]))
+            else: 
+                new_headers.append(c.strftime('%d-%b-%y') if isinstance(c, pd.Timestamp) else str(c))
+        
+        pivot.columns = new_headers
+        metric_cols = [c for c in pivot.columns if c not in idx]
+
+        if show_total and len(metric_cols) > 1 and not ('sum' in aggs and 'count' in aggs):
+            pivot['TOTAL'] = pivot[metric_cols].sum(axis=1)
+            metric_cols.append('TOTAL')
+            
+        chart_data = None
+        if mode == 'chart':
+            chart_df = pivot.sort_values(by=metric_cols[0], ascending=False).head(15) if metric_cols else pivot.head(15)
+            labels = chart_df[idx[0]].astype(str).tolist() if idx else ["Total"]
+            datasets = [{"label": m, "data": chart_df[m].tolist(), "backgroundColor": "#0071e3", "borderRadius": 4} for m in metric_cols if m != "TOTAL"]
+            chart_data = {"labels": labels, "datasets": datasets}
+
+        if not pivot.empty:
+            totals = {c: pivot[c].sum() if c in metric_cols else ('' if c != idx[0] else 'GRAND TOTAL') for c in pivot.columns}
+            pivot = pd.concat([pivot, pd.DataFrame([totals])], ignore_index=True)
+
+        for c in idx:
+            if c in pivot.columns and pd.api.types.is_datetime64_any_dtype(pivot[c]):
+                pivot[c] = pivot[c].dt.strftime('%d-%b-%y')
+        for c in metric_cols: pivot[c] = pivot[c].apply(format_indian_number)
+
+        html = pivot.to_html(classes='excel-table', border=0, index=False)
+        html = html.replace('<th>TOTAL</th>', '<th class="total-col">TOTAL</th>')
+        
+        if 'TOTAL' in metric_cols:
+            html = re.sub(r'(<td>)([\d,-]+)(</td></tr>)', r'<td class="total-col">\2\3', html)
+        
+        pivot.to_pickle(os.path.join(UPLOAD_DIR, "summary_data.pkl"))
+        
+        return jsonify({
+            "table_html": html, "chart_data": chart_data,
+            "dyn_title": dynamic_title, "dyn_date": date_subtitle, "kpi_html": kpi_html
+        })
+        
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": f"Backend Error: {str(e)}"}), 500
 
 @app.route("/download", methods=["GET"])
 def download():
-    summary_path = os.path.join(UPLOAD_DIR, "summary_data.pkl")
-    if not os.path.exists(summary_path): return "No data to download", 400
-    df = pd.read_pickle(summary_path)
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df.to_excel(writer, index=False, sheet_name='Dashboard_Report')
-    output.seek(0)
-    return send_file(output, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", download_name="Executive_Report.xlsx", as_attachment=True)
+    try:
+        summary_path = os.path.join(UPLOAD_DIR, "summary_data.pkl")
+        if not os.path.exists(summary_path): return "No data to download", 400
+        df = pd.read_pickle(summary_path)
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False, sheet_name='Dashboard_Report')
+        output.seek(0)
+        return send_file(output, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", download_name="Executive_Report.xlsx", as_attachment=True)
+    except Exception as e:
+        traceback.print_exc()
+        return f"Download Failed: {str(e)}", 500
 
 if __name__ == '__main__':
     app.run(debug=True)
