@@ -1,970 +1,1133 @@
-import os
+"""Analytics Pro - upload a sheet, slice it, pivot it, export it.
+
+Single-file Flask app. Run:  python app.py
+Needs: flask, pandas, openpyxl
+"""
+import hashlib
+import html
 import io
 import json
-from datetime import datetime, timedelta
-from flask import Flask, request, render_template_string, send_file, jsonify, redirect, url_for
+import os
+import re
+import threading
+import warnings
+from datetime import datetime
+
 import pandas as pd
-import numpy as np
+from flask import (Flask, Response, jsonify, redirect, render_template_string,
+                   request, send_file, url_for)
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 64 * 1024 * 1024  # 64 MB uploads
 
-UPLOAD_DIR = "/tmp/dashboard_uploads"
+UPLOAD_DIR = os.environ.get("DASHBOARD_UPLOAD_DIR", "/tmp/dashboard_uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 DATA_FILE_PATH = os.path.join(UPLOAD_DIR, "shared_data.pkl")
-META_FILE_PATH = os.path.join(UPLOAD_DIR, "metadata.pkl")
+META_FILE_PATH = os.path.join(UPLOAD_DIR, "metadata.json")
 
-# --- APPLE iOS "LIQUID GLASS" THEME & STICKY MOBILE ENGINE ---
-GLOBAL_HEAD = """
-<style>
-    :root {
-        --bg-main: #f2f2f7;
-        --glass-bg: rgba(255, 255, 255, 0.78);
-        --glass-sidebar: rgba(255, 255, 255, 0.85);
-        --glass-border: rgba(255, 255, 255, 0.85);
-        --text-primary: #1d1d1f;
-        --text-secondary: #86868b;
-        --shadow-glass: 0 20px 40px rgba(0, 0, 0, 0.06), 0 1px 3px rgba(0, 0, 0, 0.04);
-        --blue-apple: #0071e3;
-        --blue-hover: #0077ed;
-        --code-pink: #ff375f; --code-purple: #bf5af2; --code-blue: #5ac8fa; --code-orange: #ff9f0a; --code-green: #32d74b;
+RAW_ROW_LIMIT = 3000          # rows rendered in Raw view (Excel export is always complete)
+LABELS = {"sum": "Value", "count": "Qty", "mean": "Avg Price"}
+
+# ════════════════════════════════════════════════════════════════════
+#  DATA LAYER  (parse once on upload, cache in memory by file mtime)
+# ════════════════════════════════════════════════════════════════════
+_lock = threading.Lock()
+_state = {"mtime": None, "df": None, "ctx": None}
+
+
+def pick_date_col(cols):
+    for c in ("Customized Sales Date", "Sale Date"):
+        if c in cols:
+            return c
+    return next((c for c in cols if "date" in c.lower()), "")
+
+
+def prepare_df(df):
+    """Normalise once at upload so every request afterwards is cheap."""
+    df.columns = [str(c).strip() for c in df.columns]
+    d = pick_date_col(list(df.columns))
+    if d and not pd.api.types.is_numeric_dtype(df[d]):
+        df[d] = pd.to_datetime(df[d], errors="coerce", dayfirst=True)
+    c = detect_columns(df)
+    for key in ("spc", "seg", "fam"):          # stable string keys for filtering
+        col = c[key]
+        if col:
+            s = df[col]
+            df[col] = s.astype(object).where(s.isna(), s.astype(str))
+    return df
+
+
+def detect_columns(df):
+    cols = list(df.columns)
+    low = {c: c.lower() for c in cols}
+    date = pick_date_col(cols)
+    if date and not pd.api.types.is_datetime64_any_dtype(df[date]):
+        date = ""
+    num = df.select_dtypes(include="number").columns.tolist()
+    return {
+        "date": date,
+        "spc": next((c for c in cols if "spc" in low[c] and "name" in low[c]), ""),
+        "seg": next((c for c in cols if "seg1" in low[c]), ""),
+        "fam": next((c for c in cols if "family" in low[c]), ""),
+        "value": "Tentative DP" if "Tentative DP" in num else (num[0] if num else ""),
     }
-    body { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: var(--bg-main); margin: 0; padding: 0; color: var(--text-primary); -webkit-font-smoothing: antialiased; }
-    .nav { background: rgba(255, 255, 255, 0.85); backdrop-filter: saturate(200%) blur(30px); border-bottom: 1px solid rgba(0, 0, 0, 0.08); padding: 0 24px; height: 60px; display: flex; justify-content: space-between; align-items: center; font-size: 16px; font-weight: 600; color: var(--text-primary); position: fixed; top: 0; width: 100%; box-sizing: border-box; z-index: 1000; }
-    .view-toggle { background: rgba(0,0,0,0.04); padding: 8px 14px; border-radius: 980px; font-size: 12px; font-weight: 500; cursor: pointer; display: flex; align-items: center; transition: 0.2s; border: none; color: var(--text-primary); flex-shrink: 0; }
-    .view-toggle:hover { background: rgba(0,0,0,0.08); }
-    .upload-container { max-width: 480px; margin: 120px auto 40px auto; padding: 0 16px; box-sizing: border-box; animation: fadeIn 0.4s ease; }
-    .title { font-size: 36px; font-weight: 700; letter-spacing: -0.015em; text-align: center; margin: 0 0 8px 0; }
-    .subtitle { font-size: 16px; font-weight: 400; text-align: center; color: var(--text-secondary); margin: 0 0 32px 0; }
-    .card { background: var(--glass-bg); backdrop-filter: blur(25px) saturate(180%); border-radius: 24px; padding: 32px; box-shadow: var(--shadow-glass); border: 1px solid var(--glass-border); box-sizing: border-box; }
-    
-    .sidebar-section { margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid rgba(0,0,0,0.06); transition: opacity 0.3s ease; }
-    .sidebar-section:last-child { border-bottom: none; }
-    .section-title { font-size: 13px; font-weight: 700; color: var(--text-primary); margin: 0 0 12px 0; text-transform: uppercase; letter-spacing: 0.03em; }
-    .form-group { margin-bottom: 16px; }
-    .form-label { font-size: 11px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; margin-bottom: 6px; display: block; }
-    .form-label-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
-    .form-label-header .form-label { margin-bottom: 0; }
-    .btn-micro { background: rgba(0,0,0,0.04); border: none; color: var(--blue-apple); font-size: 10px; font-weight: 600; cursor: pointer; padding: 4px 8px; border-radius: 6px; transition: 0.2s; }
-    .btn-micro:hover { background: rgba(0,113,227,0.1); }
-    .form-input { width: 100%; padding: 10px 12px; font-size: 13px; border: 1px solid rgba(0,0,0,0.1); border-radius: 8px; background-color: rgba(255,255,255,0.9); color: var(--text-primary); box-sizing: border-box; transition: all 0.2s ease; margin-bottom: 8px; }
-    .form-input:focus { border-color: var(--blue-apple); outline: none; box-shadow: 0 0 0 4px rgba(0, 113, 227, 0.15); }
-    .checkbox-group { background: rgba(255,255,255,0.6); border: 1px solid rgba(0,0,0,0.08); border-radius: 10px; padding: 8px; max-height: 160px; overflow-y: auto; }
-    .checkbox-item { display: flex; align-items: center; margin-bottom: 4px; font-size: 13px; cursor: pointer; padding: 6px 8px; border-radius: 6px; transition: background 0.15s; }
-    .checkbox-item:hover { background: rgba(0,0,0,0.04); }
-    .checkbox-item:last-child { margin-bottom: 0; }
-    .checkbox-item input { margin-right: 10px; width: 16px; height: 16px; accent-color: var(--blue-apple); cursor: pointer; flex-shrink: 0; }
-    .btn-primary { background-color: var(--blue-apple); color: white; border: none; border-radius: 980px; padding: 12px 20px; font-size: 14px; font-weight: 600; cursor: pointer; text-align: center; display: inline-flex; align-items: center; justify-content: center; text-decoration: none; box-sizing: border-box; transition: background 0.2s, transform 0.1s; width: 100%; }
-    .btn-primary:hover { background-color: var(--blue-hover); }
-    .btn-segmented { display: flex; background: rgba(0,0,0,0.05); border-radius: 10px; padding: 4px; gap: 4px; box-shadow: inset 0 1px 3px rgba(0,0,0,0.06); }
-    .btn-segmented label { flex: 1; text-align: center; font-size: 12px; font-weight: 600; padding: 6px 16px; border-radius: 8px; cursor: pointer; color: var(--text-secondary); transition: 0.2s; white-space: nowrap; }
-    .btn-segmented input { display: none; }
-    .btn-segmented input:checked + label { background: #ffffff; color: var(--text-primary); box-shadow: 0 2px 6px rgba(0,0,0,0.08), 0 1px 2px rgba(0,0,0,0.04); }
-    .date-preset-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 12px; }
-    .date-preset-btn { background: rgba(0,0,0,0.03); border: 1px solid rgba(0,0,0,0.05); color: var(--text-primary); padding: 8px; font-size: 11px; font-weight: 600; border-radius: 8px; cursor: pointer; transition: 0.2s; text-align: center; }
-    .date-preset-btn:hover { background: rgba(0,113,227,0.1); color: var(--blue-apple); }
-    .date-preset-btn.active { background: var(--blue-apple); color: #ffffff; border-color: var(--blue-apple); }
-    .kpi-ribbon { display: flex; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; animation: fadeIn 0.4s ease; }
-    .kpi-card { flex: 1; min-width: 140px; background: rgba(255,255,255,0.85); backdrop-filter: blur(25px); border: 1px solid var(--glass-border); border-radius: 16px; padding: 16px; box-shadow: 0 4px 15px rgba(0,0,0,0.03); display: flex; flex-direction: column; justify-content: center; }
-    .kpi-card .kpi-label { font-size: 11px; font-weight: 700; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; }
-    .kpi-card .kpi-val { font-size: 24px; font-weight: 700; color: var(--text-primary); letter-spacing: -0.02em; }
-    .dropdown { position: relative; display: inline-block; }
-    .dropdown-content { display: none; position: absolute; right: 0; background-color: rgba(255,255,255,0.95); backdrop-filter: blur(30px); min-width: 170px; box-shadow: 0 15px 35px rgba(0,0,0,0.12); border-radius: 16px; border: 1px solid rgba(255,255,255,0.8); z-index: 2000; overflow: hidden; margin-top: 8px; }
-    .dropdown-content.show { display: block; animation: fadeIn 0.2s ease; }
-    .dropdown-item { color: var(--text-primary); padding: 12px 16px; text-decoration: none; display: block; font-size: 13px; font-weight: 500; cursor: pointer; border: none; background: none; width: 100%; text-align: left; transition: background 0.2s; }
-    .dropdown-item:hover { background-color: rgba(0,113,227,0.08); color: var(--blue-apple); }
-    @keyframes fadeIn { from { opacity: 0; transform: translateY(-10px); } to { opacity: 1; transform: translateY(0); } }
 
-    .table-container { background: var(--glass-bg); backdrop-filter: blur(25px); border-radius: 20px; box-shadow: var(--shadow-glass); border: 1px solid var(--glass-border); overflow: hidden; width: 100%; box-sizing: border-box; display: flex; flex-direction: column; animation: fadeIn 0.5s ease; }
-    .filter-text-bar { padding: 14px 20px; border-bottom: 1px solid rgba(0,0,0,0.06); background: rgba(255,255,255,0.6); }
-    .table-scroll { max-height: calc(100vh - 280px); overflow-y: auto; overflow-x: auto; -webkit-overflow-scrolling: touch; position: relative; }
-    .excel-table { width: max-content; min-width: 100%; border-collapse: separate; border-spacing: 0; font-size: 13px; background: transparent; }
-    .excel-table th, .excel-table td { padding: 14px 20px; text-align: left; border-bottom: 1px solid rgba(0,0,0,0.06); white-space: nowrap; position: relative; }
-    .excel-table th { background-color: rgba(30, 30, 34, 0.85); backdrop-filter: blur(20px) saturate(180%); font-family: 'SF Mono', ui-monospace, Menlo, Monaco, monospace; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; position: sticky; top: 0; z-index: 100; border-bottom: 1px solid rgba(255,255,255,0.1); user-select: none; }
-    .excel-table th:nth-child(5n+1) { color: var(--code-blue); }
-    .excel-table th:nth-child(5n+2) { color: var(--code-pink); }
-    .excel-table th:nth-child(5n+3) { color: var(--code-orange); }
-    .excel-table th:nth-child(5n+4) { color: var(--code-green); }
-    .excel-table th:nth-child(5n+5) { color: var(--code-purple); }
-    .resizer { position: absolute; right: 0; top: 0; bottom: 0; width: 6px; cursor: col-resize; z-index: 101; }
-    .resizer:hover { background-color: rgba(0, 113, 227, 0.4); }
-    .excel-table tr:hover td { background-color: rgba(0, 113, 227, 0.04); }
-    .excel-table th.total-col-header { color: #ffffff !important; background-color: rgba(20, 20, 24, 0.98); border-left: 1px solid rgba(255,255,255,0.1); }
-    .excel-table td.total-col-cell { background-color: rgba(0, 113, 227, 0.03); font-weight: 600; border-left: 1px solid rgba(0, 113, 227, 0.1); }
-    .excel-table tbody tr:last-child td { font-weight: 700; background-color: rgba(0, 113, 227, 0.12); color: var(--blue-apple); border-top: 2px solid var(--blue-apple); border-bottom: none; box-shadow: inset 0 1px 0 rgba(255,255,255,0.6); }
-    .number-cell { font-variant-numeric: tabular-nums; }
-    .pct-positive { color: #34c759; font-weight: 600; }
-    .pct-negative { color: #ff3b30; font-weight: 600; }
-    .pct-neutral { color: var(--text-secondary); }
 
-    /* HIGH-CONTRAST EXPORT MODE HACK */
-    body.export-mode .main-content { background: #ffffff !important; }
-    body.export-mode .kpi-card { background: #f2f2f7 !important; backdrop-filter: none !important; border: 1px solid #d1d1d6 !important; box-shadow: none !important; }
-    body.export-mode .kpi-card .kpi-label { color: #86868b !important; }
-    body.export-mode .kpi-card .kpi-val { color: #000000 !important; }
-    body.export-mode .table-container { background: #ffffff !important; backdrop-filter: none !important; border: 1px solid #d1d1d6 !important; box-shadow: none !important; }
-    body.export-mode .filter-text-bar { background: #f2f2f7 !important; color: #000000 !important; border-bottom: 1px solid #d1d1d6 !important; }
-    body.export-mode .excel-table th { background-color: #f2f2f7 !important; color: #000000 !important; backdrop-filter: none !important; border-bottom: 1px solid #d1d1d6 !important; border-right: 1px solid #d1d1d6 !important; }
-    body.export-mode .excel-table td { background-color: #ffffff !important; color: #000000 !important; border-bottom: 1px solid #e5e5ea !important; border-right: 1px solid #e5e5ea !important; }
-    body.export-mode .excel-table th.total-col-header { background-color: #e5e5ea !important; color: #000000 !important; }
-    body.export-mode .excel-table td.total-col-cell { background-color: #f8f8f8 !important; color: #000000 !important; }
-    body.export-mode .excel-table tbody tr:last-child td { background-color: #e5e5ea !important; color: #000000 !important; border-top: 2px solid #000000 !important; }
-    body.export-mode .pct-positive { color: #28a745 !important; }
-    body.export-mode .pct-negative { color: #dc3545 !important; }
-
-    /* Layout & Sidebar Resizer */
-    body.desktop-mode { overflow: hidden; }
-    body.desktop-mode .app-layout { display: flex; flex-direction: row; height: 100vh; padding-top: 60px; box-sizing: border-box; }
-    body.desktop-mode .sidebar { width: 320px; background: var(--glass-sidebar); backdrop-filter: blur(40px) saturate(180%); padding: 24px 20px; overflow-y: auto; flex-shrink: 0; box-sizing: border-box; height: calc(100vh - 60px); }
-    .sidebar-resizer { width: 5px; background: rgba(0,0,0,0.02); cursor: col-resize; z-index: 100; transition: background 0.2s; flex-shrink: 0; border-right: 1px solid rgba(0,0,0,0.06); }
-    .sidebar-resizer:hover, .sidebar-resizer.resizing { background: var(--blue-apple); }
-    body.desktop-mode .main-content { flex: 1; padding: 24px 32px; overflow-y: auto; overflow-x: hidden; background: var(--bg-main); box-sizing: border-box; height: calc(100vh - 60px); }
-    body.desktop-mode .header-actions { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; flex-wrap: wrap; gap: 16px; }
-    
-    body.mobile-mode { overflow: auto; }
-    body.mobile-mode .app-layout { display: flex; flex-direction: column; padding-top: 60px; box-sizing: border-box; }
-    body.mobile-mode .sidebar { width: 100% !important; background: var(--glass-sidebar); border-right: none; border-bottom: 1px solid rgba(0,0,0,0.08); padding: 20px; box-sizing: border-box; }
-    body.mobile-mode .sidebar-resizer { display: none; }
-    body.mobile-mode .main-content { width: 100%; padding: 20px; box-sizing: border-box; background: var(--bg-main); }
-    body.mobile-mode .header-actions { display: flex; flex-direction: column; align-items: stretch; gap: 12px; margin-bottom: 20px; }
-    body.mobile-mode .header-actions .dropdown { width: 100%; }
-    ::-webkit-scrollbar { width: 6px; height: 6px; }
-    ::-webkit-scrollbar-track { background: transparent; }
-    ::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.2); border-radius: 10px; }
-</style>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/dom-to-image/2.6.0/dom-to-image.min.js"></script>
-<script>
-    function toggleViewMode() {
-        const body = document.body;
-        const btn = document.getElementById('viewToggleBtn');
-        if (body.classList.contains('desktop-mode')) {
-            body.classList.remove('desktop-mode');
-            body.classList.add('mobile-mode');
-            if(btn) btn.innerHTML = "📱 Mobile Site";
-        } else {
-            body.classList.remove('mobile-mode');
-            body.classList.add('desktop-mode');
-            if(btn) btn.innerHTML = "💻 Desktop Site";
-        }
+def build_context(df):
+    c = detect_columns(df)
+    lists = {k: (sorted(df[c[k]].dropna().unique().tolist()) if c[k] else [])
+             for k in ("spc", "seg", "fam")}
+    keys = [(k, c[k]) for k in ("spc", "seg", "fam") if c[k]]
+    mapping = []
+    if keys:
+        m = df[[col for _, col in keys]].fillna("N/A").drop_duplicates()
+        m.columns = [k for k, _ in keys]
+        mapping = m.to_dict(orient="records")
+    min_d = max_d = "N/A"
+    if c["date"]:
+        s = df[c["date"]]
+        if s.notna().any():
+            min_d, max_d = s.min().strftime("%d %b %y"), s.max().strftime("%d %b %y")
+    return {
+        **c,
+        "spc_list": lists["spc"], "seg_list": lists["seg"], "fam_list": lists["fam"],
+        "grouping": df.select_dtypes(exclude="number").columns.tolist(),
+        "mapping_json": json.dumps(mapping).replace("<", "\\u003c"),
+        "min_date": min_d, "max_date": max_d,
     }
-    function toggleExportMenu() {
-        document.getElementById("exportDropdown").classList.toggle("show");
-    }
-    window.onclick = function(event) {
-        if (!event.target.matches('.btn-primary') && !event.target.closest('.dropdown')) {
-            var dropdowns = document.getElementsByClassName("dropdown-content");
-            for (var i = 0; i < dropdowns.length; i++) {
-                if (dropdowns[i].classList.contains('show')) dropdowns[i].classList.remove('show');
-            }
-        }
-    }
-</script>
-"""
 
-UPLOAD_HTML = """
-<!DOCTYPE html>
-<html>
-<head><title>Data Portal - Analytics Pro</title><meta name="viewport" content="width=device-width, initial-scale=1.0">""" + GLOBAL_HEAD + """</head>
-<body style="background: #f2f2f7;">
-    <div class="nav">
-        <div>Analytics Pro</div>
-        <div>
-            <button class="view-toggle" onclick="toggleViewMode()" id="viewToggleBtn">💻 Desktop Site</button>
-        </div>
-    </div>
-    <div class="upload-container">
-        <h1 class="title">Analytics Engine.</h1>
-        <p class="subtitle">Upload your data to launch the Business Intelligence workspace.</p>
-        <div class="card">
-            <form action="/dashboard" method="post" enctype="multipart/form-data">
-                <div class="form-group">
-                    <input type="file" name="file" accept=".xlsx, .xls, .csv" required class="form-input" style="border: 2px dashed rgba(0,0,0,0.15); background: rgba(255,255,255,0.5); padding: 30px; text-align: center; cursor: pointer;">
-                </div>
-                <button type="submit" class="btn-primary">Launch Workspace →</button>
-            </form>
-        </div>
-    </div>
-</body>
-</html>
-"""
 
-WORKSPACE_HTML = """
-<!DOCTYPE html>
-<html>
-<head><title>Intelligence Workspace</title><meta name="viewport" content="width=device-width, initial-scale=1.0">""" + GLOBAL_HEAD + """</head>
-<body>
-    <div class="nav">
-        <div>Analytics Pro</div>
-        <div style="display: flex; align-items: center;">
-            <button class="view-toggle" onclick="toggleViewMode()" id="viewToggleBtn">💻 Desktop Site</button>
-        </div>
-    </div>
-    
-    <div class="app-layout">
-        <div class="sidebar" id="appSidebar">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px;">
-                <h2 style="font-size: 20px; font-weight: 700; margin: 0; letter-spacing: -0.015em;">Workspace</h2>
-                <button type="button" onclick="clearAll()" style="background: rgba(0,113,227,0.1); border: none; color: var(--blue-apple); font-size: 11px; font-weight: 600; cursor: pointer; padding: 6px 12px; border-radius: 8px;">Reset All</button>
-            </div>
+def get_state():
+    try:
+        mtime = os.path.getmtime(DATA_FILE_PATH)
+    except OSError:
+        return None
+    with _lock:
+        if _state["mtime"] != mtime:
+            try:
+                df = pd.read_pickle(DATA_FILE_PATH)
+            except Exception:
+                return None
+            _state.update(mtime=mtime, df=df, ctx=build_context(df))
+        return dict(_state)
 
-            <form id="config-form">
-                <input type="hidden" name="date_col" value="{{ default_date_col }}">
-
-                <!-- TIMELINE -->
-                <div class="sidebar-section">
-                    <h3 class="section-title">Timeline</h3>
-                    {% if default_date_col %}
-                    <div class="date-preset-grid">
-                        <div class="date-preset-btn" onclick="setDateRange('today', this)">Today</div>
-                        <div class="date-preset-btn" onclick="setDateRange('last7', this)">Last 7 Days</div>
-                        <div class="date-preset-btn" onclick="setDateRange('last30', this)">Last 30 Days</div>
-                        <div class="date-preset-btn" onclick="setDateRange('mtd', this)">Month-to-Date</div>
-                        <div class="date-preset-btn" onclick="setDateRange('prev_month', this)">Prev Month</div>
-                        <div class="date-preset-btn" onclick="setDateRange('ytd', this)">Year-to-Date</div>
-                    </div>
-                    
-                    <div style="display: flex; gap: 8px;">
-                        <div style="flex:1;">
-                            <label class="form-label">FROM</label>
-                            <input type="date" name="start_date" id="start_date" class="form-input">
-                        </div>
-                        <div style="flex:1;">
-                            <label class="form-label">TO</label>
-                            <input type="date" name="end_date" id="end_date" class="form-input">
-                        </div>
-                    </div>
-                    {% endif %}
-                </div>
-
-                <!-- DATA FILTERS -->
-                <div class="sidebar-section">
-                    <h3 class="section-title">Filters</h3>
-                    
-                    {% if spc_list %}
-                    <div class="form-group">
-                        <div class="form-label-header">
-                            <label class="form-label">SPC NAME</label>
-                            <div>
-                                <button type="button" class="btn-micro" onclick="selectAll('spc_filters', true)">All</button>
-                                <button type="button" class="btn-micro" onclick="selectAll('spc_filters', false)">Clear</button>
-                            </div>
-                        </div>
-                        <div class="checkbox-group" id="spc-container">
-                            {% for spc in spc_list %}
-                            <label class="checkbox-item" data-val="{{ spc }}"><input type="checkbox" name="spc_filters" value="{{ spc }}" onchange="handleCascade()"> <span style="overflow:hidden; text-overflow:ellipsis;">{{ spc }}</span></label>
-                            {% endfor %}
-                        </div>
-                    </div>
-                    {% endif %}
-
-                    {% if seg1_list %}
-                    <div class="form-group">
-                        <div class="form-label-header">
-                            <label class="form-label">SEG 1</label>
-                            <div>
-                                <button type="button" class="btn-micro" onclick="selectAll('seg1_filters', true)">All</button>
-                                <button type="button" class="btn-micro" onclick="selectAll('seg1_filters', false)">Clear</button>
-                            </div>
-                        </div>
-                        <div class="checkbox-group" id="seg-container">
-                            {% for seg in seg1_list %}
-                            <label class="checkbox-item" data-val="{{ seg }}"><input type="checkbox" name="seg1_filters" value="{{ seg }}" onchange="handleCascade()"> <span style="overflow:hidden; text-overflow:ellipsis;">{{ seg }}</span></label>
-                            {% endfor %}
-                        </div>
-                    </div>
-                    {% endif %}
-
-                    {% if family_list %}
-                    <div class="form-group">
-                        <div class="form-label-header">
-                            <label class="form-label">FAMILY NAME</label>
-                            <div>
-                                <button type="button" class="btn-micro" onclick="selectAll('family_filters', true)">All</button>
-                                <button type="button" class="btn-micro" onclick="selectAll('family_filters', false)">Clear</button>
-                            </div>
-                        </div>
-                        <div class="checkbox-group" id="fam-container">
-                            {% for fam in family_list %}
-                            <label class="checkbox-item" data-val="{{ fam }}"><input type="checkbox" name="family_filters" value="{{ fam }}"> <span style="overflow:hidden; text-overflow:ellipsis;">{{ fam }}</span></label>
-                            {% endfor %}
-                        </div>
-                    </div>
-                    {% endif %}
-                </div>
-
-                <!-- TABLE STRUCTURE -->
-                <div class="sidebar-section" id="sidebar-structure">
-                    <h3 class="section-title">Structure</h3>
-
-                    <div class="form-group">
-                        <div class="form-label-header">
-                            <label class="form-label">ROW GROUPING</label>
-                            <div>
-                                <button type="button" class="btn-micro" onclick="selectAll('index_cols', true)">All</button>
-                                <button type="button" class="btn-micro" onclick="selectAll('index_cols', false)">Clear</button>
-                            </div>
-                        </div>
-                        <div class="checkbox-group" id="row-grouping-container" style="max-height: none;">
-                            {% for col in grouping_cols %}
-                            <label class="checkbox-item">
-                                <input type="checkbox" name="index_cols" value="{{ col }}"> 
-                                <span style="overflow: hidden; text-overflow: ellipsis;">{{ col }}</span>
-                            </label>
-                            {% endfor %}
-                        </div>
-                    </div>
-                </div>
-
-                <!-- METRICS -->
-                <div class="sidebar-section" id="sidebar-metrics">
-                    <h3 class="section-title">Metrics</h3>
-                    <div class="form-group">
-                        <div class="checkbox-group" style="max-height: none;">
-                            <label class="checkbox-item"><input type="checkbox" name="agg_funcs" value="sum"> Sum Total</label>
-                            <label class="checkbox-item"><input type="checkbox" name="agg_funcs" value="count"> Count (Quantity)</label>
-                            <label class="checkbox-item"><input type="checkbox" name="agg_funcs" value="mean"> Average Price</label>
-                            <div style="border-top: 1px solid rgba(0,0,0,0.06); margin: 6px 0;"></div>
-                            <label class="checkbox-item" title="% of Column Total"><input type="checkbox" name="agg_funcs" value="contrib"> Contribution %</label>
-                            <label class="checkbox-item" title="Period-over-Period Growth"><input type="checkbox" name="agg_funcs" value="growth"> Growth % (PoP)</label>
-                            <div style="border-top: 1px solid rgba(0,0,0,0.06); margin: 6px 0;"></div>
-                            <label class="checkbox-item"><input type="checkbox" name="show_row_total" value="true" checked> <b>Show Grand Totals</b></label>
-                        </div>
-                    </div>
-                </div>
-
-            </form>
-            <div style="text-align: center; margin: 24px 0;">
-                <a href="/upload" style="color: #ff3b30; font-size: 13px; text-decoration: none; font-weight: 600; background: rgba(255,59,48,0.1); padding: 10px 20px; border-radius: 980px;">← Upload New File</a>
-            </div>
-        </div>
-        
-        <div class="sidebar-resizer" id="sidebarResizer"></div>
-
-        <div class="main-content">
-            <div class="header-actions">
-                <div style="display: flex; align-items: center; gap: 20px; flex-wrap: wrap;">
-                    <h2 style="font-size: 28px; font-weight: 700; margin: 0; letter-spacing: -0.015em;">Executive Dashboard</h2>
-                    
-                    <!-- Seamless View Toggle -->
-                    <div class="btn-segmented" style="width: max-content;">
-                        <input type="radio" id="view_dash" name="view_mode_toggle" value="dashboard" checked onchange="updateDashboard()">
-                        <label for="view_dash">Pivot View</label>
-                        
-                        <input type="radio" id="view_raw" name="view_mode_toggle" value="raw" onchange="updateDashboard()">
-                        <label for="view_raw">Raw Data</label>
-                    </div>
-                </div>
-                
-                <div class="dropdown" id="exportDropdownContainer">
-                    <button onclick="toggleExportMenu()" class="btn-primary">Export ▾</button>
-                    <div id="exportDropdown" class="dropdown-content">
-                        <button onclick="exportImage(); toggleExportMenu();" class="dropdown-item">🖼️ Save Image</button>
-                        <a href="/download" download="Executive_Report.xlsx" class="dropdown-item" onclick="toggleExportMenu();">📊 Download Excel</a>
-                    </div>
-                </div>
-            </div>
-            
-            <!-- KPI RIBBON -->
-            <div id="kpi-banner" class="kpi-ribbon" style="display:none;"></div>
-            
-            <div id="capture-area" class="table-container">
-                <div id="table-wrapper" class="table-scroll">
-                    <div style="padding: 100px 20px; text-align: center;">
-                        <p style="color: #86868b; font-size: 15px; font-weight: 500;">Select at least one <b>Row</b> and one <b>Metric</b> from the sidebar to compile intelligence.</p>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <!-- Injecting Data Map for Cascading Filters -->
-    <script>
-        const filterMap = {{ filter_mapping_json|safe }};
-    </script>
-
-    <script>
-        // Sidebar Resizer Logic
-        const resizer = document.getElementById('sidebarResizer');
-        const sidebar = document.getElementById('appSidebar');
-        let isResizing = false;
-
-        resizer.addEventListener('mousedown', (e) => {
-            isResizing = true;
-            resizer.classList.add('resizing');
-            document.body.style.cursor = 'col-resize';
-        });
-
-        document.addEventListener('mousemove', (e) => {
-            if (!isResizing) return;
-            if(e.clientX > 200 && e.clientX < 600) {
-                sidebar.style.width = e.clientX + 'px';
-            }
-        });
-
-        document.addEventListener('mouseup', () => {
-            if (isResizing) {
-                isResizing = false;
-                resizer.classList.remove('resizing');
-                document.body.style.cursor = 'default';
-            }
-        });
-        
-        // Date Presets Logic
-        function setDateRange(range, btnElement) {
-            document.querySelectorAll('.date-preset-btn').forEach(btn => btn.classList.remove('active'));
-            if(btnElement) btnElement.classList.add('active');
-            
-            const today = new Date();
-            let start = new Date();
-            let end = new Date();
-            
-            if (range === 'today') {
-                // start and end stay as today
-            } else if (range === 'last7') {
-                start.setDate(today.getDate() - 6);
-            } else if (range === 'last30') {
-                start.setDate(today.getDate() - 29);
-            } else if (range === 'mtd') {
-                start = new Date(today.getFullYear(), today.getMonth(), 1);
-            } else if (range === 'prev_month') {
-                start = new Date(today.getFullYear(), today.getMonth() - 1, 1);
-                end = new Date(today.getFullYear(), today.getMonth(), 0);
-            } else if (range === 'ytd') {
-                start = new Date(today.getFullYear(), 0, 1);
-            }
-            
-            start.setMinutes(start.getMinutes() - start.getTimezoneOffset());
-            end.setMinutes(end.getMinutes() - end.getTimezoneOffset());
-            
-            document.getElementById('start_date').value = start.toISOString().split('T')[0];
-            document.getElementById('end_date').value = end.toISOString().split('T')[0];
-            
-            updateDashboard();
-        }
-
-        function selectAll(name, checked) {
-            const checkboxes = document.querySelectorAll(`input[name="${name}"]`);
-            checkboxes.forEach(cb => { cb.checked = checked; });
-            if(['spc_filters', 'seg1_filters', 'family_filters'].includes(name)) {
-                handleCascade();
-            } else {
-                updateDashboard();
-            }
-        }
-
-        function clearAll() {
-            document.getElementById('config-form').reset();
-            document.querySelectorAll('.date-preset-btn').forEach(btn => btn.classList.remove('active'));
-            document.querySelectorAll('.checkbox-item').forEach(el => el.style.display = 'flex');
-            
-            document.getElementById('sidebar-structure').style.opacity = '1';
-            document.getElementById('sidebar-structure').style.pointerEvents = 'auto';
-            document.getElementById('sidebar-metrics').style.opacity = '1';
-            document.getElementById('sidebar-metrics').style.pointerEvents = 'auto';
-            document.getElementById('view_dash').checked = true;
-            
-            document.getElementById('table-wrapper').innerHTML = '<div style="padding: 100px 20px; text-align: center;"><p style="color: #86868b; font-size: 15px; font-weight: 500;">Select at least one <b>Row</b> and one <b>Metric</b> from the sidebar to compile intelligence.</p></div>';
-            document.getElementById('kpi-banner').style.display = 'none';
-        }
-
-        function handleCascade() {
-            const selectedSpcs = Array.from(document.querySelectorAll('input[name="spc_filters"]:checked')).map(cb => cb.value);
-            const selectedSegs = Array.from(document.querySelectorAll('input[name="seg1_filters"]:checked')).map(cb => cb.value);
-            
-            let validSegs = new Set();
-            let validFams = new Set();
-
-            if (selectedSpcs.length === 0) {
-                document.querySelectorAll('#seg-container .checkbox-item, #fam-container .checkbox-item').forEach(el => el.style.display = 'flex');
-            } else {
-                filterMap.forEach(row => {
-                    if (selectedSpcs.includes(row.spc)) {
-                        validSegs.add(row.seg);
-                        if (selectedSegs.length === 0 || selectedSegs.includes(row.seg)) {
-                            validFams.add(row.fam);
-                        }
-                    }
-                });
-
-                document.querySelectorAll('#seg-container .checkbox-item').forEach(el => {
-                    if (validSegs.has(el.dataset.val)) el.style.display = 'flex';
-                    else { el.style.display = 'none'; el.querySelector('input').checked = false; }
-                });
-
-                document.querySelectorAll('#fam-container .checkbox-item').forEach(el => {
-                    if (validFams.has(el.dataset.val) || selectedSpcs.length === 0) el.style.display = 'flex';
-                    else { el.style.display = 'none'; el.querySelector('input').checked = false; }
-                });
-            }
-            updateDashboard();
-        }
-
-        async function updateDashboard() {
-            const form = document.getElementById('config-form');
-            const formData = new FormData(form);
-            
-            const viewMode = document.querySelector('input[name="view_mode_toggle"]:checked').value;
-            formData.append('view_mode', viewMode);
-            
-            const indexCols = formData.getAll('index_cols');
-            const aggFuncs = formData.getAll('agg_funcs');
-            
-            const structureSection = document.getElementById('sidebar-structure');
-            const metricsSection = document.getElementById('sidebar-metrics');
-            if (viewMode === 'raw') {
-                structureSection.style.opacity = '0.3';
-                structureSection.style.pointerEvents = 'none';
-                metricsSection.style.opacity = '0.3';
-                metricsSection.style.pointerEvents = 'none';
-            } else {
-                structureSection.style.opacity = '1';
-                structureSection.style.pointerEvents = 'auto';
-                metricsSection.style.opacity = '1';
-                metricsSection.style.pointerEvents = 'auto';
-            }
-            
-            if (viewMode === 'dashboard' && (indexCols.length === 0 || aggFuncs.length === 0)) {
-                document.getElementById('table-wrapper').innerHTML = '<div style="padding: 100px 20px; text-align: center;"><p style="color: #86868b; font-size: 15px; font-weight: 500;">Select at least one <b>Row</b> and one <b>Metric</b> from the sidebar to compile intelligence.</p></div>';
-                document.getElementById('kpi-banner').style.display = 'none';
-                return;
-            }
-
-            try {
-                const response = await fetch('/calculate', { method: 'POST', body: formData });
-                const data = await response.json();
-                
-                if (response.ok) {
-                    const kpiBanner = document.getElementById('kpi-banner');
-                    if(data.kpi_html) {
-                        kpiBanner.innerHTML = data.kpi_html;
-                        kpiBanner.style.display = 'flex';
-                    } else {
-                        kpiBanner.style.display = 'none';
-                    }
-                    
-                    let html = "";
-                    if (data.filter_text) {
-                        html += `<div class="filter-text-bar">${data.filter_text}</div>`;
-                    }
-                    html += data.table_html;
-                    document.getElementById('table-wrapper').innerHTML = html;
-                    makeTableResizable();
-                } else {
-                    document.getElementById('table-wrapper').innerHTML = `<div style="padding: 100px 20px; text-align: center;"><p style="color: #ff3b30; font-weight: 600;">${data.error}</p></div>`;
-                    document.getElementById('kpi-banner').style.display = 'none';
-                }
-            } catch (err) {
-                console.error("Failed to update", err);
-            }
-        }
-
-        function makeTableResizable() {
-            const table = document.querySelector('.excel-table');
-            if (!table) return;
-            const cols = table.querySelectorAll('th');
-            cols.forEach((col) => {
-                if (col.querySelector('.resizer')) return;
-                const resizer = document.createElement('div');
-                resizer.className = 'resizer';
-                col.appendChild(resizer);
-                let x = 0, w = 0;
-                resizer.addEventListener('mousedown', function (e) {
-                    x = e.clientX; w = col.offsetWidth;
-                    document.addEventListener('mousemove', mouseMoveHandler);
-                    document.addEventListener('mouseup', mouseUpHandler);
-                    e.stopPropagation();
-                });
-                function mouseMoveHandler(e) { col.style.width = `${w + (e.clientX - x)}px`; }
-                function mouseUpHandler() { document.removeEventListener('mousemove', mouseMoveHandler); document.removeEventListener('mouseup', mouseUpHandler); }
-            });
-        }
-
-        document.querySelectorAll('#config-form input').forEach(el => {
-            if(el.type !== 'date') {
-                el.addEventListener('change', () => {
-                    if (el.name !== 'start_date' && el.name !== 'end_date') {
-                        updateDashboard();
-                    }
-                });
-            }
-        });
-        
-        document.querySelectorAll('#config-form input[type="date"]').forEach(el => {
-            el.addEventListener('change', () => {
-                document.querySelectorAll('.date-preset-btn').forEach(btn => btn.classList.remove('active'));
-                updateDashboard();
-            });
-        });
-        
-        window.addEventListener('DOMContentLoaded', () => {
-            const body = document.body;
-            if (window.innerWidth <= 768) { body.classList.add('mobile-mode'); document.getElementById('viewToggleBtn').innerHTML = "📱 Mobile Site"; } 
-            else { body.classList.add('desktop-mode'); document.getElementById('viewToggleBtn').innerHTML = "💻 Desktop Site"; }
-            updateDashboard();
-        });
-        
-        function exportImage() {
-            const captureArea = document.querySelector('.main-content');
-            const scrollArea = document.getElementById('table-wrapper');
-            const exportBtn = document.getElementById('exportDropdownContainer');
-            
-            const origMaxHeight = scrollArea.style.maxHeight;
-            const origOverflow = scrollArea.style.overflow;
-            
-            scrollArea.style.maxHeight = 'none';
-            scrollArea.style.overflow = 'visible';
-            exportBtn.style.display = 'none'; 
-            
-            document.body.classList.add('export-mode');
-            
-            setTimeout(() => {
-                domtoimage.toJpeg(captureArea, { quality: 1.0, bgcolor: '#ffffff' })
-                    .then(function (dataUrl) {
-                        if (/Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent)) {
-                            const modal = document.createElement('div');
-                            modal.style.position = 'fixed';
-                            modal.style.top = '0'; modal.style.left = '0'; 
-                            modal.style.width = '100%'; modal.style.height = '100%';
-                            modal.style.backgroundColor = 'rgba(0,0,0,0.95)'; 
-                            modal.style.zIndex = '99999';
-                            modal.style.display = 'flex'; 
-                            modal.style.flexDirection = 'column'; 
-                            modal.style.alignItems = 'center'; 
-                            modal.style.justifyContent = 'center';
-                            
-                            const closeBtn = document.createElement('button');
-                            closeBtn.innerText = 'Close Preview';
-                            closeBtn.style.padding = '12px 24px'; 
-                            closeBtn.style.marginBottom = '20px'; 
-                            closeBtn.style.borderRadius = '980px';
-                            closeBtn.style.border = 'none';
-                            closeBtn.style.backgroundColor = '#ffffff';
-                            closeBtn.style.color = '#1d1d1f';
-                            closeBtn.style.fontWeight = '600';
-                            closeBtn.onclick = () => document.body.removeChild(modal);
-                            
-                            const inst = document.createElement('p');
-                            inst.innerText = 'Long-press the image below to save it to your Photos.';
-                            inst.style.color = '#ffffff'; 
-                            inst.style.marginBottom = '20px';
-                            inst.style.fontSize = '14px';
-                            
-                            const img = document.createElement('img');
-                            img.src = dataUrl;
-                            img.style.maxWidth = '90%'; 
-                            img.style.maxHeight = '70%'; 
-                            img.style.borderRadius = '12px';
-                            img.style.boxShadow = '0 10px 30px rgba(0,0,0,0.5)';
-                            
-                            modal.appendChild(closeBtn);
-                            modal.appendChild(inst);
-                            modal.appendChild(img);
-                            document.body.appendChild(modal);
-                        } else {
-                            let link = document.createElement('a');
-                            link.download = 'Executive_Report.jpeg';
-                            link.href = dataUrl;
-                            link.click();
-                        }
-                        
-                        scrollArea.style.maxHeight = origMaxHeight;
-                        scrollArea.style.overflow = origOverflow;
-                        exportBtn.style.display = 'inline-block';
-                        document.body.classList.remove('export-mode');
-                    })
-                    .catch(function (error) {
-                        console.error('Export failed:', error);
-                        scrollArea.style.maxHeight = origMaxHeight;
-                        scrollArea.style.overflow = origOverflow;
-                        exportBtn.style.display = 'inline-block';
-                        document.body.classList.remove('export-mode');
-                        alert("Could not export image. Please check console logs.");
-                    });
-            }, 500);
-        }
-    </script>
-</body>
-</html>
-"""
-
-def load_data():
-    if os.path.exists(DATA_FILE_PATH):
-        try: return pd.read_pickle(DATA_FILE_PATH)
-        except: return None
-    return None
 
 def save_data(df):
-    df.to_pickle(DATA_FILE_PATH)
-    meta = {"upload_time": datetime.now().strftime("%d %b %Y, %I:%M %p")}
-    pd.to_pickle(meta, META_FILE_PATH)
+    df = prepare_df(df)
+    tmp = DATA_FILE_PATH + ".tmp"
+    df.to_pickle(tmp)
+    os.replace(tmp, DATA_FILE_PATH)            # atomic: readers never see half a file
+    with open(META_FILE_PATH, "w") as fh:
+        json.dump({"upload_time": datetime.now().strftime("%d %b %Y, %I:%M %p")}, fh)
 
-def get_metadata():
-    upload_time = datetime.now().strftime("%d %b %Y, %I:%M %p")
-    if os.path.exists(META_FILE_PATH):
-        try:
-            meta = pd.read_pickle(META_FILE_PATH)
-            upload_time = meta.get("upload_time", upload_time)
-        except: pass
-    return upload_time
 
-def get_filter_lists(df):
-    spc_col = next((c for c in df.columns if 'spc' in str(c).lower() and 'name' in str(c).lower()), 'SPC Name' if 'SPC Name' in df.columns else '')
-    seg1_col = next((c for c in df.columns if 'seg1' in str(c).lower()), 'SEG1' if 'SEG1' in df.columns else '')
-    family_col = next((c for c in df.columns if 'family' in str(c).lower()), 'Family Name' if 'Family Name' in df.columns else '')
-    
-    spc_list = df[spc_col].dropna().unique().tolist() if spc_col and spc_col in df.columns else []
-    seg1_list = df[seg1_col].dropna().unique().tolist() if seg1_col and seg1_col in df.columns else []
-    family_list = df[family_col].dropna().unique().tolist() if family_col and family_col in df.columns else []
-    
-    mapping_df = df[[c for c in [spc_col, seg1_col, family_col] if c]].dropna(how='all').fillna('N/A').astype(str).drop_duplicates()
-    mapping_df.columns = ['spc' if c == spc_col else 'seg' if c == seg1_col else 'fam' if c == family_col else c for c in mapping_df.columns]
-    filter_mapping_json = json.dumps(mapping_df.to_dict(orient='records'))
-    
-    return sorted([str(x) for x in spc_list]), sorted([str(x) for x in seg1_list]), sorted([str(x) for x in family_list]), filter_mapping_json
+def get_upload_time():
+    try:
+        with open(META_FILE_PATH) as fh:
+            return json.load(fh).get("upload_time", "")
+    except (OSError, ValueError):
+        return ""
 
-def get_date_bounds(df, date_col):
-    min_date, max_date = "N/A", "N/A"
-    if date_col and date_col in df.columns:
-        try:
-            parsed = pd.to_datetime(df[date_col], errors='coerce', dayfirst=True)
-            if pd.notna(parsed.min()): min_date = parsed.min().strftime("%d %b %y")
-            if pd.notna(parsed.max()): max_date = parsed.max().strftime("%d %b %y")
-        except: pass
-    return min_date, max_date
+
+# ════════════════════════════════════════════════════════════════════
+#  FORMATTING / RENDERING
+# ════════════════════════════════════════════════════════════════════
+_GROUP = re.compile(r"(\d)(?=(\d\d)+$)")
+
 
 def format_indian_number(x):
-    if pd.isna(x) or x == '': return ''
+    if x is None or (isinstance(x, str) and x == ""):
+        return ""
     try:
-        num = int(round(float(x)))
-        s = str(abs(num))
-        if len(s) > 3:
-            res = s[-3:]
-            s = s[:-3]
-            while len(s) > 2:
-                res = s[-2:] + ',' + res
-                s = s[:-2]
-            s = s + ',' + res
-        return '-' + s if num < 0 else s
-    except (ValueError, TypeError): return str(x)
+        if pd.isna(x):
+            return ""
+        n = int(round(float(x)))
+    except (ValueError, TypeError, OverflowError):
+        return html.escape(str(x))
+    s = str(abs(n))
+    if len(s) > 3:
+        s = _GROUP.sub(r"\1,", s[:-3]) + "," + s[-3:]
+    return f"-{s}" if n < 0 else s
 
-# --- ROUTES ---
-@app.route("/", methods=["GET", "POST"])
+
+def format_pct(v):
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return ""
+    if x != x:
+        return ""
+    if round(x, 1) > 0:
+        return f'<span class="pct-positive">↑ {x:.1f}%</span>'
+    if round(x, 1) < 0:
+        return f'<span class="pct-negative">↓ {abs(x):.1f}%</span>'
+    return '<span class="pct-neutral">–</span>'
+
+
+def col_to_cells(s):
+    if pd.api.types.is_datetime64_any_dtype(s):
+        return s.dt.strftime("%d-%b-%y").fillna("").tolist()
+    if pd.api.types.is_numeric_dtype(s):
+        return [format_indian_number(v) for v in s]
+    return ["" if pd.isna(v) else html.escape(str(v)) for v in s]
+
+
+def render_table(headers, columns, css, numeric, total_idx=-1):
+    def cls(i):
+        out = []
+        if i in numeric:
+            out.append("num")
+        if i == total_idx:
+            out.append("total-col")
+        return f' class="{" ".join(out)}"' if out else ""
+
+    head = "".join(f"<th{cls(i)}>{html.escape(h)}</th>" for i, h in enumerate(headers))
+    body = "".join(
+        "<tr>" + "".join(f"<td{cls(i)}>{v}</td>" for i, v in enumerate(row)) + "</tr>"
+        for row in zip(*columns)
+    )
+    return (f'<table class="excel-table {css}"><thead><tr>{head}</tr></thead>'
+            f"<tbody>{body}</tbody></table>")
+
+
+def empty_block(title, msg=""):
+    return (f'<div class="empty"><svg class="ic"><use href="#i-chart"/></svg>'
+            f"<h3>{html.escape(title)}</h3><p>{html.escape(msg)}</p></div>")
+
+
+# ════════════════════════════════════════════════════════════════════
+#  QUERY ENGINE
+# ════════════════════════════════════════════════════════════════════
+def parse_date(s):
+    if not s:
+        return None
+    t = pd.to_datetime(s, errors="coerce")
+    return None if pd.isna(t) else t
+
+
+def _txt(label, vals):
+    shown = ", ".join(html.escape(v) for v in vals[:6])
+    more = f" +{len(vals) - 6} more" if len(vals) > 6 else ""
+    return f"<b>{label}</b> {shown}{more}"
+
+
+def apply_filters(df, ctx, params):
+    mask, texts = None, []
+
+    def add(m):
+        nonlocal mask
+        mask = m if mask is None else (mask & m)
+
+    dc = ctx["date"]
+    if dc:
+        start, end = parse_date(params.get("start_date")), parse_date(params.get("end_date"))
+        if start is not None:
+            add(df[dc] >= start)
+        if end is not None:
+            add(df[dc] < end + pd.Timedelta(days=1))
+        if start is not None or end is not None:
+            a = start.strftime("%d-%b-%y") if start is not None else "Start"
+            b = end.strftime("%d-%b-%y") if end is not None else "End"
+            texts.append(f"<b>Date</b> {a} – {b}")
+
+    for key, field, label in (("spc", "spc_filters", "SPC"),
+                              ("seg", "seg1_filters", "SEG 1"),
+                              ("fam", "family_filters", "Family")):
+        col, vals = ctx[key], params.getlist(field)
+        if col and vals:
+            add(df[col].isin(vals))
+            texts.append(_txt(label, vals))
+
+    return (df if mask is None else df[mask]), texts
+
+
+def build_view(state, params, want_export=False):
+    """Returns (payload, export_df, http_status)."""
+    df, ctx = state["df"], state["ctx"]
+    mode = params.get("view_mode", "dashboard")
+    index_cols = [c for c in params.getlist("index_cols")
+                  if c in df.columns and c != ctx["value"]]
+    agg_funcs = params.getlist("agg_funcs")
+
+    if mode != "raw" and (not index_cols or not agg_funcs):
+        return {"error": "Select at least one row grouping and one metric."}, None, 400
+
+    dff, texts = apply_filters(df, ctx, params)
+    filter_text = " · ".join(texts) if texts else "All data"
+    value_col = ctx["value"]
+
+    kpi = ""
+    if len(dff) and value_col:
+        active = format_indian_number(dff[ctx["spc"]].nunique()) if ctx["spc"] else "N/A"
+        kpi = ('<div class="kpi"><div class="kpi-label">Total Volume</div>'
+               f'<div class="kpi-val">{format_indian_number(dff[value_col].sum())}</div></div>'
+               '<div class="kpi"><div class="kpi-label">Records</div>'
+               f'<div class="kpi-val">{format_indian_number(len(dff))}</div></div>'
+               '<div class="kpi"><div class="kpi-label">Active Entities</div>'
+               f'<div class="kpi-val">{active}</div></div>')
+
+    if dff.empty:
+        return {"table_html": empty_block("No matching data", "Try widening the date range or clearing a filter."),
+                "filter_text": filter_text, "status": "0 results", "kpi_html": ""}, None, 200
+
+    # ── RAW ─────────────────────────────────────────────────────────
+    if mode == "raw":
+        shown = dff.head(RAW_ROW_LIMIT)
+        headers = [str(c) for c in shown.columns]
+        columns = [col_to_cells(shown[c]) for c in shown.columns]
+        numeric = {i for i, c in enumerate(shown.columns) if pd.api.types.is_numeric_dtype(shown[c])}
+        status = (f"{format_indian_number(len(dff))} rows" if len(dff) <= RAW_ROW_LIMIT else
+                  f"First {format_indian_number(RAW_ROW_LIMIT)} of {format_indian_number(len(dff))} rows")
+        return {"table_html": render_table(headers, columns, "raw", numeric),
+                "filter_text": filter_text, "status": status, "kpi_html": kpi}, \
+            (dff if want_export else None), 200
+
+    # ── PIVOT ───────────────────────────────────────────────────────
+    if not value_col:
+        return {"error": "No numeric column found to aggregate."}, None, 400
+
+    aggs = [a for a in ("sum", "count", "mean") if a in agg_funcs] or ["sum"]
+    metrics = [LABELS[a] for a in aggs]
+    sub = dff[index_cols + [value_col]]
+    g = (sub.groupby(index_cols, observed=True)[value_col].agg(aggs)
+            .rename(columns=LABELS).reset_index())
+    if g.empty:
+        return {"table_html": empty_block("No groups to show", "The selected grouping has only empty values."),
+                "filter_text": filter_text, "status": "0 groups", "kpi_html": kpi}, None, 200
+    g[metrics] = g[metrics].fillna(0)
+
+    ordered = list(index_cols)
+    for m in metrics:
+        ordered.append(m)
+        if "contrib" in agg_funcs and m != "Avg Price":
+            tot = g[m].sum()
+            g[f"{m} Contrib %"] = g[m] / tot * 100 if tot else 0.0
+            ordered.append(f"{m} Contrib %")
+        if "growth" in agg_funcs:
+            prev = g[m].shift()
+            g[f"{m} Growth %"] = (g[m] - prev) / prev.where(prev != 0) * 100
+            ordered.append(f"{m} Growth %")
+
+    total_idx = -1
+    if params.get("show_row_total") == "true" and len(metrics) > 1:
+        g["TOTAL"] = g[metrics].sum(axis=1)
+        ordered.append("TOTAL")
+        total_idx = len(ordered) - 1
+
+    valid = sub.dropna(subset=index_cols)[value_col]
+    base = {"Value": valid.sum(), "Qty": valid.count(), "Avg Price": valid.mean()}
+    totals = {m: base[m] for m in metrics}
+    if "TOTAL" in ordered:
+        totals["TOTAL"] = sum(totals[m] for m in metrics)
+
+    columns, numeric = [], set()
+    for i, h in enumerate(ordered):
+        s = g[h]
+        if h in index_cols:
+            cells = col_to_cells(s) + ["GRAND TOTAL" if i == 0 else ""]
+        elif h.endswith(" %"):
+            cells = [format_pct(v) for v in s] + [""]
+            numeric.add(i)
+        else:
+            cells = [format_indian_number(v) for v in s] + [format_indian_number(totals[h])]
+            numeric.add(i)
+        columns.append(cells)
+
+    export = None
+    if want_export:
+        row = {c: None for c in ordered}
+        row[index_cols[0]] = "GRAND TOTAL"
+        row.update(totals)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            export = pd.concat([g[ordered], pd.DataFrame([row], columns=ordered)], ignore_index=True)
+
+    return {"table_html": render_table(ordered, columns, "pivot", numeric, total_idx),
+            "filter_text": filter_text,
+            "status": f"{format_indian_number(len(g))} groups", "kpi_html": kpi}, export, 200
+
+
+# ════════════════════════════════════════════════════════════════════
+#  ROUTES
+# ════════════════════════════════════════════════════════════════════
+@app.get("/")
 def home():
-    df = load_data()
-    if df is not None:
-        all_cols = df.columns.tolist()
-        default_date_col = 'Customized Sales Date' if 'Customized Sales Date' in all_cols else ('Sale Date' if 'Sale Date' in all_cols else next((c for c in all_cols if 'date' in str(c).lower()), ""))
-        grouping_cols = df.select_dtypes(exclude=['number']).columns.tolist()
-        spc_list, seg1_list, family_list, filter_mapping_json = get_filter_lists(df)
-        upload_time = get_metadata()
-        min_sale_date, max_sale_date = get_date_bounds(df, default_date_col)
-        return render_template_string(WORKSPACE_HTML, all_cols=all_cols, grouping_cols=grouping_cols, default_date_col=default_date_col, spc_list=spc_list, seg1_list=seg1_list, family_list=family_list, upload_time=upload_time, min_sale_date=min_sale_date, max_sale_date=max_sale_date, filter_mapping_json=filter_mapping_json)
-    return render_template_string(UPLOAD_HTML)
+    st = get_state()
+    if st is None:
+        return render_template_string(UPLOAD_HTML, error=None)
+    return render_template_string(WORKSPACE_HTML, ctx=st["ctx"], upload_time=get_upload_time())
 
-@app.route("/upload", methods=["GET"])
+
+@app.get("/upload")
 def upload_page():
-    return render_template_string(UPLOAD_HTML)
+    return render_template_string(UPLOAD_HTML, error=None)
 
-@app.route("/dashboard", methods=["POST"])
+
+@app.post("/dashboard")
 def dashboard():
-    if 'file' in request.files and request.files['file'].filename != '':
-        file = request.files['file']
-        df = pd.read_csv(file) if file.filename.endswith('.csv') else pd.read_excel(file)
-        save_data(df)
-    return redirect(url_for('home'))
-
-@app.route("/calculate", methods=["POST"])
-def calculate():
-    df = load_data()
-    if df is None: return jsonify({"error": "No data available."}), 400
-        
-    view_mode = request.form.get('view_mode', 'dashboard')
-    date_col = request.form.get('date_col')
-    start_date = request.form.get('start_date')
-    end_date = request.form.get('end_date')
-    index_cols = request.form.getlist('index_cols')
-    agg_funcs = request.form.getlist('agg_funcs')
-    
-    spc_filters = request.form.getlist('spc_filters')
-    seg1_filters = request.form.getlist('seg1_filters')
-    family_filters = request.form.getlist('family_filters')
-    show_row_total = request.form.get('show_row_total') == 'true'
-    
-    num_cols = df.select_dtypes(include='number').columns.tolist()
-    value_cols = ['Tentative DP'] if 'Tentative DP' in num_cols else (num_cols[:1] if num_cols else [])
-    
-    if view_mode == 'dashboard' and (not index_cols or not agg_funcs):
-        return jsonify({"error": "Select at least one Row Grouping and one Metric."}), 400
-
-    calc_contrib = 'contrib' in agg_funcs
-    calc_growth = 'growth' in agg_funcs
-    base_aggs = [f for f in agg_funcs if f in ['sum', 'count', 'mean']]
-    if not base_aggs: base_aggs = ['sum']
-
+    f = request.files.get("file")
+    if not f or not f.filename:
+        return redirect(url_for("home"))
+    name = f.filename.lower()
     try:
-        filter_texts = []
-        df_filtered = df.copy()
-        
-        if date_col and date_col in df_filtered.columns:
-            df_filtered[date_col] = pd.to_datetime(df_filtered[date_col], errors='coerce', dayfirst=True)
-            if start_date: df_filtered = df_filtered[df_filtered[date_col] >= pd.to_datetime(start_date)]
-            if end_date: df_filtered = df_filtered[df_filtered[date_col] <= pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)]
-            if start_date or end_date:
-                s_str = pd.to_datetime(start_date).strftime('%d-%b-%y') if start_date else 'Start'
-                e_str = pd.to_datetime(end_date).strftime('%d-%b-%y') if end_date else 'End'
-                filter_texts.append(f"<b>{date_col}</b>: {s_str} to {e_str}")
+        if name.endswith(".csv"):
+            df = pd.read_csv(f)
+        elif name.endswith((".xlsx", ".xls")):
+            df = pd.read_excel(f)
+        else:
+            raise ValueError("unsupported file type, please use .xlsx, .xls or .csv")
+        if df.empty:
+            raise ValueError("the file has no rows")
+        save_data(df)
+    except Exception as exc:  # noqa: BLE001 - surface any parse error to the user
+        return render_template_string(UPLOAD_HTML, error=f"Couldn't read that file: {exc}"), 400
+    return redirect(url_for("home"))
 
-        spc_col = next((c for c in df_filtered.columns if 'spc' in str(c).lower() and 'name' in str(c).lower()), 'SPC Name' if 'SPC Name' in df_filtered.columns else '')
-        if spc_col and spc_filters and spc_col in df_filtered.columns:
-            df_filtered = df_filtered[df_filtered[spc_col].astype(str).isin(spc_filters)]
-            filter_texts.append(f"<b>SPC</b>: {', '.join(spc_filters)}")
 
-        seg1_col = next((c for c in df_filtered.columns if 'seg1' in str(c).lower()), 'SEG1' if 'SEG1' in df_filtered.columns else '')
-        if seg1_col and seg1_filters and seg1_col in df_filtered.columns:
-            df_filtered = df_filtered[df_filtered[seg1_col].astype(str).isin(seg1_filters)]
-            filter_texts.append(f"<b>SEG1</b>: {', '.join(seg1_filters)}")
+@app.post("/calculate")
+def calculate():
+    st = get_state()
+    if st is None:
+        return jsonify({"error": "No data available."}), 400
+    try:
+        payload, _, code = build_view(st, request.form)
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"An error occurred: {exc}"}), 500
+    return jsonify(payload), code
 
-        family_col = next((c for c in df_filtered.columns if 'family' in str(c).lower()), 'Family Name' if 'Family Name' in df_filtered.columns else '')
-        if family_col and family_filters and family_col in df_filtered.columns:
-            df_filtered = df_filtered[df_filtered[family_col].astype(str).isin(family_filters)]
-            filter_texts.append(f"<b>Family</b>: {', '.join(family_filters)}")
 
-        kpi_html = ""
-        if not df_filtered.empty and value_cols:
-            total_val = format_indian_number(df_filtered[value_cols[0]].sum())
-            total_rows = format_indian_number(len(df_filtered))
-            active_spcs = df_filtered[spc_col].nunique() if spc_col in df_filtered.columns else "N/A"
-            kpi_html = f"""
-                <div class="kpi-card"><div class="kpi-label">Total Volume</div><div class="kpi-val">{total_val}</div></div>
-                <div class="kpi-card"><div class="kpi-label">Records</div><div class="kpi-val">{total_rows}</div></div>
-                <div class="kpi-card"><div class="kpi-label">Active Entities</div><div class="kpi-val">{active_spcs}</div></div>
-            """
-
-        filter_text = f"<p style='color:#86868b; font-size:12px; margin:0;'>{' | '.join(filter_texts)}</p>" if filter_texts else ""
-
-        if df_filtered.empty:
-            return jsonify({"table_html": "<div style='padding: 60px 20px; text-align: center;'><p style='color: #ff3b30;'>No data found for the selected filters.</p></div>", "filter_text": filter_text, "kpi_html": ""})
-
-        # RAW DATA VIEW HACK (No Limits)
-        if view_mode == 'raw':
-            for col in df_filtered.columns:
-                if pd.api.types.is_datetime64_any_dtype(df_filtered[col]):
-                    df_filtered[col] = df_filtered[col].dt.strftime('%d-%b-%y')
-                elif pd.api.types.is_numeric_dtype(df_filtered[col]):
-                    df_filtered[col] = df_filtered[col].apply(format_indian_number)
-            
-            df_filtered.to_pickle(os.path.join(UPLOAD_DIR, "summary_data.pkl"))
-            table_html = df_filtered.to_html(classes='excel-table', border=0, index=False, justify='left', escape=False)
-            table_html = table_html.replace('<td>', '<td class="number-cell">')
-            return jsonify({"table_html": table_html, "filter_text": filter_text, "kpi_html": kpi_html})
-
-        for col in index_cols:
-            if col in df_filtered.columns and pd.api.types.is_datetime64_any_dtype(df_filtered[col]):
-                df_filtered[col] = df_filtered[col].dt.strftime('%d-%b-%y')
-
-        pivot_kwargs = {'data': df_filtered, 'index': index_cols, 'values': value_cols, 'aggfunc': base_aggs}
-        pivot_df = pd.pivot_table(**pivot_kwargs).reset_index().fillna(0)
-        
-        new_cols = []
-        agg_map = {'sum': 'Value', 'count': 'Qty', 'mean': 'Avg'}
-        for col in pivot_df.columns:
-            if isinstance(col, tuple):
-                if col[0] in index_cols and all(x == '' for x in col[1:]):
-                    new_cols.append(str(col[0]))
-                    continue
-                parts = []
-                for item in col:
-                    item_str = str(item).strip()
-                    if item_str in agg_map:
-                        if len(base_aggs) > 1: parts.append(agg_map[item_str])
-                    elif item_str in value_cols:
-                        if len(value_cols) > 1: parts.append(item_str)
-                    elif item_str and item_str.lower() != 'nan':
-                        parts.append(item_str)
-                new_cols.append(" - ".join(parts) if parts else " - ".join(str(c) for c in col if str(c).strip()))
-            else:
-                if col in index_cols:
-                    new_cols.append(str(col))
-                else:
-                    col_str = str(col)
-                    new_cols.append(col_str.replace('sum - ', '').replace('count - ', '').replace('mean - ', ''))
-        
-        pivot_df.columns = [str(c) for c in new_cols]
-
-        metric_columns = [col for col in pivot_df.columns if col not in index_cols]
-        contrib_data = {}
-        if calc_contrib:
-            for c in metric_columns:
-                total = pivot_df[c].sum()
-                contrib_data[f"{c} Contrib %"] = (pivot_df[c] / total * 100).fillna(0) if total else 0
-                
-        growth_data = {}
-        if calc_growth and len(metric_columns) > 1:
-            for i in range(1, len(metric_columns)):
-                prev = metric_columns[i-1]
-                curr = metric_columns[i]
-                growth_data[f"{curr} Growth %"] = ((pivot_df[curr] - pivot_df[prev]) / pivot_df[prev].replace(0, pd.NA) * 100).fillna(0)
-
-        final_cols = index_cols.copy()
-        for i, c in enumerate(metric_columns):
-            final_cols.append(c)
-            if calc_contrib: 
-                pivot_df[f"{c} Contrib %"] = contrib_data[f"{c} Contrib %"]
-                final_cols.append(f"{c} Contrib %")
-            if calc_growth and i > 0:
-                pivot_df[f"{c} Growth %"] = growth_data[f"{c} Growth %"]
-                final_cols.append(f"{c} Growth %")
-        
-        if show_row_total and len(metric_columns) > 1:
-            pivot_df['TOTAL'] = pivot_df[metric_columns].sum(axis=1)
-            final_cols.append('TOTAL')
-            metric_columns.append('TOTAL')
-            
-        pivot_df = pivot_df[final_cols]
-            
-        if not pivot_df.empty:
-            total_row = pd.DataFrame([{c: '' for c in pivot_df.columns}])
-            total_row.iloc[0, 0] = 'GRAND TOTAL'
-            for c in metric_columns:
-                total_row.at[0, c] = pivot_df[c].sum()
-            pivot_df = pd.concat([pivot_df, total_row], ignore_index=True)
-            
-        pivot_df.to_pickle(os.path.join(UPLOAD_DIR, "summary_data.pkl"))
-        
-        def format_pct(x):
-            if pd.isna(x) or x == '': return ''
-            try:
-                val = float(x)
-                if val > 0: return f'<span class="pct-positive">↑ {val:.1f}%</span>'
-                elif val < 0: return f'<span class="pct-negative">↓ {abs(val):.1f}%</span>'
-                return f'<span class="pct-neutral">-</span>'
-            except: return str(x)
-                
-        for c in pivot_df.columns:
-            if c not in index_cols:
-                if 'Contrib %' in c or 'Growth %' in c:
-                    pivot_df[c] = pivot_df[c].apply(format_pct)
-                else:
-                    pivot_df[c] = pivot_df[c].apply(format_indian_number)
-        
-        table_html = pivot_df.to_html(classes='excel-table', border=0, index=False, justify='left', escape=False)
-        table_html = table_html.replace('<th>TOTAL</th>', '<th class="total-col-header">TOTAL</th>')
-        table_html = table_html.replace('<td>', '<td class="number-cell">')
-
-        return jsonify({"table_html": table_html, "filter_text": filter_text, "kpi_html": kpi_html})
-        
-    except Exception as e:
-        return jsonify({"error": f"An error occurred: {str(e)}"}), 500
-
-@app.route("/download", methods=["GET"])
+@app.get("/download")
 def download():
-    summary_path = os.path.join(UPLOAD_DIR, "summary_data.pkl")
-    if not os.path.exists(summary_path): return "No data to download", 400
-    df = pd.read_pickle(summary_path)
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df.to_excel(writer, index=False, sheet_name='Dashboard_Report')
-    output.seek(0)
-    return send_file(output, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", download_name="Executive_Report.xlsx", as_attachment=True)
+    st = get_state()
+    if st is None:
+        return "No data to download", 400
+    try:
+        payload, export, code = build_view(st, request.args, want_export=True)
+    except Exception as exc:  # noqa: BLE001
+        return f"Export failed: {exc}", 500
+    if export is None:
+        return payload.get("error", "Nothing to export"), 400
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+        export.to_excel(writer, index=False, sheet_name="Dashboard_Report")
+    out.seek(0)
+    return send_file(out, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                     download_name="Executive_Report.xlsx", as_attachment=True)
 
-if __name__ == '__main__':
-    app.run(debug=True)
+
+# Static assets are served once and cached forever (version-hashed URL).
+@app.get("/assets/app.css")
+def asset_css():
+    return Response(APP_CSS, mimetype="text/css",
+                    headers={"Cache-Control": "public, max-age=31536000, immutable"})
+
+
+@app.get("/assets/app.js")
+def asset_js():
+    return Response(APP_JS, mimetype="application/javascript",
+                    headers={"Cache-Control": "public, max-age=31536000, immutable"})
+
+
+@app.context_processor
+def inject_assets():
+    return {"asset_v": ASSET_VERSION, "sprite": SPRITE}
+
+
+# ════════════════════════════════════════════════════════════════════
+#  FRONT END
+# ════════════════════════════════════════════════════════════════════
+SPRITE = """
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+<symbol id="i-chev" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></symbol>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></symbol>
+<symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 16V4m0 0L8 8m4-4l4 4M4 15v3a2 2 0 002 2h12a2 2 0 002-2v-3"/></symbol>
+<symbol id="i-share" viewBox="0 0 24 24"><path d="M12 15V3m0 0L8 7m4-4l4 4M5 12v7a2 2 0 002 2h10a2 2 0 002-2v-7"/></symbol>
+<symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/></symbol>
+<symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="9" cy="10" r="1.5"/><path d="M21 16l-5-5-8 8"/></symbol>
+<symbol id="i-sheet" viewBox="0 0 24 24"><path d="M7 3h7l5 5v11a2 2 0 01-2 2H7a2 2 0 01-2-2V5a2 2 0 012-2z"/><path d="M14 3v5h5M9 13h6M9 17h6"/></symbol>
+<symbol id="i-chart" viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M2 20h20"/></symbol>
+<symbol id="i-reset" viewBox="0 0 24 24"><path d="M3 12a9 9 0 109-9 9 9 0 00-6.4 2.6L3 8"/><path d="M3 3v5h5"/></symbol>
+</defs></svg>
+"""
+
+HEAD = """<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<link rel="stylesheet" href="/assets/app.css?v={{ asset_v }}">
+<script src="/assets/app.js?v={{ asset_v }}" defer></script>"""
+
+UPLOAD_HTML = """<!doctype html>
+<html lang="en"><head><title>Analytics Pro</title>""" + HEAD + """</head>
+<body class="upload-page">
+{{ sprite|safe }}
+<header class="nav"><span class="brand"><span class="brand-mark"></span>Analytics Pro</span></header>
+<main class="upload-wrap">
+  <h1 class="hero-title">Analytics Engine.</h1>
+  <p class="hero-sub">Upload your data to launch the business intelligence workspace.</p>
+  <form class="upload-card" action="/dashboard" method="post" enctype="multipart/form-data" id="uploadForm">
+    {% if error %}<div class="alert" role="alert">{{ error }}</div>{% endif %}
+    <label class="dropzone" id="dropzone" for="file">
+      <svg class="ic ic-lg"><use href="#i-upload"/></svg>
+      <span class="dz-title" id="dzTitle">Choose a file</span>
+      <span class="dz-sub" id="dzSub">or drag it here · .xlsx, .xls, .csv</span>
+    </label>
+    <input id="file" class="sr-only" type="file" name="file" accept=".xlsx,.xls,.csv" required>
+    <button type="submit" class="btn-primary block" id="launchBtn" disabled>Launch workspace</button>
+  </form>
+</main>
+</body></html>"""
+
+WORKSPACE_HTML = """<!doctype html>
+<html lang="en"><head><title>Intelligence Workspace</title>""" + HEAD + """</head>
+<body>
+<script>document.body.classList.add(innerWidth<=768?'mobile-mode':'desktop-mode')</script>
+{{ sprite|safe }}
+
+{% macro acc(title, badge, open=False, structural=False) %}
+<section class="acc{% if open %} open{% endif %}"{% if structural %} data-structural{% endif %}>
+  <button type="button" class="acc-head" aria-expanded="{{ 'true' if open else 'false' }}">
+    <span class="acc-title">{{ title }}</span>
+    <span class="badge" data-badge-for="{{ badge }}" hidden>0</span>
+    <svg class="ic chev"><use href="#i-chev"/></svg>
+  </button>
+  <div class="acc-panel"><div class="acc-inner"><div class="acc-body">{{ caller() }}</div></div></div>
+</section>
+{% endmacro %}
+
+{% macro checklist(name, items) %}
+{% set searchable = items|length > 7 %}
+<div class="tools{% if not searchable %} end{% endif %}">
+  {% if searchable %}<label class="search"><svg class="ic"><use href="#i-search"/></svg><input type="search" placeholder="Search" autocomplete="off" data-search="{{ name }}"></label>{% endif %}
+  <span class="tool-btns">
+    <button type="button" class="btn-micro" data-select="{{ name }}" data-on="1">All</button>
+    <button type="button" class="btn-micro" data-select="{{ name }}" data-on="0">Clear</button>
+  </span>
+</div>
+<div class="list" data-list="{{ name }}">
+  {% for it in items %}<label class="row" data-val="{{ it }}"><input type="checkbox" name="{{ name }}" value="{{ it }}"><span class="box"></span><span class="label" title="{{ it }}">{{ it }}</span></label>{% endfor %}
+</div>
+{% endmacro %}
+
+<header class="nav">
+  <div class="nav-left">
+    <button type="button" class="icon-btn only-mobile" id="sidebarToggle" aria-label="Show or hide controls" aria-expanded="true"><svg class="ic"><use href="#i-sliders"/></svg></button>
+    <span class="brand"><span class="brand-mark"></span>Analytics Pro</span>
+  </div>
+  <button type="button" class="pill-btn" id="viewToggleBtn">Desktop view</button>
+</header>
+<div id="loadbar" aria-hidden="true"></div>
+
+<div class="app">
+  <aside class="sidebar" id="appSidebar">
+    <div class="sidebar-head">
+      <div class="head-row">
+        <h2>Workspace</h2>
+        <button type="button" class="btn-text" id="resetBtn"><svg class="ic"><use href="#i-reset"/></svg>Reset</button>
+      </div>
+      <div class="sidebar-meta">{% if upload_time %}Updated {{ upload_time }}{% endif %}{% if ctx.min_date != 'N/A' %} · {{ ctx.min_date }} – {{ ctx.max_date }}{% endif %}</div>
+    </div>
+
+    <form id="config-form" class="sidebar-scroll" autocomplete="off">
+      {% call acc('Timeline', '__date', True) %}
+        {% if ctx.date %}
+        <div class="chips">
+          <button type="button" class="chip" data-preset="today">Today</button>
+          <button type="button" class="chip" data-preset="last7">7 days</button>
+          <button type="button" class="chip" data-preset="last30">30 days</button>
+          <button type="button" class="chip" data-preset="mtd">Month to date</button>
+          <button type="button" class="chip" data-preset="prev_month">Last month</button>
+          <button type="button" class="chip" data-preset="ytd">Year to date</button>
+          <button type="button" class="chip" data-preset="all">All time</button>
+        </div>
+        <div class="date-grid">
+          <div class="field"><label for="start_date">From</label><input type="date" name="start_date" id="start_date"></div>
+          <div class="field"><label for="end_date">To</label><input type="date" name="end_date" id="end_date"></div>
+        </div>
+        {% else %}<p class="muted">No date column was detected in this file.</p>{% endif %}
+      {% endcall %}
+
+      {% if ctx.spc_list %}{% call acc('SPC name', 'spc_filters') %}{{ checklist('spc_filters', ctx.spc_list) }}{% endcall %}{% endif %}
+      {% if ctx.seg_list %}{% call acc('Segment 1', 'seg1_filters') %}{{ checklist('seg1_filters', ctx.seg_list) }}{% endcall %}{% endif %}
+      {% if ctx.fam_list %}{% call acc('Family name', 'family_filters') %}{{ checklist('family_filters', ctx.fam_list) }}{% endcall %}{% endif %}
+
+      {% call acc('Row grouping', 'index_cols', True, True) %}{{ checklist('index_cols', ctx.grouping) }}{% endcall %}
+
+      {% call acc('Metrics', 'agg_funcs', True, True) %}
+        <div class="list static">
+          <label class="row"><input type="checkbox" name="agg_funcs" value="sum"><span class="box"></span><span class="label">Sum total<small>Total value per group</small></span></label>
+          <label class="row"><input type="checkbox" name="agg_funcs" value="count"><span class="box"></span><span class="label">Count<small>Number of records</small></span></label>
+          <label class="row"><input type="checkbox" name="agg_funcs" value="mean"><span class="box"></span><span class="label">Average price<small>Mean value per record</small></span></label>
+        </div>
+        <div class="list static">
+          <label class="row"><input type="checkbox" name="agg_funcs" value="contrib"><span class="box"></span><span class="label">Contribution %<small>Share of the column total</small></span></label>
+          <label class="row"><input type="checkbox" name="agg_funcs" value="growth"><span class="box"></span><span class="label">Growth %<small>Change versus the previous row</small></span></label>
+        </div>
+        <div class="list static">
+          <label class="row switch"><span class="label">Row totals<small>Add a TOTAL column</small></span><input type="checkbox" name="show_row_total" value="true" checked><span class="track"><span class="knob"></span></span></label>
+        </div>
+      {% endcall %}
+    </form>
+
+    <div class="sidebar-foot">
+      <a class="btn-tinted" href="/upload"><svg class="ic"><use href="#i-upload"/></svg>Upload new file</a>
+    </div>
+  </aside>
+
+  <div class="sidebar-resizer" id="sidebarResizer" role="separator" aria-orientation="vertical" title="Drag to resize · double-click to reset"></div>
+
+  <main class="main">
+    <div class="page-head">
+      <div>
+        <h1 class="page-title">Executive Dashboard</h1>
+        <div class="seg" role="radiogroup" aria-label="View mode">
+          <span class="seg-thumb"></span>
+          <input type="radio" id="view_dash" name="view_mode_toggle" value="dashboard" checked><label for="view_dash">Pivot</label>
+          <input type="radio" id="view_raw" name="view_mode_toggle" value="raw"><label for="view_raw">Raw data</label>
+        </div>
+      </div>
+      <div class="menu-wrap" id="exportWrap">
+        <button type="button" class="btn-primary" id="exportBtn" aria-haspopup="true" aria-expanded="false"><svg class="ic"><use href="#i-share"/></svg>Export</button>
+        <div class="menu" id="exportMenu" role="menu">
+          <button type="button" class="menu-item" id="dlImage" role="menuitem"><svg class="ic"><use href="#i-image"/></svg>Save image</button>
+          <button type="button" class="menu-item" id="dlExcel" role="menuitem"><svg class="ic"><use href="#i-sheet"/></svg>Download Excel</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="report-area">
+      <div id="kpi-banner" class="kpis" hidden></div>
+      <div id="capture-area" class="table-card">
+        <div class="table-bar" id="table-bar" hidden></div>
+        <div id="table-wrapper" class="table-scroll"></div>
+      </div>
+    </div>
+  </main>
+</div>
+<script id="filter-map" type="application/json">{{ ctx.mapping_json|safe }}</script>
+</body></html>"""
+
+APP_CSS = r"""
+:root,body.export-mode{
+  color-scheme:light;
+  --bg:#f5f5f7;--surface:rgba(255,255,255,.72);--surface-solid:#fff;--sidebar:rgba(250,250,252,.8);
+  --nav-bg:rgba(251,251,253,.8);--menu-bg:rgba(255,255,255,.86);--th-bg:rgba(250,250,252,.92);
+  --hairline:rgba(0,0,0,.09);--hairline-strong:rgba(0,0,0,.18);
+  --fill:rgba(120,120,128,.12);--fill-2:rgba(120,120,128,.07);--seg-thumb:#fff;
+  --label:#1d1d1f;--label-2:#515154;--label-3:#86868b;
+  --blue:#0071e3;--blue-h:#0077ed;--blue-a:#006edb;--blue-tint:rgba(0,113,227,.1);--total-bg:#eaf3fe;
+  --green:#34c759;--pos:#1f8a3c;--neg:#d70015;
+  --shadow-1:0 1px 2px rgba(0,0,0,.04),0 6px 20px rgba(0,0,0,.04);--shadow-2:0 16px 48px rgba(0,0,0,.16);
+}
+@media (prefers-color-scheme:dark){:root{
+  color-scheme:dark;
+  --bg:#000;--surface:rgba(28,28,30,.72);--surface-solid:#1c1c1e;--sidebar:rgba(20,20,22,.8);
+  --nav-bg:rgba(22,22,24,.8);--menu-bg:rgba(44,44,46,.86);--th-bg:rgba(34,34,36,.92);
+  --hairline:rgba(255,255,255,.12);--hairline-strong:rgba(255,255,255,.24);
+  --fill:rgba(120,120,128,.28);--fill-2:rgba(120,120,128,.14);--seg-thumb:#636366;
+  --label:#f5f5f7;--label-2:#c7c7cc;--label-3:#8e8e93;
+  --blue:#2997ff;--blue-h:#4aa8ff;--blue-a:#1a85ec;--blue-tint:rgba(41,151,255,.18);--total-bg:#10243b;
+  --green:#30d158;--pos:#32d74b;--neg:#ff453a;
+  --shadow-1:0 1px 2px rgba(0,0,0,.4),0 6px 20px rgba(0,0,0,.3);--shadow-2:0 16px 48px rgba(0,0,0,.6);
+}}
+:root{
+  --font:-apple-system,BlinkMacSystemFont,"SF Pro Display","SF Pro Text","Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  --r-md:12px;--r-lg:18px;--nav-h:52px;
+  --ease:cubic-bezier(.32,.72,0,1);--spring:cubic-bezier(.34,1.45,.64,1);
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+[hidden]{display:none!important}
+body{margin:0;font-family:var(--font);background:var(--bg);color:var(--label);-webkit-font-smoothing:antialiased;letter-spacing:-.01em;line-height:1.4}
+button,input{font:inherit;color:inherit;letter-spacing:inherit}
+button{cursor:pointer;-webkit-tap-highlight-color:transparent}
+:focus-visible{outline:3px solid color-mix(in srgb,var(--blue) 45%,transparent);outline-offset:1px}
+.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+.ic{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex:none}
+.ic-lg{width:40px;height:40px;stroke-width:1.5}
+.muted{margin:0;font-size:13px;color:var(--label-3)}
+.glass,.nav,.sidebar,.acc,.kpi,.menu,.table-bar{-webkit-backdrop-filter:saturate(180%) blur(24px);backdrop-filter:saturate(180%) blur(24px)}
+
+/* ── nav ── */
+.nav{position:fixed;inset:0 0 auto 0;height:var(--nav-h);z-index:1000;display:flex;align-items:center;justify-content:space-between;padding:0 20px;background:var(--nav-bg);border-bottom:.5px solid var(--hairline)}
+.nav-left{display:flex;align-items:center;gap:8px}
+.brand{display:flex;align-items:center;gap:10px;font-size:15px;font-weight:600;letter-spacing:-.015em}
+.brand-mark{width:22px;height:22px;border-radius:7px;background:linear-gradient(135deg,#5ac8fa,#0071e3 55%,#5e5ce6);box-shadow:inset 0 0 0 .5px rgba(255,255,255,.45),0 2px 6px rgba(0,113,227,.35)}
+.pill-btn{height:30px;padding:0 14px;border:0;border-radius:15px;background:var(--fill);font-size:12px;font-weight:500;transition:background .2s,transform .25s var(--spring)}
+.pill-btn:hover{background:var(--hairline-strong)} .pill-btn:active{transform:scale(.95)}
+.icon-btn{width:34px;height:34px;display:none;place-items:center;border:0;border-radius:10px;background:none;color:var(--blue);transition:background .2s,transform .25s var(--spring)}
+.icon-btn:hover{background:var(--blue-tint)} .icon-btn:active{transform:scale(.9)}
+#loadbar{position:fixed;top:var(--nav-h);left:0;width:100%;height:2px;z-index:999;overflow:hidden;opacity:0;transition:opacity .25s}
+#loadbar::after{content:"";position:absolute;inset:0;width:40%;background:var(--blue);border-radius:2px}
+body.loading #loadbar{opacity:1}
+body.loading #loadbar::after{animation:slide 1.1s var(--ease) infinite}
+@keyframes slide{from{transform:translateX(-100%)}to{transform:translateX(250%)}}
+
+/* ── layout ── */
+body.desktop-mode{overflow:hidden}
+.desktop-mode .app{display:flex;height:100vh;padding-top:var(--nav-h)}
+.mobile-mode .app{display:block;padding-top:var(--nav-h)}
+.sidebar{display:flex;flex-direction:column;flex:none;width:var(--sidebar-w,340px);min-width:260px;height:calc(100vh - var(--nav-h));background:var(--sidebar)}
+.sidebar-head{padding:22px 20px 12px}
+.head-row{display:flex;align-items:center;justify-content:space-between}
+.sidebar-head h2{margin:0;font-size:22px;font-weight:700;letter-spacing:-.025em;line-height:1.15}
+.sidebar-meta{margin-top:4px;font-size:12px;color:var(--label-3);min-height:16px}
+.sidebar-scroll{flex:1;overflow-y:auto;padding:4px 14px 20px;overscroll-behavior:contain;scrollbar-gutter:stable}
+.sidebar-foot{padding:12px 14px calc(12px + env(safe-area-inset-bottom));border-top:.5px solid var(--hairline)}
+.sidebar-resizer{position:relative;flex:none;width:1px;background:var(--hairline);cursor:col-resize;transition:background .2s,box-shadow .2s}
+.sidebar-resizer::before{content:"";position:absolute;inset:0 -4px}
+.sidebar-resizer:hover,.sidebar-resizer.resizing{background:var(--blue);box-shadow:0 0 0 1px var(--blue)}
+.main{flex:1;min-width:0;height:calc(100vh - var(--nav-h));overflow-y:auto;padding:28px 36px 40px}
+.page-head{display:flex;align-items:flex-end;justify-content:space-between;flex-wrap:wrap;gap:16px;margin-bottom:20px}
+.page-title{margin:0 0 14px;font-size:32px;font-weight:700;letter-spacing:-.03em;line-height:1.1}
+
+/* ── accordion ── */
+.acc{margin-bottom:10px;border-radius:var(--r-md);background:var(--surface);box-shadow:0 0 0 .5px var(--hairline),var(--shadow-1);overflow:hidden;transition:opacity .3s,filter .3s}
+.acc.is-disabled{opacity:.4;filter:saturate(.3);pointer-events:none}
+.acc-head{display:flex;align-items:center;gap:8px;width:100%;padding:13px 14px;border:0;background:none;text-align:left;font-size:13px;font-weight:600;transition:background .2s}
+.acc-head:hover{background:var(--fill-2)}
+.acc-title{flex:1}
+.chev{width:14px;height:14px;color:var(--label-3);transition:transform .4s var(--ease)}
+.acc.open .chev{transform:rotate(90deg)}
+.acc-panel{display:grid;grid-template-rows:0fr;transition:grid-template-rows .45s var(--ease)}
+.acc.open .acc-panel{grid-template-rows:1fr}
+.acc-inner{min-height:0;overflow:hidden;visibility:hidden;opacity:0;transition:opacity .3s,visibility 0s .45s}
+.acc.open .acc-inner{visibility:visible;opacity:1;transition:opacity .35s .08s,visibility 0s}
+.acc-body{padding:2px 12px 12px}
+.badge{min-width:20px;height:20px;padding:0 6px;display:grid;place-items:center;border-radius:10px;background:var(--blue);color:#fff;font-size:11px;font-weight:600;animation:pop .35s var(--spring)}
+@keyframes pop{from{transform:scale(.4);opacity:0}to{transform:none;opacity:1}}
+
+/* ── lists, checks, switch ── */
+.tools{display:flex;align-items:center;gap:8px;margin:0 0 10px}
+.tools.end{justify-content:flex-end}
+.tool-btns{display:flex;gap:6px}
+.search{position:relative;flex:1;min-width:0}
+.search .ic{position:absolute;left:9px;top:50%;width:14px;height:14px;transform:translateY(-50%);color:var(--label-3)}
+.search input{width:100%;height:30px;padding:0 10px 0 28px;border:0;border-radius:8px;background:var(--fill);font-size:13px;transition:background .2s,box-shadow .2s}
+.search input:focus{outline:0;background:var(--surface-solid);box-shadow:0 0 0 3px color-mix(in srgb,var(--blue) 35%,transparent)}
+.btn-micro{height:26px;padding:0 11px;border:0;border-radius:13px;background:var(--blue-tint);color:var(--blue);font-size:12px;font-weight:500;transition:background .2s,transform .25s var(--spring)}
+.btn-micro:hover{background:color-mix(in srgb,var(--blue) 20%,transparent)} .btn-micro:active{transform:scale(.93)}
+.list{max-height:200px;overflow-y:auto;border-radius:10px;background:var(--surface-solid);box-shadow:0 0 0 .5px var(--hairline)}
+.list.static{max-height:none;overflow:visible}
+.list+.list{margin-top:10px}
+.row{position:relative;display:flex;align-items:center;gap:11px;min-height:40px;padding:9px 12px;font-size:13px;cursor:pointer;transition:background .15s}
+.row+.row::before{content:"";position:absolute;top:0;left:43px;right:0;height:.5px;background:var(--hairline)}
+.row:hover{background:var(--fill-2)} .row:active{background:var(--fill)}
+.row[data-casc="1"],.row[data-srch="1"]{display:none}
+.row .label{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.row small{display:block;margin-top:1px;font-size:11px;color:var(--label-3);white-space:normal}
+.row input{position:absolute;opacity:0;pointer-events:none}
+.box{flex:none;width:20px;height:20px;display:grid;place-items:center;border-radius:50%;border:1.5px solid color-mix(in srgb,var(--label-3) 75%,transparent);transition:background .25s var(--ease),border-color .25s,transform .3s var(--spring)}
+.box::after{content:"";width:9px;height:5px;margin-top:-2px;border:2px solid #fff;border-top:0;border-right:0;transform:rotate(-45deg) scale(0);transition:transform .35s var(--spring)}
+.row input:checked+.box{background:var(--blue);border-color:var(--blue)}
+.row input:checked+.box::after{transform:rotate(-45deg) scale(1)}
+.row input:focus-visible+.box{outline:3px solid color-mix(in srgb,var(--blue) 45%,transparent);outline-offset:1px}
+.row:active .box{transform:scale(.86)}
+.switch .track{position:relative;flex:none;width:44px;height:26px;border-radius:13px;background:var(--fill);transition:background .3s var(--ease)}
+.switch .knob{position:absolute;top:2px;left:2px;width:22px;height:22px;border-radius:50%;background:#fff;box-shadow:0 2px 5px rgba(0,0,0,.28);transition:transform .4s var(--spring),width .2s}
+.switch input:checked+.track{background:var(--green)}
+.switch input:checked+.track .knob{transform:translateX(18px)}
+.switch:active .knob{width:27px}
+.switch:active input:checked+.track .knob{transform:translateX(13px)}
+.switch input:focus-visible+.track{outline:3px solid color-mix(in srgb,var(--blue) 45%,transparent);outline-offset:2px}
+.switch::before{display:none}
+
+/* ── timeline ── */
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:14px}
+.chip{height:28px;padding:0 12px;border:0;border-radius:14px;background:var(--fill);font-size:12px;font-weight:500;transition:background .2s,color .2s,transform .3s var(--spring)}
+.chip:hover{background:var(--blue-tint);color:var(--blue)} .chip:active{transform:scale(.94)}
+.chip.active{background:var(--blue);color:#fff}
+.date-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.field label{display:block;margin:0 0 4px 2px;font-size:11px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--label-3)}
+.field input{width:100%;height:36px;padding:0 8px;border:0;border-radius:9px;background:var(--surface-solid);box-shadow:0 0 0 .5px var(--hairline);font-size:13px;transition:box-shadow .2s}
+.field input:focus{outline:0;box-shadow:0 0 0 3px color-mix(in srgb,var(--blue) 40%,transparent)}
+
+/* ── buttons ── */
+.btn-primary{display:inline-flex;align-items:center;justify-content:center;gap:8px;height:40px;padding:0 20px;border:0;border-radius:980px;background:var(--blue);color:#fff;font-size:14px;font-weight:500;text-decoration:none;transition:background .2s,transform .3s var(--spring),box-shadow .2s}
+.btn-primary:hover{background:var(--blue-h);box-shadow:0 4px 14px color-mix(in srgb,var(--blue) 35%,transparent)}
+.btn-primary:active{background:var(--blue-a);transform:scale(.96)}
+.btn-primary:disabled{opacity:.35;cursor:not-allowed;box-shadow:none;transform:none}
+.btn-primary.block{width:100%}
+.btn-primary.busy{pointer-events:none;opacity:.7}
+.btn-tinted{display:flex;align-items:center;justify-content:center;gap:8px;height:38px;border-radius:10px;background:var(--fill);color:var(--label);font-size:13px;font-weight:500;text-decoration:none;transition:background .2s,transform .3s var(--spring)}
+.btn-tinted:hover{background:var(--hairline-strong)} .btn-tinted:active{transform:scale(.97)}
+.btn-text{display:inline-flex;align-items:center;gap:5px;padding:5px 8px;border:0;border-radius:8px;background:none;color:var(--blue);font-size:13px;font-weight:500;transition:background .2s,transform .25s var(--spring)}
+.btn-text:hover{background:var(--blue-tint)} .btn-text:active{transform:scale(.95)}
+.btn-text .ic{width:14px;height:14px}
+
+/* ── segmented control ── */
+.seg{position:relative;display:inline-grid;grid-auto-flow:column;grid-auto-columns:1fr;padding:2px;border-radius:10px;background:var(--fill);isolation:isolate}
+.seg-thumb{position:absolute;z-index:-1;top:2px;bottom:2px;left:2px;width:calc(50% - 2px);border-radius:8px;background:var(--seg-thumb);box-shadow:0 3px 8px rgba(0,0,0,.12),0 1px 1px rgba(0,0,0,.08);transition:transform .4s var(--ease)}
+.seg:has(#view_raw:checked) .seg-thumb{transform:translateX(100%)}
+.seg input{position:absolute;opacity:0;pointer-events:none}
+.seg label{padding:6px 20px;border-radius:8px;text-align:center;font-size:13px;font-weight:500;color:var(--label-2);cursor:pointer;white-space:nowrap;transition:color .25s}
+.seg input:checked+label{color:var(--label)}
+.seg input:focus-visible+label{outline:3px solid color-mix(in srgb,var(--blue) 45%,transparent)}
+
+/* ── export menu ── */
+.menu-wrap{position:relative}
+.menu{position:absolute;right:0;top:calc(100% + 8px);z-index:50;min-width:210px;padding:6px;border-radius:14px;background:var(--menu-bg);box-shadow:0 0 0 .5px var(--hairline),var(--shadow-2);transform-origin:top right;opacity:0;visibility:hidden;pointer-events:none;transform:scale(.9) translateY(-6px);transition:opacity .2s,transform .35s var(--spring),visibility 0s .35s}
+.menu.show{opacity:1;visibility:visible;pointer-events:auto;transform:none;transition-delay:0s}
+.menu-item{display:flex;align-items:center;gap:10px;width:100%;padding:9px 10px;border:0;border-radius:8px;background:none;font-size:13px;text-align:left;transition:background .15s,color .15s}
+.menu-item:hover{background:var(--blue);color:#fff}
+.menu-item:disabled{opacity:.4;pointer-events:none}
+
+/* ── KPIs + table ── */
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-bottom:16px}
+.kpi{padding:16px 18px;border-radius:var(--r-lg);background:var(--surface);box-shadow:0 0 0 .5px var(--hairline),var(--shadow-1)}
+.kpi-label{margin-bottom:6px;font-size:12px;font-weight:500;color:var(--label-3)}
+.kpi-val{font-size:28px;font-weight:700;letter-spacing:-.03em;line-height:1.1;font-variant-numeric:tabular-nums}
+.table-card{display:flex;flex-direction:column;overflow:hidden;border-radius:var(--r-lg);background:var(--surface-solid);box-shadow:0 0 0 .5px var(--hairline),var(--shadow-1)}
+.table-bar{display:flex;justify-content:space-between;gap:16px;padding:12px 18px;font-size:12px;color:var(--label-2);background:var(--surface);border-bottom:.5px solid var(--hairline)}
+.table-bar b{margin-right:2px;font-weight:600;color:var(--label)}
+.table-bar span:last-child{flex:none;color:var(--label-3)}
+.table-scroll{max-height:calc(100vh - 320px);overflow:auto;-webkit-overflow-scrolling:touch;transition:opacity .25s}
+.table-card.updating .table-scroll{opacity:.55}
+.excel-table{width:max-content;min-width:100%;border-collapse:separate;border-spacing:0;font-size:13px;font-variant-numeric:tabular-nums}
+.excel-table th,.excel-table td{padding:11px 18px;border-bottom:.5px solid var(--hairline);text-align:left;white-space:nowrap}
+.excel-table .num{text-align:right}
+.excel-table th{position:sticky;top:0;z-index:2;background:var(--th-bg);-webkit-backdrop-filter:blur(16px);backdrop-filter:blur(16px);font-size:11px;font-weight:600;letter-spacing:.05em;text-transform:uppercase;color:var(--label-2);user-select:none}
+.excel-table tbody tr{transition:background .15s}
+.excel-table tbody tr:hover td{background:var(--blue-tint)}
+.excel-table th.total-col{color:var(--blue)}
+.excel-table td.total-col{font-weight:600;border-left:.5px solid var(--hairline);background:color-mix(in srgb,var(--blue) 5%,transparent)}
+.pivot tbody tr:last-child td{position:sticky;bottom:0;z-index:1;border-top:1px solid var(--hairline-strong);border-bottom:0;background:var(--total-bg);color:var(--label);font-weight:700}
+.pct-positive{color:var(--pos);font-weight:600}.pct-negative{color:var(--neg);font-weight:600}.pct-neutral{color:var(--label-3)}
+.resizer{position:absolute;top:0;right:0;bottom:0;width:10px;cursor:col-resize;touch-action:none}
+.resizer::after{content:"";position:absolute;right:4px;top:28%;bottom:28%;width:1px;background:var(--hairline-strong);transition:background .2s,width .2s}
+.resizer:hover::after{background:var(--blue);width:2px}
+.empty{display:grid;justify-items:center;gap:6px;padding:90px 24px;text-align:center;color:var(--label-3)}
+.empty .ic{width:44px;height:44px;stroke-width:1.4;opacity:.7}
+.empty h3{margin:10px 0 0;font-size:19px;font-weight:600;letter-spacing:-.02em;color:var(--label)}
+.empty p{max-width:340px;margin:0;font-size:14px}
+.empty.err h3{color:var(--neg)}
+
+/* ── export mode (flat, white, print-safe) ── */
+body.export-mode *{-webkit-backdrop-filter:none!important;backdrop-filter:none!important;box-shadow:none!important;animation:none!important}
+body.export-mode #report-area{padding:24px;background:#fff}
+body.export-mode .table-card{border:1px solid #d1d1d6}
+
+/* ── upload page ── */
+.upload-wrap{max-width:520px;margin:0 auto;padding:calc(var(--nav-h) + 72px) 20px 48px;animation:rise .6s var(--ease) both}
+.hero-title{margin:0 0 10px;text-align:center;font-size:clamp(34px,7vw,56px);font-weight:700;letter-spacing:-.035em;line-height:1.05}
+.hero-sub{margin:0 0 32px;text-align:center;font-size:17px;color:var(--label-3)}
+.upload-card{display:grid;gap:16px;padding:28px;border-radius:26px;background:var(--surface);box-shadow:0 0 0 .5px var(--hairline),var(--shadow-1);-webkit-backdrop-filter:blur(24px);backdrop-filter:blur(24px)}
+.dropzone{display:grid;justify-items:center;gap:6px;padding:38px 20px;border:1.5px dashed var(--hairline-strong);border-radius:18px;background:var(--fill-2);color:var(--label-3);text-align:center;cursor:pointer;transition:border-color .3s var(--ease),background .3s,transform .4s var(--spring)}
+.dropzone:hover{border-color:var(--blue);color:var(--blue)}
+.dropzone.drag{border-color:var(--blue);background:var(--blue-tint);color:var(--blue);transform:scale(1.015)}
+.dropzone.has-file{border-style:solid;border-color:var(--blue);background:var(--blue-tint);color:var(--blue)}
+.dz-title{margin-top:6px;font-size:17px;font-weight:600;color:var(--label);word-break:break-all}
+.dz-sub{font-size:13px}
+.alert{padding:12px 14px;border-radius:12px;background:color-mix(in srgb,var(--neg) 12%,transparent);color:var(--neg);font-size:13px;font-weight:500}
+@keyframes rise{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
+
+/* ── toast + mobile preview ── */
+.toast{position:fixed;left:50%;bottom:28px;z-index:3000;padding:11px 18px;border-radius:980px;background:rgba(40,40,44,.92);color:#fff;font-size:13px;font-weight:500;transform:translate(-50%,16px);opacity:0;transition:opacity .3s,transform .4s var(--spring)}
+.toast.in{opacity:1;transform:translate(-50%,0)}
+.preview-modal{position:fixed;inset:0;z-index:5000;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;padding:20px;background:rgba(0,0,0,.92);animation:fade .25s}
+.preview-modal img{max-width:92%;max-height:68%;border-radius:12px;box-shadow:0 10px 30px rgba(0,0,0,.5)}
+.preview-modal p{margin:0;color:#fff;font-size:14px}
+.preview-modal .btn-primary{background:#fff;color:#1d1d1f}
+@keyframes fade{from{opacity:0}to{opacity:1}}
+
+/* ── mobile mode ── */
+.only-mobile{display:none}
+.mobile-mode .only-mobile{display:grid}
+.mobile-mode .sidebar{width:100%;min-width:0;height:auto;max-height:4000px;overflow:hidden;border-bottom:.5px solid var(--hairline);transition:max-height .55s var(--ease),opacity .3s,visibility 0s}
+.mobile-mode.sidebar-collapsed .sidebar{max-height:0;opacity:0;visibility:hidden;border:0;transition:max-height .5s var(--ease),opacity .3s,visibility 0s .5s}
+.mobile-mode .sidebar-scroll{overflow:visible}
+.mobile-mode .sidebar-resizer{display:none}
+.mobile-mode .main{height:auto;overflow:visible;padding:20px 16px 36px}
+.mobile-mode .page-title{font-size:28px}
+.mobile-mode .table-scroll{max-height:70vh}
+.mobile-mode .page-head{align-items:stretch;flex-direction:column}
+.mobile-mode .menu-wrap .btn-primary{width:100%}
+.mobile-mode .menu{left:0;right:0;transform-origin:top center}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--hairline-strong);border-radius:8px;border:2px solid transparent;background-clip:content-box}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{transition-duration:.01ms!important;animation-duration:.01ms!important}}
+"""
+
+APP_JS = r"""
+(() => {
+'use strict';
+const $ = (s, r = document) => r.querySelector(s);
+const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
+const root = document.documentElement, body = document.body;
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const store = {
+  get(k){ try { return localStorage.getItem(k); } catch (e) { return null; } },
+  set(k, v){ try { localStorage.setItem(k, v); } catch (e) {} }
+};
+function toast(msg){
+  const t = document.createElement('div');
+  t.className = 'toast'; t.textContent = msg; body.appendChild(t);
+  requestAnimationFrame(() => t.classList.add('in'));
+  setTimeout(() => { t.classList.remove('in'); setTimeout(() => t.remove(), 400); }, 3200);
+}
+
+/* ── upload page ── */
+const dz = $('#dropzone');
+if (dz) {
+  const input = $('#file'), title = $('#dzTitle'), sub = $('#dzSub'), btn = $('#launchBtn');
+  const size = n => n > 1048576 ? (n / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(n / 1024)) + ' KB';
+  const sync = () => {
+    const f = input.files[0];
+    dz.classList.toggle('has-file', !!f);
+    title.textContent = f ? f.name : 'Choose a file';
+    sub.textContent = f ? size(f.size) + ' · ready to launch' : 'or drag it here · .xlsx, .xls, .csv';
+    btn.disabled = !f;
+  };
+  input.addEventListener('change', sync);
+  ['dragenter', 'dragover'].forEach(ev => dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.add('drag'); }));
+  ['dragleave', 'drop'].forEach(ev => dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.remove('drag'); }));
+  dz.addEventListener('drop', e => { if (e.dataTransfer.files.length) { input.files = e.dataTransfer.files; sync(); } });
+  $('#uploadForm').addEventListener('submit', () => { btn.classList.add('busy'); btn.textContent = 'Uploading…'; });
+}
+
+/* ── shared chrome (workspace) ── */
+const form = $('#config-form');
+if (!form) return;
+
+const viewBtn = $('#viewToggleBtn');
+const labelView = () => { viewBtn.textContent = body.classList.contains('mobile-mode') ? 'Mobile view' : 'Desktop view'; };
+viewBtn.addEventListener('click', () => {
+  const m = body.classList.contains('mobile-mode');
+  body.classList.toggle('mobile-mode', !m); body.classList.toggle('desktop-mode', m); labelView();
+});
+labelView();
+$('#sidebarToggle').addEventListener('click', e => {
+  const c = body.classList.toggle('sidebar-collapsed');
+  e.currentTarget.setAttribute('aria-expanded', String(!c));
+});
+
+const menu = $('#exportMenu'), exportBtn = $('#exportBtn'), dlExcel = $('#dlExcel');
+const setMenu = open => { menu.classList.toggle('show', open); exportBtn.setAttribute('aria-expanded', String(open)); };
+exportBtn.addEventListener('click', e => { e.stopPropagation(); setMenu(!menu.classList.contains('show')); });
+document.addEventListener('click', e => { if (!menu.contains(e.target)) setMenu(false); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') setMenu(false); });
+
+/* sidebar resizer (pointer events: mouse + touch + pen) */
+const rz = $('#sidebarResizer');
+const savedW = store.get('ap-sidebar-w');
+if (savedW) root.style.setProperty('--sidebar-w', savedW + 'px');
+rz.addEventListener('pointerdown', e => {
+  rz.setPointerCapture(e.pointerId); rz.classList.add('resizing');
+  body.style.cursor = 'col-resize'; body.style.userSelect = 'none';
+});
+rz.addEventListener('pointermove', e => {
+  if (!rz.hasPointerCapture(e.pointerId)) return;
+  root.style.setProperty('--sidebar-w', Math.min(560, Math.max(260, e.clientX)) + 'px');
+});
+const endResize = () => {
+  rz.classList.remove('resizing'); body.style.cursor = ''; body.style.userSelect = '';
+  const w = parseInt(getComputedStyle(root).getPropertyValue('--sidebar-w'), 10);
+  if (w) store.set('ap-sidebar-w', w);
+};
+rz.addEventListener('pointerup', endResize);
+rz.addEventListener('pointercancel', endResize);
+rz.addEventListener('dblclick', () => { root.style.removeProperty('--sidebar-w'); store.set('ap-sidebar-w', ''); });
+
+/* ── workspace state ── */
+const filterMap = JSON.parse($('#filter-map').textContent || '[]');
+const tableWrap = $('#table-wrapper'), card = $('#capture-area'), bar = $('#table-bar'), kpi = $('#kpi-banner');
+const EMPTY_ICON = '<svg class="ic"><use href="#i-chart"/></svg>';
+const emptyBlock = (t, m, err) => `<div class="empty${err ? ' err' : ''}">${EMPTY_ICON}<h3>${esc(t)}</h3><p>${m}</p></div>`;
+const PROMPT = emptyBlock('Build your view', 'Pick at least one <b>row grouping</b> and one <b>metric</b> in the sidebar to compile your report.');
+let ctrl = null, timer = null, lastParams = null;
+
+const checked = name => $$(`input[name="${name}"]:checked`);
+const isShown = r => r.dataset.casc !== '1' && r.dataset.srch !== '1';
+
+function updateBadges(){
+  const sd = $('#start_date'), ed = $('#end_date');
+  $$('[data-badge-for]').forEach(b => {
+    const k = b.dataset.badgeFor;
+    const n = k === '__date' ? ((sd && sd.value) || (ed && ed.value) ? 1 : 0) : checked(k).length;
+    const was = b.textContent;
+    b.hidden = n === 0;
+    b.textContent = n;
+    if (n && was !== String(n)) { b.style.animation = 'none'; void b.offsetWidth; b.style.animation = ''; }
+  });
+}
+
+function schedule(delay = 90){ clearTimeout(timer); timer = setTimeout(update, delay); }
+
+async function update(){
+  const fd = new FormData(form);
+  const mode = $('input[name="view_mode_toggle"]:checked').value;
+  fd.append('view_mode', mode);
+  $$('[data-structural]').forEach(el => el.classList.toggle('is-disabled', mode === 'raw'));
+  updateBadges();
+
+  if (mode === 'dashboard' && (!fd.getAll('index_cols').length || !fd.getAll('agg_funcs').length)) {
+    if (ctrl) ctrl.abort();
+    body.classList.remove('loading'); card.classList.remove('updating');
+    kpi.hidden = true; bar.hidden = true; tableWrap.innerHTML = PROMPT;
+    lastParams = null; dlExcel.disabled = true;
+    return;
+  }
+
+  if (ctrl) ctrl.abort();
+  const mine = ctrl = new AbortController();
+  body.classList.add('loading'); card.classList.add('updating');
+  try {
+    const res = await fetch('/calculate', { method: 'POST', body: fd, signal: mine.signal });
+    const d = await res.json();
+    if (res.ok) {
+      kpi.innerHTML = d.kpi_html || ''; kpi.hidden = !d.kpi_html;
+      bar.innerHTML = `<span>${d.filter_text}</span><span>${esc(d.status || '')}</span>`; bar.hidden = false;
+      tableWrap.innerHTML = d.table_html;
+      addResizers();
+      lastParams = new URLSearchParams(fd).toString();
+      dlExcel.disabled = false;
+    } else {
+      kpi.hidden = true; bar.hidden = true;
+      tableWrap.innerHTML = emptyBlock('Something went wrong', esc(d.error || 'Unknown error'), true);
+      lastParams = null; dlExcel.disabled = true;
+    }
+  } catch (err) {
+    if (err.name === 'AbortError') return;
+    tableWrap.innerHTML = emptyBlock('Connection problem', 'Could not reach the server. Please try again.', true);
+  } finally {
+    if (mine === ctrl) { body.classList.remove('loading'); card.classList.remove('updating'); }
+  }
+}
+
+/* cascading filters: SPC → SEG1 → Family */
+function cascade(){
+  const spc = new Set(checked('spc_filters').map(i => i.value));
+  const apply = (name, valid) => {
+    $$('.row', $(`[data-list="${name}"]`) || document.createElement('div')).forEach(r => {
+      const hide = !valid.has(r.dataset.val);
+      r.dataset.casc = hide ? '1' : '0';
+      if (hide) r.querySelector('input').checked = false;
+    });
+  };
+  apply('seg1_filters', new Set(filterMap.filter(r => !spc.size || spc.has(r.spc)).map(r => r.seg)));
+  const seg = new Set(checked('seg1_filters').map(i => i.value));
+  apply('family_filters', new Set(filterMap.filter(r => (!spc.size || spc.has(r.spc)) && (!seg.size || seg.has(r.seg))).map(r => r.fam)));
+}
+
+/* delegated events */
+form.addEventListener('submit', e => e.preventDefault());
+form.addEventListener('change', e => {
+  const t = e.target;
+  if (t.type === 'date') $$('.chip').forEach(c => c.classList.remove('active'));
+  if (t.name === 'spc_filters' || t.name === 'seg1_filters') cascade();
+  schedule();
+});
+form.addEventListener('input', e => {
+  const q = e.target.dataset && e.target.dataset.search;
+  if (!q) return;
+  const needle = e.target.value.trim().toLowerCase();
+  $$('.row', $(`[data-list="${q}"]`)).forEach(r => { r.dataset.srch = r.dataset.val.toLowerCase().includes(needle) ? '0' : '1'; });
+});
+form.addEventListener('click', e => {
+  const head = e.target.closest('.acc-head');
+  if (head) {
+    const open = head.parentElement.classList.toggle('open');
+    head.setAttribute('aria-expanded', String(open));
+    return;
+  }
+  const sel = e.target.closest('[data-select]');
+  if (sel) {
+    const on = sel.dataset.on === '1', name = sel.dataset.select;
+    $$(`input[name="${name}"]`).forEach(i => { if (!on || isShown(i.closest('.row'))) i.checked = on; });
+    if (name === 'spc_filters' || name === 'seg1_filters') cascade();
+    schedule(0);
+    return;
+  }
+  const chip = e.target.closest('.chip');
+  if (chip) preset(chip.dataset.preset, chip);
+});
+$$('input[name="view_mode_toggle"]').forEach(r => r.addEventListener('change', () => schedule(0)));
+
+/* date presets */
+const iso = d => new Date(d.getTime() - d.getTimezoneOffset() * 6e4).toISOString().slice(0, 10);
+function preset(key, chip){
+  $$('.chip').forEach(c => c.classList.toggle('active', c === chip && key !== 'all'));
+  const t = new Date(); let s = new Date(), e = new Date();
+  if (key === 'last7') s.setDate(t.getDate() - 6);
+  else if (key === 'last30') s.setDate(t.getDate() - 29);
+  else if (key === 'mtd') s = new Date(t.getFullYear(), t.getMonth(), 1);
+  else if (key === 'prev_month') { s = new Date(t.getFullYear(), t.getMonth() - 1, 1); e = new Date(t.getFullYear(), t.getMonth(), 0); }
+  else if (key === 'ytd') s = new Date(t.getFullYear(), 0, 1);
+  $('#start_date').value = key === 'all' ? '' : iso(s);
+  $('#end_date').value = key === 'all' ? '' : iso(e);
+  schedule(0);
+}
+
+/* reset */
+$('#resetBtn').addEventListener('click', () => {
+  form.reset();
+  $$('.chip').forEach(c => c.classList.remove('active'));
+  $$('.row').forEach(r => { delete r.dataset.casc; delete r.dataset.srch; });
+  $('#view_dash').checked = true;
+  schedule(0);
+});
+
+/* column resizing */
+function addResizers(){
+  $$('.excel-table th', tableWrap).forEach(th => {
+    if (!th.querySelector('.resizer')) th.appendChild(Object.assign(document.createElement('div'), { className: 'resizer' }));
+  });
+}
+tableWrap.addEventListener('pointerdown', e => {
+  const h = e.target.closest('.resizer');
+  if (!h) return;
+  const th = h.parentElement, sx = e.clientX, sw = th.offsetWidth;
+  h.setPointerCapture(e.pointerId);
+  const move = ev => { th.style.width = th.style.minWidth = Math.max(60, sw + ev.clientX - sx) + 'px'; };
+  const up = () => { h.removeEventListener('pointermove', move); h.removeEventListener('pointerup', up); };
+  h.addEventListener('pointermove', move); h.addEventListener('pointerup', up);
+  e.preventDefault(); e.stopPropagation();
+});
+
+/* export: Excel (server recomputes from the same params, so it is always in sync) */
+dlExcel.addEventListener('click', () => { setMenu(false); if (lastParams) location.href = '/download?' + lastParams; });
+
+/* export: image (library is lazy-loaded on first use) */
+let d2i = null;
+const loadD2I = () => d2i || (d2i = new Promise((ok, fail) => {
+  const s = document.createElement('script');
+  s.src = 'https://cdnjs.cloudflare.com/ajax/libs/dom-to-image/2.6.0/dom-to-image.min.js';
+  s.onload = ok; s.onerror = () => { d2i = null; fail(new Error('load')); };
+  document.head.appendChild(s);
+}));
+$('#dlImage').addEventListener('click', async () => {
+  setMenu(false);
+  const area = $('#report-area');
+  const prev = [tableWrap.style.maxHeight, tableWrap.style.overflow];
+  try {
+    await loadD2I();
+    tableWrap.style.maxHeight = 'none'; tableWrap.style.overflow = 'visible';
+    body.classList.add('export-mode');
+    await new Promise(r => setTimeout(r, 350));
+    const url = await domtoimage.toPng(area, { bgcolor: '#ffffff', cacheBust: true });
+    if (/Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)) {
+      const m = document.createElement('div'); m.className = 'preview-modal';
+      m.innerHTML = '<button class="btn-primary" type="button">Close preview</button><p>Press and hold the image to save it to Photos.</p><img alt="Report">';
+      m.querySelector('img').src = url;
+      m.querySelector('button').onclick = () => m.remove();
+      body.appendChild(m);
+    } else {
+      const a = document.createElement('a'); a.download = 'Executive_Report.png'; a.href = url; a.click();
+    }
+  } catch (err) {
+    console.error(err); toast('Could not export the image. Please try again.');
+  } finally {
+    tableWrap.style.maxHeight = prev[0]; tableWrap.style.overflow = prev[1];
+    body.classList.remove('export-mode');
+  }
+});
+
+updateBadges();
+update();
+})();
+"""
+
+ASSET_VERSION = hashlib.md5((APP_CSS + APP_JS).encode()).hexdigest()[:8]
+
+if __name__ == "__main__":
+    app.run(debug=os.environ.get("FLASK_DEBUG", "1") == "1")
