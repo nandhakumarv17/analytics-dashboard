@@ -52,7 +52,7 @@ GLOBAL_HEAD = """
     .checkbox-group { background: rgba(120,120,128,0.05); border: 1px solid var(--glass-border); border-radius: 12px; padding: 8px; max-height: 220px; overflow-y: auto; }
     .checkbox-item { display: flex; align-items: center; padding: 8px 10px; font-size: 13px; cursor: pointer; border-radius: 8px; font-weight: 500; }
     .checkbox-item:hover { background: rgba(120,120,128,0.1); }
-    .checkbox-item input[type="checkbox"]:not(.ios-switch) { margin-right: 10px; accent-color: var(--blue-apple); width: 16px; height: 16px; }
+    .checkbox-item input[type="checkbox"]:not(.ios-switch), .checkbox-item input[type="radio"] { margin-right: 10px; accent-color: var(--blue-apple); width: 16px; height: 16px; }
     .drag-handle { margin-right: 10px; cursor: grab; color: var(--text-secondary); opacity: 0.7; font-size: 16px; }
     
     .btn-segmented { display: flex; background: rgba(120,120,128,0.1); border-radius: 12px; padding: 4px; gap: 4px; }
@@ -86,6 +86,10 @@ GLOBAL_HEAD = """
     input:checked + .switch { background: var(--green); }
     input:checked + .switch::after { transform: translateX(20px); }
     input.ios-switch { display: none; }
+    
+    .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+    .chip { padding: 6px 10px; border-radius: 8px; background: rgba(120,120,128,0.1); font-size: 11px; font-weight: 600; cursor: pointer; transition: 0.2s; border: none; color: var(--text-primary); }
+    .chip.active { background: var(--blue-apple); color: #fff; }
 </style>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Sortable/1.15.0/Sortable.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/dom-to-image/2.6.0/dom-to-image.min.js"></script>
@@ -144,6 +148,12 @@ WORKSPACE_HTML = """
                 </div>
                 
                 <div class="section-title">Timeline & Periods</div>
+                <div class="chips">
+                    <button type="button" class="chip" onclick="preset('mtd', this)">MTD</button>
+                    <button type="button" class="chip" onclick="preset('ytd', this)">YTD</button>
+                    <button type="button" class="chip" onclick="preset('last7', this)">Last 7 Days</button>
+                    <button type="button" class="chip" onclick="preset('all', this)">Max Date</button>
+                </div>
                 <div style="display:flex; gap:8px;">
                     <div style="flex:1;">
                         <label style="font-size:10px; color:var(--text-secondary);">FROM</label>
@@ -180,8 +190,16 @@ WORKSPACE_HTML = """
                     </div>
 
                     <div class="section-title">Metrics & Configuration</div>
+                    <label style="font-size: 10px; color: var(--text-secondary); margin-bottom: 4px; display:block;">VALUE FIELD</label>
+                    <div class="checkbox-group" style="margin-bottom: 12px; max-height: 120px;">
+                        {% for col in num_cols %}
+                        <label class="checkbox-item"><input type="radio" name="value_col" value="{{ col }}" {% if col == 'Tentative DP' or loop.first %}checked{% endif %}> <span>{{ col }}</span></label>
+                        {% endfor %}
+                    </div>
+                    
+                    <label style="font-size: 10px; color: var(--text-secondary); margin-bottom: 4px; display:block;">AGGREGATION</label>
                     <div class="checkbox-group">
-                        <label class="checkbox-item"><input type="checkbox" name="agg_funcs" value="sum" checked> <span>Sum Total (₹)</span></label>
+                        <label class="checkbox-item"><input type="checkbox" name="agg_funcs" value="sum" checked> <span>Sum Total</span></label>
                         <label class="checkbox-item"><input type="checkbox" name="agg_funcs" value="count"> <span>Count (Qty)</span></label>
                         <div style="height: 1px; background: var(--glass-border); margin: 4px 0;"></div>
                         
@@ -224,7 +242,6 @@ WORKSPACE_HTML = """
     </div>
 
     <script>
-        // Update segmented toggle background slider
         document.querySelectorAll('input[name="view_mode_toggle"]').forEach(radio => {
             radio.addEventListener('change', function() {
                 const thumb = document.querySelector('.seg-thumb');
@@ -240,12 +257,10 @@ WORKSPACE_HTML = """
             }
         }
 
-        // Initialize drag and drop for hierarchy
         document.querySelectorAll('.sortable-list').forEach(el => {
             new Sortable(el, { handle: '.drag-handle', animation: 150, onEnd: updateDashboard });
         });
         
-        // Highlight active week buttons
         document.querySelectorAll('input[name="week_num"]').forEach(cb => {
             cb.addEventListener('change', function() {
                 if(this.checked) { this.parentElement.style.background = 'var(--blue-apple)'; this.parentElement.style.color = '#fff'; }
@@ -253,10 +268,26 @@ WORKSPACE_HTML = """
             });
         });
 
-        function checkValue(name, val) {
-            document.querySelectorAll(`input[name="${name}"]`).forEach(cb => {
-                if(cb.value === val || cb.value === val.replace('BA Name', 'SPC Name')) cb.checked = true;
-            });
+        const iso = d => new Date(d.getTime() - d.getTimezoneOffset() * 6e4).toISOString().slice(0, 10);
+        function preset(key, chip) {
+            document.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
+            chip.classList.add('active');
+            
+            if (key === 'all') {
+                document.getElementById('start_date').value = '';
+                document.getElementById('end_date').value = '';
+                updateDashboard();
+                return;
+            }
+            
+            const t = new Date(); let s = new Date(), e = new Date();
+            if (key === 'last7') s.setDate(t.getDate() - 6);
+            else if (key === 'mtd') s = new Date(t.getFullYear(), t.getMonth(), 1);
+            else if (key === 'ytd') s = new Date(t.getFullYear(), 0, 1);
+            
+            document.getElementById('start_date').value = iso(s);
+            document.getElementById('end_date').value = iso(e);
+            updateDashboard();
         }
 
         let chartInstance = null;
@@ -267,7 +298,6 @@ WORKSPACE_HTML = """
             const mode = document.querySelector('input[name="view_mode_toggle"]:checked').value;
             formData.append('view_mode', mode);
 
-            // Smart Totals Logic
             const metrics = formData.getAll('agg_funcs');
             const totalCb = document.getElementById('show_total_cb');
             const totalWrap = document.getElementById('total_wrapper');
@@ -276,7 +306,7 @@ WORKSPACE_HTML = """
                 totalCb.checked = false; 
                 totalCb.disabled = true;
                 totalWrap.style.opacity = '0.4';
-                totalWrap.title = "Cannot total mixed metrics (₹ and Qty)";
+                totalWrap.title = "Cannot total mixed metrics (Sum and Qty)";
             } else {
                 totalCb.disabled = false;
                 totalWrap.style.opacity = '1';
@@ -285,8 +315,6 @@ WORKSPACE_HTML = """
 
             try {
                 const res = await fetch('/calculate', { method: 'POST', body: formData });
-                
-                // Advanced Error Catching
                 let data;
                 try {
                     data = await res.json();
@@ -414,7 +442,8 @@ def home():
     if df is not None:
         cols = df.columns.tolist()
         grouping = df.select_dtypes(exclude=['number']).columns.tolist()
-        return render_template_string(WORKSPACE_HTML, all_cols=cols, grouping_cols=grouping)
+        num_cols = df.select_dtypes(include='number').columns.tolist()
+        return render_template_string(WORKSPACE_HTML, all_cols=cols, grouping_cols=grouping, num_cols=num_cols)
     return render_template_string(UPLOAD_HTML, error=None)
 
 @app.route("/upload", methods=["GET"])
@@ -502,13 +531,18 @@ def calculate():
         dynamic_title = f"Sales Analysis by {' & '.join(idx)}" if idx else "Executive Dashboard"
         date_subtitle = " · ".join(filter_texts) if filter_texts else "All Time"
         
-        # Ensure Numeric Safety
-        if 'Tentative DP' in df.columns:
-            df['Tentative DP'] = pd.to_numeric(df['Tentative DP'].astype(str).str.replace(',', ''), errors='coerce')
-            val_col = 'Tentative DP'
+        # User Selected Value Field Setup
+        val_col = request.form.get('value_col')
+        if val_col and val_col in df.columns:
+            if df[val_col].dtype == object:
+                df[val_col] = pd.to_numeric(df[val_col].astype(str).str.replace(',', ''), errors='coerce')
         else:
-            num_cols = df.select_dtypes(include='number').columns.tolist()
-            val_col = num_cols[0] if num_cols else None
+            if 'Tentative DP' in df.columns:
+                df['Tentative DP'] = pd.to_numeric(df['Tentative DP'].astype(str).str.replace(',', ''), errors='coerce')
+                val_col = 'Tentative DP'
+            else:
+                num_cols = df.select_dtypes(include='number').columns.tolist()
+                val_col = num_cols[0] if num_cols else None
 
         kpi_html = ""
         if not df.empty and val_col:
