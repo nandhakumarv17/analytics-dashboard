@@ -90,6 +90,20 @@ GLOBAL_HEAD = """
     .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
     .chip { padding: 6px 10px; border-radius: 8px; background: rgba(120,120,128,0.1); font-size: 11px; font-weight: 600; cursor: pointer; transition: 0.2s; border: none; color: var(--text-primary); }
     .chip.active { background: var(--blue-apple); color: #fff; }
+
+    /* Accordion styling for Status filter */
+    .acc { margin-bottom: 10px; border-radius: 12px; background: var(--glass-bg); box-shadow: var(--shadow-glass); border: 1px solid var(--glass-border); overflow: hidden; transition: 0.3s; }
+    .acc-head { display: flex; align-items: center; gap: 8px; width: 100%; padding: 13px 14px; border: 0; background: none; text-align: left; font-size: 13px; font-weight: 600; transition: 0.2s; color: var(--text-primary); }
+    .acc-head:hover { background: rgba(120, 120, 128, 0.1); }
+    .acc-title { flex: 1; }
+    .chev { width: 14px; height: 14px; color: var(--text-secondary); transition: transform 0.4s; }
+    .acc.open .chev { transform: rotate(90deg); }
+    .acc-panel { display: grid; grid-template-rows: 0fr; transition: 0.45s; }
+    .acc.open .acc-panel { grid-template-rows: 1fr; }
+    .acc-inner { min-height: 0; overflow: hidden; }
+    .acc-body { padding: 4px 12px 12px; }
+    .tools { display: flex; justify-content: space-between; margin-bottom: 8px; }
+    .tools button { font-size: 11px; font-weight: 600; color: var(--blue-apple); background: none; border: none; cursor: pointer; }
 </style>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Sortable/1.15.0/Sortable.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/dom-to-image/2.6.0/dom-to-image.min.js"></script>
@@ -130,7 +144,7 @@ WORKSPACE_HTML = """
         <div class="nav-brand">Analytics Pro</div>
         <div class="nav-controls">
             <button class="btn-liquid" onclick="toggleDarkMode()" id="dm-btn">🌙 Dark</button>
-            <button class="btn-liquid btn-primary" onclick="exportImage()">📸 Export</button>
+            <button class="btn-liquid btn-primary" onclick="exportImage()">📸 Save Image</button>
             <button class="btn-liquid" id="dlExcel">📊 Download Excel</button>
         </div>
     </div>
@@ -138,21 +152,40 @@ WORKSPACE_HTML = """
     <div class="app-layout">
         <div class="sidebar">
             <form id="config-form">
-                <div class="section-title" style="margin-top: 0;">Filters</div>
-                <div class="checkbox-group" style="margin-bottom: 16px; opacity: 0.8;">
-                    <label class="switch-container" style="cursor: not-allowed;" title="Permanently locked">
-                        <span style="font-size: 13px; font-weight: 500;">Final Status: Ok</span>
-                        <input type="checkbox" class="ios-switch" checked disabled>
-                        <div class="switch"></div>
-                    </label>
-                </div>
+            
+                {% if status_list %}
+                <section class="acc open">
+                  <button type="button" class="acc-head" onclick="this.parentElement.classList.toggle('open')">
+                    <span class="acc-title">Final Status</span>
+                    <svg class="ic chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18l6-6-6-6"/></svg>
+                  </button>
+                  <div class="acc-panel">
+                    <div class="acc-inner">
+                      <div class="acc-body">
+                        <div class="tools">
+                            <button type="button" onclick="document.querySelectorAll('input[name=status_filters]').forEach(cb => cb.checked = true); updateDashboard();">Select All</button>
+                            <button type="button" onclick="document.querySelectorAll('input[name=status_filters]').forEach(cb => cb.checked = false); updateDashboard();">Clear</button>
+                        </div>
+                        <div class="checkbox-group" style="max-height: 150px;">
+                            {% for st in status_list %}
+                            <label class="checkbox-item"><input type="checkbox" name="status_filters" value="{{ st }}" checked> <span>{{ st }}</span></label>
+                            {% endfor %}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </section>
+                {% endif %}
                 
                 <div class="section-title">Timeline & Periods</div>
                 <div class="chips">
-                    <button type="button" class="chip" onclick="preset('mtd', this)">MTD</button>
-                    <button type="button" class="chip" onclick="preset('ytd', this)">YTD</button>
+                    <button type="button" class="chip" onclick="preset('yesterday', this)">Yesterday</button>
                     <button type="button" class="chip" onclick="preset('last7', this)">Last 7 Days</button>
-                    <button type="button" class="chip" onclick="preset('all', this)">Max Date</button>
+                    <button type="button" class="chip" onclick="preset('mtd', this)">MTD</button>
+                    <button type="button" class="chip" onclick="preset('lmtd', this)">LMTD</button>
+                    <button type="button" class="chip" onclick="preset('lwtd', this)">LWTD</button>
+                    <button type="button" class="chip" onclick="preset('ytd', this)">YTD</button>
+                    <button type="button" class="chip" onclick="preset('lytd', this)">LYTD</button>
                 </div>
                 <div style="display:flex; gap:8px;">
                     <div style="flex:1;">
@@ -273,17 +306,27 @@ WORKSPACE_HTML = """
             document.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
             chip.classList.add('active');
             
-            if (key === 'all') {
-                document.getElementById('start_date').value = '';
-                document.getElementById('end_date').value = '';
-                updateDashboard();
-                return;
-            }
+            const t = new Date(); let s = new Date(t), e = new Date(t);
             
-            const t = new Date(); let s = new Date(), e = new Date();
-            if (key === 'last7') s.setDate(t.getDate() - 6);
-            else if (key === 'mtd') s = new Date(t.getFullYear(), t.getMonth(), 1);
-            else if (key === 'ytd') s = new Date(t.getFullYear(), 0, 1);
+            if (key === 'yesterday') {
+                s.setDate(t.getDate() - 1); e.setDate(t.getDate() - 1);
+            } else if (key === 'last7') {
+                s.setDate(t.getDate() - 6);
+            } else if (key === 'mtd') {
+                s = new Date(t.getFullYear(), t.getMonth(), 1);
+            } else if (key === 'lmtd') {
+                s = new Date(t.getFullYear(), t.getMonth() - 1, 1);
+                e = new Date(t.getFullYear(), t.getMonth() - 1, t.getDate());
+            } else if (key === 'lwtd') {
+                let day = t.getDay() || 7; 
+                s.setDate(t.getDate() - day - 6);
+                e.setDate(t.getDate() - 7);
+            } else if (key === 'ytd') {
+                s = new Date(t.getFullYear(), 0, 1);
+            } else if (key === 'lytd') {
+                s = new Date(t.getFullYear() - 1, 0, 1);
+                e = new Date(t.getFullYear() - 1, t.getMonth(), t.getDate());
+            }
             
             document.getElementById('start_date').value = iso(s);
             document.getElementById('end_date').value = iso(e);
@@ -406,6 +449,9 @@ WORKSPACE_HTML = """
             const fd = new URLSearchParams(new FormData(document.getElementById('config-form'))); 
             location.href = '/download?' + fd.toString(); 
         });
+        
+        document.getElementById('start_date').addEventListener('change', () => document.querySelectorAll('.chip').forEach(c => c.classList.remove('active')));
+        document.getElementById('end_date').addEventListener('change', () => document.querySelectorAll('.chip').forEach(c => c.classList.remove('active')));
     </script>
 </body>
 </html>
@@ -443,7 +489,12 @@ def home():
         cols = df.columns.tolist()
         grouping = df.select_dtypes(exclude=['number']).columns.tolist()
         num_cols = df.select_dtypes(include='number').columns.tolist()
-        return render_template_string(WORKSPACE_HTML, all_cols=cols, grouping_cols=grouping, num_cols=num_cols)
+        
+        # Identify status column values for sidebar
+        status_col = next((c for c in df.columns if c.lower().replace(' ', '') in ['finalstatus', 'finalrecordstatus', 'validationremarks', 'status']), None)
+        status_list = sorted(df[status_col].dropna().unique().tolist()) if status_col else []
+        
+        return render_template_string(WORKSPACE_HTML, all_cols=cols, grouping_cols=grouping, num_cols=num_cols, status_list=status_list)
     return render_template_string(UPLOAD_HTML, error=None)
 
 @app.route("/upload", methods=["GET"])
@@ -480,24 +531,34 @@ def calculate():
         if df is None: return jsonify({"error": "No data available. Please re-upload your file."}), 400
         
         mode = request.form.get('view_mode', 'dashboard')
-        
-        # 1. PERMANENT STATUS FILTER: Final Status == Ok
-        status_cols = [c for c in df.columns if c.lower() in ['finalstatus', 'final record status', 'validation remarks', 'status']]
         filter_texts = []
-        if status_cols:
-            status_col = status_cols[0]
-            df = df[df[status_col].astype(str).str.lower().str.strip() == 'ok']
-            filter_texts.append("Status: Ok")
+        
+        # 1. FINAL STATUS Dynamic Multi-Select Filter
+        status_col = next((c for c in df.columns if c.lower().replace(' ', '') in ['finalstatus', 'finalrecordstatus', 'validationremarks', 'status']), None)
+        status_filters = request.form.getlist('status_filters')
+        if status_col and status_filters:
+            df = df[df[status_col].isin(status_filters)]
+            if len(status_filters) <= 3: filter_texts.append(f"Status: {', '.join(status_filters)}")
+            else: filter_texts.append(f"Status: {len(status_filters)} selected")
 
-        # Global Date Setup
-        date_cols = df.select_dtypes(include=['datetime64', 'object']).columns
-        date_col_name = None
-        for c in date_cols:
-            try: 
-                if pd.api.types.is_datetime64_any_dtype(df[c]) or "Date" in c:
-                    df[c] = pd.to_datetime(df[c], errors='coerce')
+        # 2. Strict Date Column Filtering (Primary Sales Date only)
+        date_cols = df.columns.tolist()
+        date_col_name = ""
+        # Prioritize exact names
+        for c in ("Customized Sales Date", "Sale Date", "Sales Date"):
+            if c in date_cols:
+                date_col_name = c
+                break
+        # Fallback to general date (ignoring tertiary/activation)
+        if not date_col_name:
+            for c in date_cols:
+                cl = c.lower()
+                if "date" in cl and "activation" not in cl and "tertiary" not in cl:
                     date_col_name = c
-            except: pass
+                    break
+                    
+        if date_col_name:
+            df[date_col_name] = pd.to_datetime(df[date_col_name], errors='coerce')
 
         # Filter by Date & Weeks
         start_date = request.form.get('start_date')
