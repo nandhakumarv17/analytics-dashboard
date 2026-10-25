@@ -49,7 +49,7 @@ GLOBAL_HEAD = """
     .main-content { flex: 1; padding: 32px 40px; overflow: hidden; display: flex; flex-direction: column; }
     
     .section-title { font-size: 12px; font-weight: 700; color: var(--text-secondary); text-transform: uppercase; margin: 24px 0 10px; letter-spacing: 0.5px; }
-    .checkbox-group { background: rgba(120,120,128,0.05); border: 1px solid var(--glass-border); border-radius: 12px; padding: 8px; max-height: 240px; overflow-y: auto; }
+    .checkbox-group { background: rgba(120,120,128,0.05); border: 1px solid var(--glass-border); border-radius: 12px; padding: 8px; max-height: 220px; overflow-y: auto; }
     .checkbox-item { display: flex; align-items: center; padding: 8px 10px; font-size: 13px; cursor: pointer; border-radius: 8px; font-weight: 500; }
     .checkbox-item:hover { background: rgba(120,120,128,0.1); }
     .checkbox-item input[type="checkbox"]:not(.ios-switch), .checkbox-item input[type="radio"] { margin-right: 10px; accent-color: var(--blue-apple); width: 16px; height: 16px; }
@@ -61,7 +61,6 @@ GLOBAL_HEAD = """
     
     .table-container { background: var(--card-bg); border-radius: 16px; border: 1px solid var(--glass-border); flex: 1; overflow: hidden; display: flex; flex-direction: column; box-shadow: var(--shadow-glass); }
     
-    /* Table Summary Bar */
     .summary-bar { background: var(--card-bg); padding: 16px 20px; border-bottom: 1px solid var(--glass-border); font-size: 13px; font-weight: 500; display: flex; justify-content: space-between; align-items: center; color: var(--text-secondary); }
     .summary-bar b { color: var(--text-primary); font-weight: 600; }
     
@@ -72,11 +71,9 @@ GLOBAL_HEAD = """
     .excel-table th:first-child, .excel-table td:first-child { position: sticky; left: 0; z-index: 20; background: var(--card-bg); font-weight: 600; box-shadow: 1px 0 0 var(--glass-border); }
     .excel-table th:first-child { z-index: 30; background: var(--header-bg); }
     
-    /* Light Blue Grand Total */
     .excel-table tbody tr:last-child td { font-weight: 700; background: var(--total-bg); color: var(--total-text); border-top: 1px solid var(--glass-border); border-bottom: none; position: sticky; bottom: 0; z-index: 15; }
     .excel-table tbody tr:last-child td:first-child { z-index: 25; }
     
-    /* Flat KPIs */
     .kpis { display: flex; gap: 60px; margin-bottom: 32px; }
     .kpi { display: flex; flex-direction: column; }
     .kpi-label { font-size: 13px; font-weight: 600; color: var(--text-secondary); margin-bottom: 6px; }
@@ -93,6 +90,10 @@ GLOBAL_HEAD = """
     .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
     .chip { padding: 6px 12px; border-radius: 8px; background: rgba(120,120,128,0.1); font-size: 12px; font-weight: 600; cursor: pointer; transition: 0.2s; border: none; color: var(--text-primary); }
     .chip.active { background: var(--blue-apple); color: #fff; }
+
+    /* Popup Modal for Weeks */
+    .modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.4); backdrop-filter: blur(4px); z-index: 2000; align-items: center; justify-content: center; }
+    .modal-card { background: var(--card-bg); border: 1px solid var(--glass-border); padding: 24px; border-radius: 20px; width: 300px; box-shadow: var(--shadow-glass); }
 </style>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/dom-to-image/2.6.0/dom-to-image.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
@@ -137,6 +138,24 @@ WORKSPACE_HTML = """
         </div>
     </div>
     
+    <!-- Week Selector Modal Popup -->
+    <div class="modal-overlay" id="weekModal">
+        <div class="modal-card">
+            <div style="font-weight: 700; margin-bottom: 14px; font-size: 16px;">Select Weeks</div>
+            <div class="checkbox-group" style="margin-bottom: 16px;">
+                <label class="checkbox-item"><input type="checkbox" name="week_num" value="1"> <span>Week 1 (Days 1–7)</span></label>
+                <label class="checkbox-item"><input type="checkbox" name="week_num" value="2"> <span>Week 2 (Days 8–14)</span></label>
+                <label class="checkbox-item"><input type="checkbox" name="week_num" value="3"> <span>Week 3 (Days 15–21)</span></label>
+                <label class="checkbox-item"><input type="checkbox" name="week_num" value="4"> <span>Week 4 (Days 22–28)</span></label>
+                <label class="checkbox-item"><input type="checkbox" name="week_num" value="5"> <span>Week 5 (Days 29+)</span></label>
+            </div>
+            <div style="display: flex; gap: 8px;">
+                <button type="button" class="btn-liquid btn-primary" style="flex: 1;" onclick="applyWeeks()">Apply Weeks</button>
+                <button type="button" class="btn-liquid" style="flex: 1;" onclick="toggleWeekModal()">Cancel</button>
+            </div>
+        </div>
+    </div>
+
     <div class="app-layout">
         <div class="sidebar">
             <form id="config-form">
@@ -183,7 +202,8 @@ WORKSPACE_HTML = """
                     <button type="button" class="chip" onclick="preset('ytd', this)">YTD</button>
                     <button type="button" class="chip" onclick="preset('lytd', this)">LYTD</button>
                 </div>
-                <div style="display:flex; gap:8px;">
+                
+                <div style="display:flex; gap:8px; margin-bottom: 12px;">
                     <div style="flex:1;">
                         <label style="font-size:10px; color:var(--text-secondary); font-weight:700;">FROM</label>
                         <input type="date" name="start_date" id="start_date" class="btn-liquid" style="width:100%; box-sizing:border-box;">
@@ -194,13 +214,8 @@ WORKSPACE_HTML = """
                     </div>
                 </div>
                 
-                <div style="margin-top: 12px; display:flex; flex-wrap:wrap; gap:6px;">
-                    <label class="btn-liquid" style="padding:4px 8px; font-size:11px; border-radius:6px; font-weight:500; cursor:pointer;"><input type="checkbox" name="week_num" value="1" style="display:none;" onchange="updateDashboard()">W1</label>
-                    <label class="btn-liquid" style="padding:4px 8px; font-size:11px; border-radius:6px; font-weight:500; cursor:pointer;"><input type="checkbox" name="week_num" value="2" style="display:none;" onchange="updateDashboard()">W2</label>
-                    <label class="btn-liquid" style="padding:4px 8px; font-size:11px; border-radius:6px; font-weight:500; cursor:pointer;"><input type="checkbox" name="week_num" value="3" style="display:none;" onchange="updateDashboard()">W3</label>
-                    <label class="btn-liquid" style="padding:4px 8px; font-size:11px; border-radius:6px; font-weight:500; cursor:pointer;"><input type="checkbox" name="week_num" value="4" style="display:none;" onchange="updateDashboard()">W4</label>
-                    <label class="btn-liquid" style="padding:4px 8px; font-size:11px; border-radius:6px; font-weight:500; cursor:pointer;"><input type="checkbox" name="week_num" value="5" style="display:none;" onchange="updateDashboard()">W5</label>
-                </div>
+                <!-- Popup Week Modal Trigger Button -->
+                <button type="button" class="btn-liquid" style="width: 100%; text-align: center; margin-bottom: 8px;" onclick="toggleWeekModal()">📅 Select Weeks <span id="weekBadge" style="color:var(--blue-apple); font-weight:700;"></span></button>
 
                 <div id="pivot-controls">
                     <div class="section-title">Rows (Y-Axis)</div>
@@ -212,7 +227,7 @@ WORKSPACE_HTML = """
                         </label>
                         <div style="height: 1px; background: var(--glass-border); margin: 4px 0;"></div>
                         {% for col in grouping_cols %}
-                        <label class="checkbox-item axis-item" data-field="{{ col }}"><input type="checkbox" name="index_cols" value="{{ col }}"> <span>{{ col }}</span></label>
+                        <label class="checkbox-item axis-row-item" data-field="{{ col }}"><input type="checkbox" name="index_cols" value="{{ col }}" onchange="updateDashboard()"> <span>{{ col }}</span></label>
                         {% endfor %}
                     </div>
                     
@@ -225,7 +240,7 @@ WORKSPACE_HTML = """
                         </label>
                         <div style="height: 1px; background: var(--glass-border); margin: 4px 0;"></div>
                         {% for col in grouping_cols %}
-                        <label class="checkbox-item axis-item" data-field="{{ col }}"><input type="checkbox" name="columns_cols" value="{{ col }}"> <span>{{ col }}</span></label>
+                        <label class="checkbox-item axis-col-item" data-field="{{ col }}"><input type="checkbox" name="columns_cols" value="{{ col }}" onchange="updateDashboard()"> <span>{{ col }}</span></label>
                         {% endfor %}
                     </div>
 
@@ -281,10 +296,36 @@ WORKSPACE_HTML = """
     </div>
 
     <script>
-        // Field Manager UI Logic
+        // Popup Modal for Weeks Logic
+        function toggleWeekModal() {
+            const modal = document.getElementById('weekModal');
+            modal.style.display = modal.style.display === 'flex' ? 'none' : 'flex';
+        }
+        
+        function applyWeeks() {
+            const count = document.querySelectorAll('input[name="week_num"]:checked').length;
+            document.getElementById('weekBadge').innerText = count > 0 ? `(${count} selected)` : '';
+            toggleWeekModal();
+            updateDashboard();
+        }
+
+        // Master Field Manager Synchronization for X and Y Axes
         function updateAxisVisibility() {
             const selectedFields = Array.from(document.querySelectorAll('input[name="master_fields"]:checked')).map(cb => cb.value);
-            document.querySelectorAll('.axis-item').forEach(item => {
+            
+            // Update Rows (Y-Axis)
+            document.querySelectorAll('.axis-row-item').forEach(item => {
+                const field = item.getAttribute('data-field');
+                if (selectedFields.includes(field)) {
+                    item.style.display = 'flex';
+                } else {
+                    item.style.display = 'none';
+                    item.querySelector('input').checked = false;
+                }
+            });
+
+            // Update Columns (X-Axis)
+            document.querySelectorAll('.axis-col-item').forEach(item => {
                 const field = item.getAttribute('data-field');
                 if (selectedFields.includes(field)) {
                     item.style.display = 'flex';
@@ -298,7 +339,6 @@ WORKSPACE_HTML = """
         
         function toggleAll(groupName, isChecked) {
             document.querySelectorAll(`input[name="${groupName}"]`).forEach(cb => {
-                // Only check visible items in axes
                 if (groupName === 'index_cols' || groupName === 'columns_cols') {
                     if (cb.parentElement.style.display !== 'none') cb.checked = isChecked;
                 } else {
@@ -309,12 +349,13 @@ WORKSPACE_HTML = """
             else updateDashboard();
         }
 
-        // View Mode UI
+        // View Mode UI Switcher
         document.querySelectorAll('input[name="view_mode_toggle"]').forEach(radio => {
             radio.addEventListener('change', function() {
                 const thumb = document.querySelector('.seg-thumb');
                 thumb.style.transform = this.value === 'chart' ? 'translateX(100%)' : 'translateX(0)';
                 document.getElementById('dlExcel').style.display = this.value === 'chart' ? 'none' : 'flex';
+                updateDashboard();
             });
         });
 
@@ -323,13 +364,6 @@ WORKSPACE_HTML = """
             document.getElementById('dm-btn').innerText = isDark ? '☀️ Light' : '🌙 Dark';
             if(document.querySelector('input[name="view_mode_toggle"]:checked').value === 'chart') updateDashboard();
         }
-        
-        document.querySelectorAll('input[name="week_num"]').forEach(cb => {
-            cb.addEventListener('change', function() {
-                if(this.checked) { this.parentElement.style.background = 'var(--blue-apple)'; this.parentElement.style.color = '#fff'; }
-                else { this.parentElement.style.background = ''; this.parentElement.style.color = ''; }
-            });
-        });
 
         const iso = d => new Date(d.getTime() - d.getTimezoneOffset() * 6e4).toISOString().slice(0, 10);
         function preset(key, chip) {
@@ -468,11 +502,7 @@ WORKSPACE_HTML = """
         document.getElementById('start_date').addEventListener('change', () => document.querySelectorAll('.chip').forEach(c => c.classList.remove('active')));
         document.getElementById('end_date').addEventListener('change', () => document.querySelectorAll('.chip').forEach(c => c.classList.remove('active')));
         
-        // Init
         window.onload = () => { updateAxisVisibility(); };
-        document.getElementById('config-form').addEventListener('change', (e) => {
-            if(e.target.name === 'index_cols' || e.target.name === 'columns_cols') updateDashboard();
-        });
     </script>
 </body>
 </html>
@@ -510,12 +540,10 @@ def home():
         cols = df.columns.tolist()
         grouping = df.select_dtypes(exclude=['number']).columns.tolist()
         
-        # Smart Value Column formatting before sending to UI
         if 'Tentative DP' in df.columns:
             df['Tentative DP'] = pd.to_numeric(df['Tentative DP'].astype(str).str.replace(',', ''), errors='coerce')
         num_cols = df.select_dtypes(include='number').columns.tolist()
         
-        # Identify exact Final Status values natively
         status_col = next((c for c in cols if 'status' in c.lower() or 'remarks' in c.lower()), None)
         status_list = sorted(df[status_col].dropna().astype(str).unique().tolist()) if status_col else []
         
@@ -606,7 +634,6 @@ def calculate():
         idx = request.form.getlist('index_cols')
         date_subtitle = " – ".join(filter_texts[:2]) if len(filter_texts)>=2 and "From" not in filter_texts[0] else (" · ".join(filter_texts) if filter_texts else "All Time")
         
-        # Value Field Setup
         val_col = request.form.get('value_col')
         if val_col and val_col in df.columns:
             if df[val_col].dtype == object: df[val_col] = pd.to_numeric(df[val_col].astype(str).str.replace(',', ''), errors='coerce')
@@ -638,7 +665,6 @@ def calculate():
         
         pivot = pd.pivot_table(**kwargs).reset_index().fillna(0)
         
-        # Format Date Headers correctly to dd-MMM-yy
         new_headers = []
         for c in pivot.columns:
             if isinstance(c, tuple):
@@ -664,16 +690,26 @@ def calculate():
         chart_data = None
         if mode == 'chart':
             chart_df = pivot.sort_values(by=metric_cols[0], ascending=False).head(15) if metric_cols else pivot.head(15)
-            # Formatting Date labels for chart X-axis
             labels = chart_df[idx[0]].apply(lambda x: x.strftime('%d-%b-%y') if isinstance(x, pd.Timestamp) else str(x)).tolist() if idx else ["Total"]
-            datasets = [{"label": m, "data": chart_df[m].tolist(), "backgroundColor": "#0071e3", "borderRadius": 4} for m in metric_cols if m != "TOTAL"]
+            
+            # Vibrant multi-color palette for chart bars
+            palette = ['#0071e3', '#34c759', '#ff9500', '#af52de', '#ff3b30', '#5ac8fa', '#ffcc00', '#5856d6']
+            datasets = []
+            for i, m in enumerate(metric_cols):
+                if m != "TOTAL":
+                    color = palette[i % len(palette)]
+                    datasets.append({
+                        "label": m, 
+                        "data": chart_df[m].tolist(), 
+                        "backgroundColor": color, 
+                        "borderRadius": 6
+                    })
             chart_data = {"labels": labels, "datasets": datasets}
 
         if not pivot.empty:
             totals = {c: pivot[c].sum() if c in metric_cols else ('' if c != idx[0] else 'GRAND TOTAL') for c in pivot.columns}
             pivot = pd.concat([pivot, pd.DataFrame([totals])], ignore_index=True)
 
-        # Force format datetimes in index columns
         for c in idx:
             if c in pivot.columns and pd.api.types.is_datetime64_any_dtype(pivot[c]):
                 pivot[c] = pivot[c].dt.strftime('%d-%b-%y')
@@ -684,7 +720,7 @@ def calculate():
         html = html.replace('<th>TOTAL</th>', '<th class="total-col">TOTAL</th>')
         if 'TOTAL' in metric_cols: html = re.sub(r'(<td>)([\d,-]+)(</td></tr>)', r'<td class="total-col">\2\3', html)
         
-        pivot.to_pickle(os.path.join(UPLOAD_DIR, "summary_data.pkl"))
+        pivot.to_pickle(os.path.join(DATA_FILE_PATH.replace('shared_data.pkl', 'summary_data.pkl')))
         
         summary_text = f"<b>Date</b> {date_subtitle} · <b>Filters</b> {' + '.join(idx)} · {len(pivot)-1} groups"
         
