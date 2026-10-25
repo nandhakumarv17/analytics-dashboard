@@ -1,4 +1,5 @@
-"""Analytics Pro - upload a sheet, slice it, pivot it, chart it, export it.
+"""
+Analytics Pro - upload a sheet, slice it, pivot it, chart it, export it.
 
 Single-file Flask app.   python app.py
 Needs: flask, pandas, openpyxl
@@ -389,9 +390,9 @@ def period_text(ctx, p):
     return f"{label} · {rng}" if label else rng
 
 
-# ════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════
 #  QUERY ENGINE
-# ════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════
 def build_view(state, p, want_export=False):
     """Returns (payload, export, http_status)."""
     df, ctx = state["df"], state["ctx"]
@@ -1199,7 +1200,7 @@ body.desktop-mode{overflow:hidden}
 .chip,.chip-check span{display:inline-flex;align-items:center;height:30px;padding:0 13px;border:0;border-radius:15px;background:var(--fill);font-size:13px;font-weight:500;transition:background .2s,color .2s,transform .35s var(--spring)}
 .chip:hover,.chip-check:hover span{background:var(--blue-tint);color:var(--blue)}
 .chip:active,.chip-check:active span{transform:scale(.93)}
-.chip.active,.chip-check input:checked+span{background:var(--blue);color:#fff}
+.chip.active,.chip-check input:checked+span{background:var(--blue);color:#fff;box-shadow:inset 0 1px 0 rgba(255,255,255,.25),0 8px 18px color-mix(in srgb,var(--blue) 25%,transparent)}
 .chip-check input{position:absolute;opacity:0;pointer-events:none}
 .chip-check{position:relative;cursor:pointer}
 .chips.agg{margin-bottom:12px}.chips.agg .chip-check span{height:34px;padding:0 18px;font-size:14px}
@@ -1347,11 +1348,11 @@ tr.hl-row td{background-image:linear-gradient(var(--hl),var(--hl))!important}
 .upload-wrap{max-width:540px;margin:0 auto;padding:calc(var(--nav-h) + 72px) 20px 48px;animation:rise .7s var(--ease) both}
 .hero-title{margin:0 0 10px;text-align:center;font-size:clamp(38px,8vw,60px);font-weight:700;letter-spacing:-.04em;line-height:1.04}
 .hero-sub{margin:0 0 34px;text-align:center;font-size:18px;color:var(--label-3)}
-.upload-card{display:grid;gap:16px;padding:26px;border-radius:32px;background:var(--surface);box-shadow:0 0 0 .5px var(--hairline),inset 0 1px 0 var(--spec),var(--shadow-1)}
+.upload-card{display:grid;gap:16px;padding:26px;border-radius:32px;background:var(--surface);box-shadow:0 0 0 .5px var(--hairline),inset 0 1px 0 var(--spec),var(--shadow-1);backdrop-filter:saturate(160%) blur(18px)}
 .dropzone{display:grid;justify-items:center;gap:6px;padding:40px 20px;border:1.5px dashed var(--hairline-strong);border-radius:22px;background:var(--fill-2);color:var(--label-3);text-align:center;cursor:pointer;transition:border-color .3s var(--ease),background .3s,transform .45s var(--spring)}
 .dropzone:hover{border-color:var(--blue);color:var(--blue)}
 .dropzone.drag{border-color:var(--blue);background:var(--blue-tint);color:var(--blue);transform:scale(1.02)}
-.dropzone.has-file{border-style:solid;border-color:var(--blue);background:var(--blue-tint);color:var(--blue)}
+.dropzone.has-file{border-style:solid;border-color:var(--blue);background:var(--blue-tint);color:var(--blue);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--blue) 30%, transparent)}
 .dz-title{margin-top:6px;font-size:17px;font-weight:600;color:var(--label);word-break:break-all}
 .dz-sub{font-size:13px}
 .alert{padding:12px 14px;border-radius:14px;background:color-mix(in srgb,var(--neg) 12%,transparent);color:var(--neg);font-size:13px;font-weight:500}
@@ -1440,12 +1441,25 @@ if (gRange) {
   gRange.addEventListener('input', () => { root.style.setProperty('--glass', gRange.value); store.set('ap-glass', gRange.value); paint(); });
 }
 const popovers = [['#glassBtn', '#glassPop'], ['#exportBtn', '#exportMenu']].map(([b, p]) => [$(b), $(p)]).filter(([b, p]) => b && p);
-function closePops(except){ popovers.forEach(([b, p]) => { if (p !== except) { p.classList.remove('show'); b.setAttribute('aria-expanded', 'false'); } }); }
+function closePops(except){
+  popovers.forEach(([b, p]) => {
+    if (p !== except) {
+      p.classList.remove('show');
+      b.setAttribute('aria-expanded', 'false');
+    }
+  });
+}
 popovers.forEach(([b, p]) => b.addEventListener('click', e => {
   e.stopPropagation(); const open = !p.classList.contains('show');
   closePops(open ? p : null); p.classList.toggle('show', open); b.setAttribute('aria-expanded', String(open));
 }));
-document.addEventListener('click', e => { if (!e.target.closest('.popover, .menu')) closePops(); });
+document.addEventListener('click', e => {
+  const insideGlass = e.target.closest('#glassBtn, #glassPop');
+  const insideExport = e.target.closest('#exportBtn, #exportMenu');
+  if (!insideGlass && !insideExport) {
+    closePops();
+  }
+});
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closePops(); });
 
 /* ═══════ upload page ═══════ */
@@ -1472,19 +1486,39 @@ if (!form) return;
 
 /* ═══════ layout switch (desktop / mobile) ═══════ */
 const sw = $('#mobileSwitch');
-sw.checked = body.classList.contains('mobile-mode');
-sw.addEventListener('change', () => {
-  const on = sw.checked;
-  body.classList.toggle('mobile-mode', on); body.classList.toggle('desktop-mode', !on);
-  body.classList.toggle('sidebar-collapsed', on);
-  $('#sidebarToggle').setAttribute('aria-expanded', String(!on));
-  store.set('ap-mobile', on ? '1' : '0');
-  redrawSoon();
-});
-$('#sidebarToggle').addEventListener('click', e => {
-  const c = body.classList.toggle('sidebar-collapsed');
-  e.currentTarget.setAttribute('aria-expanded', String(!c));
-});
+const sidebarToggle = $('#sidebarToggle');
+
+function syncMobileState() {
+  const on = body.classList.contains('mobile-mode');
+  if (sw) sw.checked = on;
+  if (sidebarToggle) {
+    sidebarToggle.setAttribute('aria-expanded', String(!body.classList.contains('sidebar-collapsed')));
+  }
+}
+
+if (sw) {
+  sw.checked = body.classList.contains('mobile-mode');
+  sw.addEventListener('change', () => {
+    const on = sw.checked;
+    body.classList.toggle('mobile-mode', on);
+    body.classList.toggle('desktop-mode', !on);
+    body.classList.toggle('sidebar-collapsed', on);
+    store.set('ap-mobile', on ? '1' : '0');
+    syncMobileState();
+    redrawSoon();
+  });
+}
+
+if (sidebarToggle) {
+  sidebarToggle.addEventListener('click', () => {
+    const collapsed = !body.classList.contains('sidebar-collapsed');
+    body.classList.toggle('sidebar-collapsed', collapsed);
+    sidebarToggle.setAttribute('aria-expanded', String(!collapsed));
+    if (body.classList.contains('mobile-mode')) {
+      store.set('ap-mobile', collapsed ? '0' : '1');
+    }
+  });
+}
 
 /* sidebar resizer */
 const rz = $('#sidebarResizer');
@@ -1510,7 +1544,13 @@ const view = () => $('input[name="view_mode_toggle"]:checked').value;
 const order = { index_cols: [], value_cols: [] };
 let data = null, dataMode = null, lastParams = null, ctrl = null, timer = null;
 let periodLabel = '', activePreset = null, activeKpi = null, kpis = [];
-const emptyBlock = (t, m, err) => `<div class="empty${err ? ' err' : ''}"><svg class="ic"><use href="#i-chart"/></svg><h3>${esc(t)}</h3><p>${m}</p></div>`;
+const emptyBlock = (t, m, err) => `
+  <div class="empty${err ? ' err' : ''}">
+    <svg class="ic"><use href="#i-chart"/></svg>
+    <h3>${esc(t)}</h3>
+    <p>${m}</p>
+  </div>
+`;
 const PROMPT = emptyBlock('Build your report', 'Pick at least one <b>X column</b>, one <b>Y column</b> and one <b>measure</b> in the sidebar.');
 
 const checked = name => $$(`input[name="${name}"]:checked`);
@@ -1560,7 +1600,14 @@ paintAnchor();
 
 function clearWM(){ $$('input[name="weeks"], input[name="months"]').forEach(i => { i.checked = false; }); }
 function clearDates(){ const s = $('#start_date'), e = $('#end_date'); if (s) { s.value = ''; e.value = ''; } }
-function setActiveChip(key){ activePreset = key; $$('.chip').forEach(c => c.classList.toggle('active', c.dataset.preset === key && key !== 'all')); }
+function setActiveChip(key){
+  activePreset = key;
+  $$('.chip').forEach(c => {
+    const selected = c.dataset.preset === key && key !== 'all';
+    c.classList.toggle('active', selected);
+    c.setAttribute('aria-pressed', selected ? 'true' : 'false');
+  });
+}
 function applyPreset(key){
   clearWM(); setActiveChip(key);
   const chip = $(`.chip[data-preset="${key}"]`); periodLabel = key === 'all' ? '' : (chip ? chip.textContent : '');
@@ -1613,12 +1660,40 @@ function setHead(title, period, filters){
 }
 function render(){
   const mode = view(), d = data;
-  tableCard.hidden = mode === 'chart'; chartCard.hidden = mode !== 'chart';
-  $('#exportCap').textContent = `Exports the ${mode === 'raw' ? 'raw data' : mode === 'chart' ? 'chart' : 'pivot'} · ${body.classList.contains('mobile-mode') ? 'mobile' : 'desktop'} layout`;
+  tableCard.hidden = mode === 'chart';
+  chartCard.hidden = mode !== 'chart';
+
+  $('#exportCap').textContent =
+    `Exports the ${mode === 'raw' ? 'raw data' : mode === 'chart' ? 'chart' : 'pivot'} · ${body.classList.contains('mobile-mode') ? 'mobile' : 'desktop'} layout`;
+
   dlExcel.disabled = !(d && !d.error && lastParams);
-  const block = html => { kpiEl.hidden = true; bar.hidden = true; tableWrap.innerHTML = html; chartBody.innerHTML = html; $('#legend').innerHTML = ''; $('#chartNote').textContent = ''; kpis = []; activeKpi = null; };
-  if (!d) { setHead('Build your report', boot.all, []); block(PROMPT); return; }
-  if (d.error) { setHead('Something went wrong', '', []); block(emptyBlock('Something went wrong', esc(d.error), true)); return; }
+
+  if (mode === 'chart') {
+    tableCard.classList.remove('updating');
+    chartCard.classList.remove('updating');
+  }
+
+  const block = html => {
+    kpiEl.hidden = true;
+    bar.hidden = true;
+    tableWrap.innerHTML = html;
+    chartBody.innerHTML = html;
+    $('#legend').innerHTML = '';
+    $('#chartNote').textContent = '';
+    kpis = [];
+    activeKpi = null;
+  };
+
+  if (!d) {
+    setHead('Build your report', boot.all, []);
+    block(PROMPT);
+    return;
+  }
+  if (d.error) {
+    setHead('Something went wrong', '', []);
+    block(emptyBlock('Something went wrong', esc(d.error), true));
+    return;
+  }
   setHead(d.title, d.period, d.filters);
 
   const prevLabel = kpis[activeKpi] && kpis[activeKpi].label;
@@ -1665,7 +1740,7 @@ function applyHighlight(){
   const match = !!(set && chartData && chartData.series.some(s => set.has(s.col)));
   chartBody.classList.toggle('hl', match);
   $$('.ser', chartBody).forEach(g => g.classList.toggle('on', !!set && set.has(+g.dataset.col)));
-  if (match) { /* make sure highlighted series is visible */
+  if (match) {
     const need = chartData.series.map((s, i) => set.has(s.col) && hidden.has(i) ? i : -1).filter(i => i >= 0);
     if (need.length) { need.forEach(i => hidden.delete(i)); drawLegend(); drawChart(false); }
   }
@@ -1782,7 +1857,7 @@ function niceTicks(lo, hi, n = 5){
   const out = []; for (let v = Math.floor(lo / step) * step; v <= Math.ceil(hi / step) * step + step / 2; v += step) out.push(+v.toFixed(10));
   return out;
 }
-function monoPath(p){  /* monotone cubic: smooth like Apple charts, never overshoots */
+function monoPath(p){
   const n = p.length; if (n < 2) return `M${p[0][0]},${p[0][1]}`;
   const dx = [], m = [], t = new Array(n);
   for (let i = 0; i < n - 1; i++) { dx[i] = p[i + 1][0] - p[i][0]; m[i] = (p[i + 1][1] - p[i][1]) / dx[i]; }
@@ -1814,7 +1889,7 @@ function drawChart(animate){
   const d = data && data.chart;
   if (!d || !d.series.length || !d.labels.length) { chartData = null; chartBody.innerHTML = emptyBlock('Nothing to chart', 'Choose at least one X column and a measure.'); $('#chartNote').textContent = ''; return; }
   const sig = d.series.map(s => s.name).join('|');
-  if (sig !== chartSig) {  /* new measures → sensible default: first 4 series sharing the first aggregate */
+  if (sig !== chartSig) {
     chartSig = sig; hidden = new Set(); const a = d.series[0].agg;
     d.series.forEach((s, i) => { if (s.agg !== a || i >= 4) hidden.add(i); });
     drawLegendFor(d);
@@ -1939,6 +2014,10 @@ $('#dlImage').addEventListener('click', async () => {
 });
 
 /* ═══════ go ═══════ */
+if (body.classList.contains('mobile-mode')) {
+  body.classList.add('sidebar-collapsed');
+}
+syncMobileState();
 syncOrder('index_cols'); syncOrder('value_cols'); updateBadges(); update();
 })();
 """
