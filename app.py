@@ -1,799 +1,1949 @@
-import os
+"""Analytics Pro - upload a sheet, slice it, pivot it, chart it, export it.
+
+Single-file Flask app.   python app.py
+Needs: flask, pandas, openpyxl
+"""
+import hashlib
+import html
 import io
 import json
+import os
 import re
-import traceback
+import threading
+import warnings
 from datetime import datetime
-from flask import Flask, request, render_template_string, send_file, jsonify, redirect, url_for
+
 import pandas as pd
-import numpy as np
+from flask import (Flask, Response, jsonify, redirect, render_template_string,
+                   request, send_file, url_for)
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 64 * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = 64 * 1024 * 1024  # 64 MB uploads
 
-UPLOAD_DIR = "/tmp/dashboard_uploads"
+UPLOAD_DIR = os.environ.get("DASHBOARD_UPLOAD_DIR", "/tmp/dashboard_uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 DATA_FILE_PATH = os.path.join(UPLOAD_DIR, "shared_data.pkl")
+META_FILE_PATH = os.path.join(UPLOAD_DIR, "metadata.json")
 
-# --- iOS LIQUID GLASS & RESPONSIVE APPLE UI ---
-GLOBAL_HEAD = """
-<style>
-    :root {
-        --bg-main: #f5f5f7; --glass-sidebar: rgba(255, 255, 255, 0.98);
-        --glass-border: rgba(0, 0, 0, 0.1); --text-primary: #1d1d1f; --text-secondary: #86868b;
-        --shadow-glass: 0 10px 30px rgba(0,0,0,0.05); --blue-apple: #0071e3; --blue-hover: #0077ed;
-        --header-bg: #f9f9fb; --header-text: #515154;
-        --total-bg: #eaf3fe; --total-text: #1d1d1f;
-        --green: #34c759; --card-bg: #ffffff;
+RAW_ROW_LIMIT = 3000      # rows drawn in Raw view (Excel export is always complete)
+PIVOT_ROW_LIMIT = 5000    # groups drawn in the Pivot table (Excel export is complete)
+CHART_MAX = 120           # categories sent to the chart
+AGG_NAME = {"sum": "Sum", "count": "Count", "mean": "Avg"}
+AGG_WORD = {"sum": "Sum", "count": "Count", "mean": "Average"}
+DERIVED_FMT = {"Week of": "%d %b %y", "Month": "%b %Y"}
+NON_ADDITIVE = re.compile(
+    r"(^|[\s_\-])(id|no|num|number|code|sku|pin|pincode|phone|mobile|year|month|week|day|qtr|quarter)($|[\s_\-])", re.I)
+
+# ════════════════════════════════════════════════════════════════════
+#  DATA LAYER  (parse once on upload, cache in memory by file mtime)
+# ════════════════════════════════════════════════════════════════════
+_lock = threading.Lock()
+_state = {"mtime": None, "df": None, "ctx": None}
+
+
+def pick_date_col(cols):
+    for c in ("Customized Sales Date", "Sale Date"):
+        if c in cols:
+            return c
+    return next((c for c in cols if "date" in c.lower()), "")
+
+
+def prepare_df(df):
+    """Normalise once at upload so every request afterwards is cheap."""
+    df.columns = [str(c).strip() for c in df.columns]
+    d = pick_date_col(list(df.columns))
+    if d and not pd.api.types.is_numeric_dtype(df[d]):
+        df[d] = pd.to_datetime(df[d], errors="coerce", dayfirst=True)
+    c = detect_columns(df)
+    for key in ("spc", "seg", "fam"):
+        col = c[key]
+        if col:
+            s = df[col]
+            df[col] = s.astype(object).where(s.isna(), s.astype(str))
+    return df
+
+
+def detect_columns(df):
+    cols = list(df.columns)
+    low = {c: c.lower() for c in cols}
+    date = pick_date_col(cols)
+    if date and not pd.api.types.is_datetime64_any_dtype(df[date]):
+        date = ""
+    num = df.select_dtypes(include="number").columns.tolist()
+    return {
+        "date": date,
+        "spc": next((c for c in cols if "spc" in low[c] and "name" in low[c]), ""),
+        "seg": next((c for c in cols if "seg1" in low[c]), ""),
+        "fam": next((c for c in cols if "family" in low[c]), ""),
+        "num_cols": num,
     }
-    body.dark-mode {
-        --bg-main: #000000; --glass-sidebar: rgba(20, 20, 22, 0.98);
-        --glass-border: rgba(255, 255, 255, 0.15); --text-primary: #f5f5f7; --text-secondary: #a1a1a6;
-        --shadow-glass: 0 10px 30px rgba(0,0,0,0.5); --header-bg: #1c1c1e; --header-text: #a1a1a6;
-        --total-bg: #10243b; --total-text: #f5f5f7;
-        --green: #30d158; --card-bg: #151516;
+
+
+def derived_names(columns, date):
+    """Week / Month buckets are offered as extra X-axis choices when a date column exists."""
+    if not date:
+        return []
+    return [n for n in ("Week of", "Month") if n not in columns]
+
+
+def week_start(s):
+    return s.dt.normalize() - pd.to_timedelta(s.dt.weekday, unit="D")
+
+
+def opts(names, hint="", checked=()):
+    return [{"name": str(n), "hint": hint, "checked": n in checked} for n in names]
+
+
+def build_context(df):
+    c = detect_columns(df)
+    cols = list(df.columns)
+    num = c["num_cols"]
+
+    lists = {k: (sorted(df[c[k]].dropna().unique().tolist()) if c[k] else [])
+             for k in ("spc", "seg", "fam")}
+    keys = [(k, c[k]) for k in ("spc", "seg", "fam") if c[k]]
+    mapping = []
+    if keys:
+        m = df[[col for _, col in keys]].fillna("N/A").drop_duplicates()
+        m.columns = [k for k, _ in keys]
+        mapping = m.to_dict(orient="records")
+
+    dmin = dmax = None
+    weeks, months = [], []
+    if c["date"]:
+        s = df[c["date"]].dropna()
+        if len(s):
+            dmin, dmax = s.min(), s.max()
+            for w in sorted(week_start(s).drop_duplicates())[-160:]:
+                e = w + pd.Timedelta(days=6)
+                weeks.append({
+                    "key": w.strftime("%Y-%m-%d"),
+                    "label": f"W{w.isocalendar()[1]:02d}",
+                    "range": f"{w.day} {w:%b}" + (f" – {e.day} {e:%b}" if e.month != w.month else f"–{e.day}"),
+                    "year": f"{w:%y}",
+                })
+            for mth in sorted((s.dt.year * 100 + s.dt.month).unique())[-60:]:
+                y, mo = divmod(int(mth), 100)
+                months.append({"key": f"{y:04d}-{mo:02d}", "label": f"{pd.Timestamp(y, mo, 1):%b} {y}"})
+
+    non_num = [x for x in cols if x not in num and x != c["date"]]
+    default_x = next((c[k] for k in ("spc", "fam", "seg") if c[k]), non_num[0] if non_num else cols[0])
+    default_y = "Tentative DP" if "Tentative DP" in num else (num[0] if num else "")
+
+    x_opts = [{"name": n, "hint": "date", "checked": False} for n in derived_names(cols, c["date"])]
+    for col in cols:
+        hint = "date" if col == c["date"] else ("number" if col in num else "")
+        x_opts.append({"name": col, "hint": hint, "checked": col == default_x})
+
+    def label(d):
+        return f"{d.day:02d} {d:%b %Y}" if d is not None else "N/A"
+
+    boot = {"map": mapping,
+            "dmin": dmin.strftime("%Y-%m-%d") if dmin is not None else "",
+            "dmax": dmax.strftime("%Y-%m-%d") if dmax is not None else "",
+            "all": f"All time · {label(dmin)} – {label(dmax)}" if dmin is not None else "All records"}
+    return {
+        **c, "dmin": dmin, "dmax": dmax, "weeks": weeks, "months": months,
+        "spc_opts": opts(lists["spc"]), "seg_opts": opts(lists["seg"]), "fam_opts": opts(lists["fam"]),
+        "x_opts": x_opts, "y_opts": opts(num, "number", {default_y}),
+        "boot_json": json.dumps(boot).replace("<", "\\u003c"),
+        "range_label": f"{label(dmin)} – {label(dmax)}" if dmin is not None else "",
     }
-    body { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", sans-serif; background: var(--bg-main); color: var(--text-primary); margin: 0; padding: 0; transition: background 0.3s, color 0.3s; -webkit-tap-highlight-color: transparent; }
-    
-    .nav { background: var(--glass-sidebar); backdrop-filter: saturate(180%) blur(20px); border-bottom: 1px solid var(--glass-border); padding: 0 16px; height: 60px; display: flex; justify-content: space-between; align-items: center; position: fixed; top: 0; width: 100%; z-index: 2500; box-sizing: border-box; }
-    .nav-brand { font-weight: 700; font-size: 17px; letter-spacing: -0.5px; display: flex; align-items: center; gap: 10px; }
-    .nav-controls { display: flex; gap: 6px; align-items: center; }
-    
-    .menu-btn { display: none; background: none; border: none; font-size: 22px; cursor: pointer; color: var(--text-primary); padding: 4px; }
-    
-    .btn-icon { background: rgba(120, 120, 128, 0.1); border: 1px solid var(--glass-border); color: var(--text-primary); border-radius: 50%; width: 36px; height: 36px; display: flex; align-items: center; justify-content: center; font-size: 15px; cursor: pointer; transition: 0.2s; flex-shrink: 0; }
-    .btn-icon:hover { background: rgba(120, 120, 128, 0.2); transform: scale(1.05); }
-    
-    .btn-liquid { background: rgba(120, 120, 128, 0.1); border: 1px solid var(--glass-border); color: var(--text-primary); border-radius: 12px; padding: 8px 12px; font-size: 12px; font-weight: 600; cursor: pointer; transition: 0.2s; white-space: nowrap; box-sizing: border-box; }
-    .btn-liquid:hover { background: rgba(120, 120, 128, 0.15); }
-    .btn-primary { background: var(--blue-apple); color: #fff; border: none; }
-    
-    .app-layout { display: flex; height: 100vh; padding-top: 60px; box-sizing: border-box; position: relative; overflow: hidden; }
-    
-    .sidebar { width: 320px; background: var(--glass-sidebar); backdrop-filter: blur(40px); border-right: 1px solid var(--glass-border); padding: 16px; overflow-y: auto; flex-shrink: 0; transition: transform 0.4s cubic-bezier(0.25, 1, 0.5, 1); z-index: 2000; box-sizing: border-box; }
-    .main-content { flex: 1; padding: 16px; overflow: hidden; display: flex; flex-direction: column; box-sizing: border-box; }
-    
-    .section-title { font-size: 11px; font-weight: 700; color: var(--text-secondary); text-transform: uppercase; margin: 18px 0 6px; letter-spacing: 0.5px; }
-    .checkbox-group { background: rgba(120,120,128,0.05); border: 1px solid var(--glass-border); border-radius: 12px; padding: 6px; max-height: 180px; overflow-y: auto; }
-    .checkbox-item { display: flex; align-items: center; padding: 8px; font-size: 13px; cursor: pointer; border-radius: 8px; font-weight: 500; }
-    .checkbox-item:hover { background: rgba(120,120,128,0.1); }
-    .checkbox-item input[type="checkbox"]:not(.ios-switch), .checkbox-item input[type="radio"] { margin-right: 10px; accent-color: var(--blue-apple); width: 16px; height: 16px; flex-shrink: 0; }
-    
-    .btn-segmented { display: flex; background: rgba(120,120,128,0.1); border-radius: 12px; padding: 4px; gap: 4px; width: 100%; max-width: 180px; margin-left: auto; }
-    .btn-segmented label { flex: 1; text-align: center; font-size: 12px; font-weight: 600; padding: 6px 10px; border-radius: 8px; cursor: pointer; color: var(--text-secondary); transition: 0.2s; z-index: 2; }
-    .btn-segmented input { display: none; }
-    .btn-segmented input:checked + label { color: var(--text-primary); }
-    
-    .table-container { background: var(--card-bg); border-radius: 16px; border: 1px solid var(--glass-border); flex: 1; overflow: hidden; display: flex; flex-direction: column; box-shadow: var(--shadow-glass); }
-    
-    .summary-bar { background: var(--card-bg); padding: 12px 16px; border-bottom: 1px solid var(--glass-border); font-size: 12px; font-weight: 500; display: flex; justify-content: space-between; align-items: center; color: var(--text-secondary); flex-wrap: wrap; gap: 8px; }
-    .summary-bar b { color: var(--text-primary); font-weight: 600; }
-    
-    .table-scroll { flex: 1; overflow: auto; -webkit-overflow-scrolling: touch; }
-    .excel-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-    .excel-table th, .excel-table td { padding: 12px 16px; text-align: left; border-bottom: 1px solid var(--glass-border); white-space: nowrap; }
-    .excel-table th { background: var(--header-bg); color: var(--header-text); font-size: 11px; text-transform: uppercase; position: sticky; top: 0; z-index: 10; font-weight: 600; letter-spacing: 0.05em; }
-    .excel-table th:first-child, .excel-table td:first-child { position: sticky; left: 0; z-index: 20; background: var(--card-bg); font-weight: 600; box-shadow: 1px 0 0 var(--glass-border); }
-    .excel-table th:first-child { z-index: 30; background: var(--header-bg); }
-    
-    .excel-table tbody tr:last-child td { font-weight: 700; background: var(--total-bg); color: var(--total-text); border-top: 1px solid var(--glass-border); border-bottom: none; position: sticky; bottom: 0; z-index: 15; }
-    .excel-table tbody tr:last-child td:first-child { z-index: 25; }
-    
-    .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 10px; margin-bottom: 16px; }
-    .kpi { display: flex; flex-direction: column; background: var(--card-bg); border: 1px solid var(--glass-border); padding: 10px 14px; border-radius: 12px; box-shadow: var(--shadow-glass); box-sizing: border-box; overflow: hidden; }
-    .kpi-label { font-size: 10px; font-weight: 600; color: var(--text-secondary); margin-bottom: 2px; text-transform: uppercase; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .kpi-val { font-size: 20px; font-weight: 700; color: var(--text-primary); letter-spacing: -0.03em; word-break: break-all; }
 
-    /* iOS Toggle Switch */
-    .switch-container { display: flex; align-items: center; justify-content: space-between; padding: 6px 8px; cursor: pointer; }
-    .switch { position: relative; width: 40px; height: 22px; background: rgba(120,120,128,0.3); border-radius: 12px; transition: 0.3s; flex-shrink: 0; }
-    .switch::after { content: ''; position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; background: #fff; border-radius: 50%; box-shadow: 0 2px 4px rgba(0,0,0,0.2); transition: 0.3s; }
-    input:checked + .switch { background: var(--green); }
-    input:checked + .switch::after { transform: translateX(18px); }
-    input.ios-switch { display: none; }
-    
-    .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
-    .chip { padding: 5px 10px; border-radius: 8px; background: rgba(120,120,128,0.1); font-size: 11px; font-weight: 600; cursor: pointer; transition: 0.2s; border: none; color: var(--text-primary); }
-    .chip.active { background: var(--blue-apple); color: #fff; }
 
-    /* Mobile Responsive Media Query */
-    @media (max-width: 900px) {
-        .menu-btn { display: block; }
-        .sidebar { position: fixed; top: 60px; bottom: 0; left: 0; transform: translateX(-100%); width: 280px; box-shadow: 20px 0 40px rgba(0,0,0,0.25); background: var(--glass-sidebar); }
-        .sidebar.open { transform: translateX(0); }
-        .main-content { padding: 12px; }
-    }
-</style>
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-"""
-
-UPLOAD_HTML = """
-<!DOCTYPE html>
-<html>
-<head><title>Upload - Analytics Pro</title><meta name="viewport" content="width=device-width, initial-scale=1.0">""" + GLOBAL_HEAD + """</head>
-<body>
-    <div class="nav"><div class="nav-brand">Analytics Pro</div></div>
-    <div style="max-width: 480px; margin: 120px auto; padding: 20px; text-align: center;">
-        <h1 style="font-size: 28px; margin-bottom: 8px;">Analytics Engine.</h1>
-        <p style="color: var(--text-secondary); margin-bottom: 32px; font-size: 14px;">Upload data to launch the Business Intelligence workspace.</p>
-        
-        {% if error %}
-        <div style="background: rgba(255, 59, 48, 0.1); color: #ff3b30; padding: 12px; border-radius: 12px; margin-bottom: 16px; font-weight: 600; font-size: 13px;">
-            {{ error }}
-        </div>
-        {% endif %}
-        
-        <form action="/dashboard" method="post" enctype="multipart/form-data" style="background: var(--card-bg); padding: 28px; border-radius: 24px; border: 1px solid var(--glass-border); box-shadow: var(--shadow-glass);">
-            <input type="file" name="file" accept=".xlsx, .xls, .csv" required style="width: 100%; margin-bottom: 24px; padding: 14px; border: 2px dashed var(--glass-border); border-radius: 12px; cursor: pointer; color: var(--text-primary); font-size: 12px;">
-            <button type="submit" class="btn-liquid btn-primary" style="width: 100%; padding: 14px; font-size: 14px;">Launch Workspace →</button>
-        </form>
-    </div>
-</body>
-</html>
-"""
-
-WORKSPACE_HTML = """
-<!DOCTYPE html>
-<html>
-<head><title>Executive Dashboard</title><meta name="viewport" content="width=device-width, initial-scale=1.0">""" + GLOBAL_HEAD + """</head>
-<body>
-    <div class="nav">
-        <div class="nav-brand">
-            <button class="menu-btn" onclick="toggleSidebar()">☰</button>
-            <span>Analytics Pro</span>
-        </div>
-        <div class="nav-controls">
-            <button class="btn-icon" onclick="location.reload()" title="Reload App">🔄</button>
-            <button class="btn-icon" onclick="toggleDarkMode()" id="dm-btn" title="Toggle Theme">🌙</button>
-            <button class="btn-icon" onclick="exportImage()" title="Save Image">📸</button>
-            <button class="btn-icon" id="dlExcel" title="Download Excel">📊</button>
-        </div>
-    </div>
-
-    <div class="app-layout">
-        <div class="sidebar" id="sidebar">
-            <form id="config-form">
-                
-                <div class="section-title" style="margin-top: 0;">Configure Axis Fields</div>
-                <div class="checkbox-group">
-                    <label class="switch-container">
-                        <span style="font-size: 13px; font-weight: 500;">Select All Fields</span>
-                        <input type="checkbox" class="ios-switch" onchange="toggleAll('master_fields', this.checked)">
-                        <div class="switch"></div>
-                    </label>
-                    <div style="height: 1px; background: var(--glass-border); margin: 4px 0;"></div>
-                    {% for col in grouping_cols %}
-                    <label class="checkbox-item">
-                        <input type="checkbox" name="master_fields" value="{{ col }}" onchange="updateAxisVisibility()" {% if loop.index <= 5 %}checked{% endif %}> 
-                        <span>{{ col }}</span>
-                    </label>
-                    {% endfor %}
-                </div>
-
-                {% if status_list %}
-                <div class="section-title">Final Status Filter</div>
-                <div class="checkbox-group" style="max-height: 150px;">
-                    <label class="switch-container">
-                        <span style="font-size: 13px; font-weight: 500;">Select All Statuses</span>
-                        <input type="checkbox" class="ios-switch" onchange="toggleAll('status_filters', this.checked)" checked>
-                        <div class="switch"></div>
-                    </label>
-                    <div style="height: 1px; background: var(--glass-border); margin: 4px 0;"></div>
-                    {% for st in status_list %}
-                    <label class="checkbox-item"><input type="checkbox" name="status_filters" value="{{ st }}" checked onchange="updateDashboard()"> <span>{{ st }}</span></label>
-                    {% endfor %}
-                </div>
-                {% endif %}
-                
-                <div class="section-title">Timeline & Comparison</div>
-                <div class="chips">
-                    <button type="button" class="chip" onclick="preset('yesterday', this)">Yesterday</button>
-                    <button type="button" class="chip" onclick="preset('last7', this)">Last 7 Days</button>
-                    <button type="button" class="chip" onclick="preset('mtd', this)">MTD</button>
-                    <button type="button" class="chip" onclick="preset('lmtd', this)">LMTD</button>
-                    <button type="button" class="chip" onclick="preset('lwtd', this)">LWTD</button>
-                    <button type="button" class="chip" onclick="preset('ytd', this)">YTD</button>
-                    <button type="button" class="chip" onclick="preset('lytd', this)">LYTD</button>
-                </div>
-                
-                <div style="display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px;">
-                    <div>
-                        <label style="font-size: 10px; color: var(--text-secondary); font-weight: 700; display: block; margin-bottom: 2px;">FROM</label>
-                        <input type="date" name="start_date" id="start_date" class="btn-liquid" style="width: 100%;" onchange="updateDashboard()">
-                    </div>
-                    <div>
-                        <label style="font-size: 10px; color: var(--text-secondary); font-weight: 700; display: block; margin-bottom: 2px;">TO</label>
-                        <input type="date" name="end_date" id="end_date" class="btn-liquid" style="width: 100%;" onchange="updateDashboard()">
-                    </div>
-                </div>
-
-                <div class="checkbox-group" style="margin-bottom: 12px;">
-                    <label class="switch-container">
-                        <span style="font-size: 13px; font-weight: 600;">Enable Period Comparison</span>
-                        <input type="checkbox" name="compare_mode" value="lmtd" class="ios-switch" onchange="updateDashboard()">
-                        <div class="switch"></div>
-                    </label>
-                </div>
-
-                <div id="pivot-controls">
-                    <div class="section-title">Rows (Y-Axis)</div>
-                    <div class="checkbox-group">
-                        <label class="switch-container">
-                            <span style="font-size: 13px; font-weight: 500;">Select All Rows</span>
-                            <input type="checkbox" class="ios-switch" onchange="toggleAll('index_cols', this.checked)">
-                            <div class="switch"></div>
-                        </label>
-                        <div style="height: 1px; background: var(--glass-border); margin: 4px 0;"></div>
-                        {% for col in grouping_cols %}
-                        <label class="checkbox-item axis-row-item" data-field="{{ col }}"><input type="checkbox" name="index_cols" value="{{ col }}" onchange="updateDashboard()"> <span>{{ col }}</span></label>
-                        {% endfor %}
-                    </div>
-                    
-                    <div class="section-title">Columns (X-Axis)</div>
-                    <div class="checkbox-group">
-                        <label class="switch-container">
-                            <span style="font-size: 13px; font-weight: 500;">Select All Columns</span>
-                            <input type="checkbox" class="ios-switch" onchange="toggleAll('columns_cols', this.checked)">
-                            <div class="switch"></div>
-                        </label>
-                        <div style="height: 1px; background: var(--glass-border); margin: 4px 0;"></div>
-                        {% for col in grouping_cols %}
-                        <label class="checkbox-item axis-col-item" data-field="{{ col }}"><input type="checkbox" name="columns_cols" value="{{ col }}" onchange="updateDashboard()"> <span>{{ col }}</span></label>
-                        {% endfor %}
-                    </div>
-
-                    <div class="section-title">Metrics & Configuration</div>
-                    <label style="font-size: 10px; color: var(--text-secondary); margin-bottom: 4px; display:block;">VALUE FIELD</label>
-                    <div class="checkbox-group" style="margin-bottom: 12px; max-height: 120px;">
-                        {% for col in num_cols %}
-                        <label class="checkbox-item"><input type="radio" name="value_col" value="{{ col }}" {% if loop.first %}checked{% endif %} onchange="updateDashboard()"> <span>{{ col }}</span></label>
-                        {% endfor %}
-                    </div>
-                    
-                    <label style="font-size: 10px; color: var(--text-secondary); margin-bottom: 4px; display:block;">AGGREGATION</label>
-                    <div class="checkbox-group">
-                        <label class="switch-container">
-                            <span style="font-size: 13px; font-weight: 500;">Sum Total</span>
-                            <input type="checkbox" name="agg_funcs" value="sum" class="ios-switch" checked onchange="updateDashboard()">
-                            <div class="switch"></div>
-                        </label>
-                        <label class="switch-container">
-                            <span style="font-size: 13px; font-weight: 500;">Count (Qty)</span>
-                            <input type="checkbox" name="agg_funcs" value="count" class="ios-switch" onchange="updateDashboard()">
-                            <div class="switch"></div>
-                        </label>
-                        <div style="height: 1px; background: var(--glass-border); margin: 4px 0;"></div>
-                        
-                        <label class="switch-container" id="total_wrapper">
-                            <span style="font-size: 13px; font-weight: 500;">Show Grand Totals</span>
-                            <input type="checkbox" id="show_total_cb" class="ios-switch" name="show_row_total" value="true" checked onchange="updateDashboard()">
-                            <div class="switch"></div>
-                        </label>
-                    </div>
-                </div>
-                
-                <div style="text-align: center; margin-top: 24px; padding-bottom: 20px;">
-                    <a href="/upload" style="color: #ff3b30; font-size: 12px; text-decoration: none; font-weight: 600; padding: 8px 16px; border-radius: 980px; background: rgba(255, 59, 48, 0.1);">← Upload New File</a>
-                </div>
-            </form>
-        </div>
-        
-        <div class="main-content" onclick="closeSidebarOnMobile(event)">
-            <div style="display: flex; justify-content: flex-end; margin-bottom: 12px;">
-                <div class="btn-segmented">
-                    <div class="seg-thumb" style="position: absolute; top: 4px; bottom: 4px; left: 4px; width: calc(50% - 4px); background: var(--card-bg); border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); transition: 0.3s; z-index: 1;"></div>
-                    <input type="radio" id="view_dash" name="view_mode_toggle" value="dashboard" checked onchange="updateDashboard()">
-                    <label for="view_dash">Pivot</label>
-                    <input type="radio" id="view_chart" name="view_mode_toggle" value="chart" onchange="updateDashboard()">
-                    <label for="view_chart">Chart</label>
-                </div>
-            </div>
-            
-            <div id="kpi-banner" class="kpis"></div>
-            
-            <div class="table-container" id="capture-area">
-                <div class="summary-bar" id="summaryBar">Select fields to build your view.</div>
-                <div id="table-wrapper" class="table-scroll">
-                    <div style="padding: 60px; text-align: center; color: var(--text-secondary); font-size: 14px;">Configure Y-Axis and metrics to preview data.</div>
-                </div>
-                <div id="chart-wrapper" style="display:none; padding: 16px; flex: 1; min-height: 400px;"><canvas id="dataChart"></canvas></div>
-            </div>
-        </div>
-    </div>
-
-    <script>
-        function toggleSidebar() {
-            document.getElementById('sidebar').classList.toggle('open');
-        }
-
-        function closeSidebarOnMobile(e) {
-            if (window.innerWidth <= 900) {
-                const sidebar = document.getElementById('sidebar');
-                if (sidebar.classList.contains('open') && !sidebar.contains(e.target)) {
-                    sidebar.classList.remove('open');
-                }
-            }
-        }
-
-        function updateAxisVisibility() {
-            const selectedFields = Array.from(document.querySelectorAll('input[name="master_fields"]:checked')).map(cb => cb.value);
-            
-            document.querySelectorAll('.axis-row-item').forEach(item => {
-                const field = item.getAttribute('data-field');
-                if (selectedFields.includes(field)) item.style.display = 'flex';
-                else { item.style.display = 'none'; item.querySelector('input').checked = false; }
-            });
-
-            document.querySelectorAll('.axis-col-item').forEach(item => {
-                const field = item.getAttribute('data-field');
-                if (selectedFields.includes(field)) item.style.display = 'flex';
-                else { item.style.display = 'none'; item.querySelector('input').checked = false; }
-            });
-            updateDashboard();
-        }
-        
-        function toggleAll(groupName, isChecked) {
-            document.querySelectorAll(`input[name="${groupName}"]`).forEach(cb => {
-                if (groupName === 'index_cols' || groupName === 'columns_cols') {
-                    if (cb.parentElement.style.display !== 'none') cb.checked = isChecked;
-                } else {
-                    cb.checked = isChecked;
-                }
-            });
-            if(groupName === 'master_fields') updateAxisVisibility();
-            else updateDashboard();
-        }
-
-        document.querySelectorAll('input[name="view_mode_toggle"]').forEach(radio => {
-            radio.addEventListener('change', function() {
-                const thumb = document.querySelector('.seg-thumb');
-                thumb.style.transform = this.value === 'chart' ? 'translateX(100%)' : 'translateX(0)';
-                updateDashboard();
-            });
-        });
-
-        function toggleDarkMode() { 
-            const isDark = document.body.classList.toggle('dark-mode'); 
-            document.getElementById('dm-btn').innerText = isDark ? '☀️' : '🌙';
-            if(document.querySelector('input[name="view_mode_toggle"]:checked').value === 'chart') updateDashboard();
-        }
-
-        const iso = d => new Date(d.getTime() - d.getTimezoneOffset() * 6e4).toISOString().slice(0, 10);
-        function preset(key, chip) {
-            document.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
-            chip.classList.add('active');
-            
-            const t = new Date(); let s = new Date(t), e = new Date(t);
-            if (key === 'yesterday') { s.setDate(t.getDate() - 1); e.setDate(t.getDate() - 1); }
-            else if (key === 'last7') { s.setDate(t.getDate() - 6); }
-            else if (key === 'mtd') { s = new Date(t.getFullYear(), t.getMonth(), 1); }
-            else if (key === 'lmtd') { s = new Date(t.getFullYear(), t.getMonth() - 1, 1); e = new Date(t.getFullYear(), t.getMonth() - 1, t.getDate()); }
-            else if (key === 'lwtd') { let day = t.getDay() || 7; s.setDate(t.getDate() - day - 6); e.setDate(t.getDate() - day); }
-            else if (key === 'ytd') { s = new Date(t.getFullYear(), 0, 1); }
-            else if (key === 'lytd') { s = new Date(t.getFullYear() - 1, 0, 1); e = new Date(t.getFullYear() - 1, t.getMonth(), t.getDate()); }
-            
-            document.getElementById('start_date').value = iso(s);
-            document.getElementById('end_date').value = iso(e);
-            updateDashboard();
-        }
-
-        let chartInstance = null;
-
-        async function updateDashboard() {
-            const form = document.getElementById('config-form');
-            const formData = new FormData(form);
-            const mode = document.querySelector('input[name="view_mode_toggle"]:checked').value;
-            formData.append('view_mode', mode);
-
-            const metrics = formData.getAll('agg_funcs');
-            const totalCb = document.getElementById('show_total_cb');
-            const totalWrap = document.getElementById('total_wrapper');
-            
-            if(metrics.includes('sum') && metrics.includes('count')) {
-                totalCb.checked = false; totalCb.disabled = true; totalWrap.style.opacity = '0.4';
-            } else {
-                totalCb.disabled = false; totalWrap.style.opacity = '1';
-            }
-
-            try {
-                const res = await fetch('/calculate', { method: 'POST', body: formData });
-                let data;
-                try { data = await res.json(); } 
-                catch (e) { document.getElementById('table-wrapper').innerHTML = `<div style="padding:40px; color:#ff3b30; text-align:center; font-weight:600;">Server Error</div>`; return; }
-                
-                if (data.error) {
-                    document.getElementById('chart-wrapper').style.display = 'none';
-                    document.getElementById('table-wrapper').style.display = 'block';
-                    document.getElementById('summaryBar').innerText = "Configuration Required";
-                    document.getElementById('table-wrapper').innerHTML = `<div style="padding:40px; color:#ff3b30; text-align:center; font-weight:600;">${data.error}</div>`;
-                    return;
-                }
-                
-                document.getElementById('summaryBar').innerHTML = data.summary_text || "Data View";
-                const kpiBanner = document.getElementById('kpi-banner');
-                kpiBanner.innerHTML = data.kpi_html || '';
-                
-                const tw = document.getElementById('table-wrapper');
-                const cw = document.getElementById('chart-wrapper');
-                
-                if (mode === 'chart') {
-                    tw.style.display = 'none';
-                    cw.style.display = 'block';
-                    renderChart(data.chart_data);
-                } else {
-                    cw.style.display = 'none';
-                    tw.style.display = 'block';
-                    tw.innerHTML = data.table_html;
-                }
-            } catch(e) { console.error(e); }
-        }
-
-        function renderChart(data) {
-            const cw = document.getElementById('chart-wrapper');
-            if(!data) { cw.innerHTML = "<div style='text-align:center; padding:40px; color:var(--text-secondary);'>Select rows and metrics to generate chart.</div>"; return; }
-            
-            cw.innerHTML = '<canvas id="dataChart"></canvas>';
-            const ctx = document.getElementById('dataChart').getContext('2d');
-            const isDark = document.body.classList.contains('dark-mode');
-            const textColor = isDark ? '#a1a1a6' : '#86868b';
-            const gridColor = isDark ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.05)';
-            
-            chartInstance = new Chart(ctx, {
-                type: 'bar',
-                data: data,
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    plugins: { legend: { labels: { color: isDark ? '#f5f5f7' : '#1d1d1f', font: { family: '-apple-system' } } } },
-                    scales: {
-                        x: { ticks: { color: textColor, font: { family: '-apple-system' } }, grid: { color: gridColor } },
-                        y: { ticks: { color: textColor, font: { family: '-apple-system' } }, grid: { color: gridColor } }
-                    }
-                }
-            });
-        }
-
-        function exportImage() {
-            const mode = document.querySelector('input[name="view_mode_toggle"]:checked').value;
-            if (mode === 'chart' && chartInstance) {
-                const a = document.createElement('a'); a.download = 'Chart_Export.png';
-                a.href = chartInstance.toBase64Image(); a.click();
-            } else {
-                const table = document.querySelector('.excel-table');
-                if(!table || table.rows.length <= 1) { 
-                    alert("Please select rows and metrics to generate a valid report before downloading the image."); 
-                    return; 
-                }
-                
-                const rows = table.querySelectorAll('tr');
-                let canvas = document.createElement('canvas');
-                let ctx = canvas.getContext('2d');
-                
-                let rowHeight = 44;
-                let numRows = rows.length;
-                let numCols = rows[0] ? rows[0].querySelectorAll('th, td').length : 4;
-                let colWidth = 180;
-                
-                canvas.width = numCols * colWidth;
-                canvas.height = numRows * rowHeight + 90;
-                
-                const isDark = document.body.classList.contains('dark-mode');
-                ctx.fillStyle = isDark ? '#151516' : '#ffffff';
-                ctx.fillRect(0, 0, canvas.width, canvas.height);
-                
-                ctx.fillStyle = isDark ? '#f5f5f7' : '#1d1d1f';
-                ctx.font = 'bold 18px -apple-system, sans-serif';
-                ctx.fillText("Executive Sales Report", 24, 42);
-                
-                let y = 75;
-                rows.forEach((row, rIndex) => {
-                    let x = 24;
-                    let cells = row.querySelectorAll('th, td');
-                    cells.forEach((cell, cIndex) => {
-                        ctx.fillStyle = rIndex === 0 ? (isDark ? '#1c1c1e' : '#f9f9fb') : (isDark ? '#151516' : '#ffffff');
-                        ctx.fillRect(x, y, colWidth - 6, rowHeight - 6);
-                        
-                        ctx.fillStyle = isDark ? '#f5f5f7' : '#1d1d1f';
-                        ctx.font = rIndex === 0 ? 'bold 13px -apple-system' : '13px -apple-system';
-                        ctx.fillText(cell.innerText.trim().substring(0, 24), x + 12, y + 27);
-                        x += colWidth;
-                    });
-                    y += rowHeight;
-                });
-                
-                const link = document.createElement('a');
-                link.download = 'Executive_Report.png';
-                link.href = canvas.toDataURL('image/png');
-                link.click();
-            }
-        }
-        
-        document.getElementById('dlExcel').addEventListener('click', () => { 
-            const fd = new URLSearchParams(new FormData(document.getElementById('config-form'))); 
-            location.href = '/download?' + fd.toString(); 
-        });
-        
-        document.getElementById('start_date').addEventListener('change', () => document.querySelectorAll('.chip').forEach(c => c.classList.remove('active')));
-        document.getElementById('end_date').addEventListener('change', () => document.querySelectorAll('.chip').forEach(c => c.classList.remove('active')));
-        
-        window.onload = () => { updateAxisVisibility(); };
-    </script>
-</body>
-</html>
-"""
-
-def get_master_data():
-    if os.path.exists(DATA_FILE_PATH):
-        try:
-            with open(DATA_FILE_PATH, 'rb') as f:
-                saved = pd.read_pickle(f)
-            df = saved['df'] if isinstance(saved, dict) and 'df' in saved else saved
-            df.rename(columns=lambda x: str(x).replace('SPC Name', 'BA Name').replace('SPC', 'BA'), inplace=True)
-            return df
-        except Exception:
-            return None
-    return None
-
-def format_indian_number(x):
-    if pd.isna(x) or x == '': return ''
+def get_state():
     try:
-        n = int(round(float(x)))
-        s = str(abs(n))
-        if len(s) > 3:
-            res = s[-3:]
-            s = s[:-3]
-            while len(s) > 2:
-                res = s[-2:] + ',' + res
-                s = s[:-2]
-            s = s + ',' + res
-        return f"-{s}" if n < 0 else s
-    except: return str(x)
+        mtime = os.path.getmtime(DATA_FILE_PATH)
+    except OSError:
+        return None
+    with _lock:
+        if _state["mtime"] != mtime:
+            try:
+                df = pd.read_pickle(DATA_FILE_PATH)
+            except Exception:
+                return None
+            _state.update(mtime=mtime, df=df, ctx=build_context(df))
+        return dict(_state)
 
-@app.route("/")
+
+def save_data(df):
+    df = prepare_df(df)
+    tmp = DATA_FILE_PATH + ".tmp"
+    df.to_pickle(tmp)
+    os.replace(tmp, DATA_FILE_PATH)
+    with open(META_FILE_PATH, "w") as fh:
+        json.dump({"upload_time": datetime.now().strftime("%d %b %Y, %I:%M %p")}, fh)
+
+
+def get_upload_time():
+    try:
+        with open(META_FILE_PATH) as fh:
+            return json.load(fh).get("upload_time", "")
+    except (OSError, ValueError):
+        return ""
+
+
+# ════════════════════════════════════════════════════════════════════
+#  FORMATTING / RENDERING
+# ════════════════════════════════════════════════════════════════════
+_GROUP = re.compile(r"(\d)(?=(\d\d)+$)")
+
+
+def format_indian_number(x, dec=0):
+    if x is None or (isinstance(x, str) and x == ""):
+        return ""
+    try:
+        if pd.isna(x):
+            return ""
+        v = round(float(x), dec)
+    except (ValueError, TypeError, OverflowError):
+        return html.escape(str(x))
+    neg = v < 0
+    v = abs(v)
+    s = str(int(v))
+    if len(s) > 3:
+        s = _GROUP.sub(r"\1,", s[:-3]) + "," + s[-3:]
+    if dec:
+        s += "." + f"{v:.{dec}f}".split(".")[1]
+    return f"-{s}" if neg and v else s
+
+
+def format_avg(x):
+    try:
+        return format_indian_number(x, 2 if abs(float(x)) < 100 else 0)
+    except (TypeError, ValueError):
+        return ""
+
+
+def format_plain(v):
+    if v is None or pd.isna(v):
+        return ""
+    try:
+        f = float(v)
+        return str(int(f)) if f.is_integer() else str(v)
+    except (TypeError, ValueError):
+        return html.escape(str(v))
+
+
+def format_pct(v):
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return ""
+    if x != x:
+        return ""
+    if round(x, 1) > 0:
+        return f'<span class="pct-positive">↑ {x:.1f}%</span>'
+    if round(x, 1) < 0:
+        return f'<span class="pct-negative">↓ {abs(x):.1f}%</span>'
+    return '<span class="pct-neutral">–</span>'
+
+
+def col_cells(s, fmt=None, esc=True):
+    if pd.api.types.is_datetime64_any_dtype(s):
+        return s.dt.strftime(fmt or "%d-%b-%y").fillna("").tolist()
+    if pd.api.types.is_numeric_dtype(s):
+        return [format_plain(v) for v in s]
+    out = ["" if pd.isna(v) else str(v) for v in s]
+    return [html.escape(v) for v in out] if esc else out
+
+
+def num_cells(s, additive=True):
+    if not additive:
+        return [format_plain(v) for v in s]
+    dec = 2 if (pd.api.types.is_float_dtype(s) and s.dropna().mod(1).ne(0).any()) else 0
+    return [format_indian_number(v, dec) for v in s]
+
+
+def render_table(headers, columns, css, numeric, nidx, foot=None, total_cols=()):
+    def cls(i, base=""):
+        out = [base] if base else []
+        if i in numeric:
+            out.append("num")
+        if i in total_cols:
+            out.append("total-col")
+        return f' class="{" ".join(out)}"' if out else ""
+
+    head = "".join(f"<th{cls(i)}>{html.escape(h)}</th>" for i, h in enumerate(headers))
+    body = "".join("<tr>" + "".join(f"<td{cls(i)}>{v}</td>" for i, v in enumerate(row)) + "</tr>"
+                   for row in zip(*columns))
+    tfoot = ""
+    if foot:
+        tfoot = "<tfoot><tr>" + "".join(f"<td{cls(i)}>{v}</td>" for i, v in enumerate(foot)) + "</tr></tfoot>"
+    return (f'<table class="excel-table {css}" data-nidx="{nidx}"><thead><tr>{head}</tr></thead>'
+            f"<tbody>{body}</tbody>{tfoot}</table>")
+
+
+def empty_block(title, msg=""):
+    return (f'<div class="empty"><svg class="ic"><use href="#i-chart"/></svg>'
+            f"<h3>{html.escape(title)}</h3><p>{html.escape(msg)}</p></div>")
+
+
+def nice_join(items):
+    items = list(items)
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " & " + items[-1]
+
+
+def pivot_title(ys, aggs, xs):
+    y = nice_join(ys[:3]) + (f" +{len(ys) - 3}" if len(ys) > 3 else "")
+    x = " › ".join(xs[:3]) + (f" +{len(xs) - 3}" if len(xs) > 3 else "")
+    return f"{nice_join([AGG_WORD[a] for a in aggs])} of {y} by {x}"
+
+
+def slug(text):
+    return re.sub(r"[^A-Za-z0-9]+", "_", text).strip("_")[:80] or "Report"
+
+
+def num_or_none(v):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return None if f != f or f in (float("inf"), float("-inf")) else round(f, 2)
+
+
+# ════════════════════════════════════════════════════════════════════
+#  FILTERS & PERIOD TEXT
+# ════════════════════════════════════════════════════════════════════
+def parse_date(s):
+    if not s:
+        return None
+    t = pd.to_datetime(s, errors="coerce")
+    return None if pd.isna(t) else t
+
+
+def clean_list(p, key, allowed):
+    seen, out = set(), []
+    for v in p.getlist(key):
+        if v in allowed and v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+def apply_filters(df, ctx, p):
+    mask = None
+
+    def add(m):
+        nonlocal mask
+        mask = m if mask is None else (mask & m)
+
+    dc = ctx["date"]
+    if dc:
+        d = df[dc]
+        start, end = parse_date(p.get("start_date")), parse_date(p.get("end_date"))
+        if start is not None:
+            add(d >= start)
+        if end is not None:
+            add(d < end + pd.Timedelta(days=1))
+        weeks = pd.to_datetime(p.getlist("weeks"), errors="coerce")
+        if len(weeks):
+            add(week_start(d).isin(weeks.dropna()))
+        months = [int(m.replace("-", "")) for m in p.getlist("months") if re.fullmatch(r"\d{4}-\d{2}", m)]
+        if months:
+            add((d.dt.year * 100 + d.dt.month).isin(months))
+
+    for key, field in (("spc", "spc_filters"), ("seg", "seg1_filters"), ("fam", "family_filters")):
+        col, vals = ctx[key], p.getlist(field)
+        if col and vals:
+            add(df[col].isin(vals))
+    return df if mask is None else df[mask]
+
+
+def filter_pills(ctx, p):
+    out = []
+    for key, field, label in (("spc", "spc_filters", "SPC"), ("seg", "seg1_filters", "Segment"),
+                              ("fam", "family_filters", "Family")):
+        vals = p.getlist(field)
+        if ctx[key] and vals:
+            out.append([label, ", ".join(vals[:4]) + (f" +{len(vals) - 4}" if len(vals) > 4 else "")])
+    return out
+
+
+def fmt_d(t):
+    return f"{t.day:02d} {t:%b %Y}"
+
+
+def period_text(ctx, p):
+    if not ctx["date"]:
+        return "All records"
+    label = re.sub(r"\s+", " ", (p.get("period_label") or "")).strip()[:40]
+    weeks = sorted(t for t in pd.to_datetime(p.getlist("weeks"), errors="coerce") if pd.notna(t))
+    if weeks:
+        names = [f"W{w.isocalendar()[1]:02d}" for w in weeks]
+        shown = ", ".join(names[:6]) + (f" +{len(names) - 6} more" if len(names) > 6 else "")
+        return (f"{'Week' if len(names) == 1 else 'Weeks'} {shown} · "
+                f"{fmt_d(weeks[0])} – {fmt_d(weeks[-1] + pd.Timedelta(days=6))}")
+    months = sorted(m for m in p.getlist("months") if re.fullmatch(r"\d{4}-\d{2}", m))
+    if months:
+        names = [pd.Timestamp(f"{m}-01").strftime("%b %Y") for m in months]
+        return "Months " + ", ".join(names[:5]) + (f" +{len(names) - 5} more" if len(names) > 5 else "")
+    start, end = parse_date(p.get("start_date")), parse_date(p.get("end_date"))
+    lo = start if start is not None else ctx["dmin"]
+    hi = end if end is not None else ctx["dmax"]
+    if lo is None or hi is None:
+        return label or "All time"
+    rng = fmt_d(lo) if lo == hi else f"{fmt_d(lo)} – {fmt_d(hi)}"
+    if start is None and end is None:
+        return f"All time · {rng}"
+    return f"{label} · {rng}" if label else rng
+
+
+# ════════════════════════════════════════════════════════════════════
+#  QUERY ENGINE
+# ════════════════════════════════════════════════════════════════════
+def build_view(state, p, want_export=False):
+    """Returns (payload, export, http_status)."""
+    df, ctx = state["df"], state["ctx"]
+    mode = "raw" if p.get("view_mode") == "raw" else "pivot"
+    dff = apply_filters(df, ctx, p)
+    base = {"period": period_text(ctx, p), "filters": filter_pills(ctx, p)}
+    if mode == "raw":
+        return build_raw(dff, ctx, base, want_export)
+    return build_pivot(dff, ctx, p, base, want_export)
+
+
+def empty_payload(base, title, head, msg):
+    return {**base, "title": title, "table_html": empty_block(head, msg), "status": "0 results",
+            "kpis": [], "chart": None}
+
+
+def build_raw(dff, ctx, base, want_export):
+    n = len(dff)
+    title = f"Raw data · {format_indian_number(n)} record{'s' if n != 1 else ''}"
+    if n == 0:
+        return empty_payload(base, title, "No matching data", "Try widening the period or clearing a filter."), None, 200
+
+    shown = dff.head(RAW_ROW_LIMIT)
+    cols = list(shown.columns)
+    columns, numeric, additive = [], set(), {}
+    for i, c in enumerate(cols):
+        s = shown[c]
+        if pd.api.types.is_datetime64_any_dtype(s):
+            columns.append(col_cells(s))
+        elif pd.api.types.is_numeric_dtype(s):
+            add = not NON_ADDITIVE.search(str(c)) and not pd.api.types.is_bool_dtype(s)
+            additive[i] = add
+            numeric.add(i)
+            columns.append(num_cells(s, add))
+        else:
+            columns.append(col_cells(s))
+
+    foot = []
+    for i, c in enumerate(cols):
+        if i == 0:
+            foot.append(f"Total · {format_indian_number(n)} rows")
+        elif additive.get(i):
+            sm = dff[c].sum()
+            dec = 2 if (pd.api.types.is_float_dtype(dff[c]) and dff[c].dropna().mod(1).ne(0).any()) else 0
+            foot.append(format_indian_number(sm, dec))
+        else:
+            foot.append("")
+
+    kpis = [{"label": "Records", "value": format_indian_number(n), "sub": "in this view", "cols": []}]
+    for i, c in enumerate(cols):
+        if additive.get(i) and len(kpis) < 5:
+            kpis.append({"label": str(c), "value": format_indian_number(dff[c].sum()), "sub": "Total", "cols": [i]})
+
+    status = (f"{format_indian_number(n)} rows" if n <= RAW_ROW_LIMIT else
+              f"Showing first {format_indian_number(RAW_ROW_LIMIT)} of {format_indian_number(n)} rows · Excel has all")
+    payload = {**base, "title": title, "status": status, "kpis": kpis, "chart": None,
+               "table_html": render_table([str(c) for c in cols], columns, "raw", numeric, 1, foot)}
+    export = {"df": dff, "nidx": 1, "fmts": {}, "footer": False} if want_export else None
+    return payload, export, 200
+
+
+def build_pivot(dff, ctx, p, base, want_export):
+    cols_set = set(dff.columns)
+    dc = ctx["date"]
+    derived_ok = set(derived_names(cols_set, dc))
+    idx_cols = clean_list(p, "index_cols", cols_set | derived_ok)
+    ycols = [c for c in clean_list(p, "value_cols", set(ctx["num_cols"])) if c not in idx_cols]
+    aggs = [a for a in ("sum", "count", "mean") if a in p.getlist("agg_funcs")]
+    if not idx_cols or not ycols or not aggs:
+        return {"error": "Pick at least one X column, one Y column and one measure."}, None, 400
+
+    share, growth = p.get("share") == "1", p.get("growth") == "1"
+    row_total = p.get("row_total") == "1"
+    title = pivot_title(ycols, aggs, idx_cols)
+    if dff.empty:
+        return empty_payload(base, title, "No matching data", "Try widening the period or clearing a filter."), None, 200
+
+    derived = {}
+    if dc:
+        d = dff[dc]
+        if "Week of" in idx_cols and "Week of" in derived_ok:
+            derived["Week of"] = week_start(d)
+        if "Month" in idx_cols and "Month" in derived_ok:
+            derived["Month"] = d.dt.normalize() - pd.to_timedelta(d.dt.day - 1, unit="D")
+    need = [c for c in dict.fromkeys(idx_cols + ycols) if c not in derived]
+    sub = dff[need].assign(**derived)
+
+    g = sub.groupby(idx_cols, observed=True, sort=True)[ycols].agg(aggs)
+    if g.empty:
+        return empty_payload(base, title, "No groups to show", "The chosen X columns only contain empty values."), None, 200
+    res = g.index.to_frame(index=False)
+    vals = g.reset_index(drop=True)
+    metas = [("idx", "")] * len(idx_cols)          # (kind, agg) per result column
+
+    def put(name, series, meta):
+        res[name] = series
+        metas.append(meta)
+
+    for y in ycols:
+        for a in aggs:
+            name = f"{y} · {AGG_NAME[a]}"
+            col = vals[(y, a)].astype(float)
+            put(name, col.to_numpy(), ("metric", a))
+            if share and a != "mean":
+                tot = col.sum()
+                put(f"{name} · Share %", (col / tot * 100).to_numpy() if tot else 0.0, ("pct", a))
+            if growth:
+                prev = col.shift()
+                put(f"{name} · Growth %", ((col - prev) / prev.where(prev != 0) * 100).to_numpy(), ("pct", a))
+
+    total_cols = {}
+    if row_total and len(ycols) > 1:
+        for a in ("sum", "count"):
+            if a in aggs:
+                parts = [f"{y} · {AGG_NAME[a]}" for y in ycols]
+                name = f"Total · {AGG_NAME[a]}"
+                put(name, res[parts].sum(axis=1).to_numpy(), ("total", a))
+                total_cols[name] = parts
+
+    valid = sub.dropna(subset=idx_cols)
+    foot = {}
+    for y in ycols:
+        for a in aggs:
+            s = valid[y]
+            foot[f"{y} · {AGG_NAME[a]}"] = {"sum": s.sum, "count": s.count, "mean": s.mean}[a]()
+    for name, parts in total_cols.items():
+        foot[name] = sum(foot[x] for x in parts)
+
+    headers = list(res.columns)
+    n = len(res)
+    fmt_first = lambda c: DERIVED_FMT.get(c)  # noqa: E731
+    labels_all = [" · ".join(parts) for parts in zip(*[
+        col_cells(res[c], fmt_first(c), esc=False) for c in idx_cols])]
+
+    # ── table
+    shown = res.head(PIVOT_ROW_LIMIT)
+    columns, numeric, foot_cells = [], set(), []
+    for i, h in enumerate(headers):
+        s, (kind, a) = shown[h], metas[i]
+        if kind == "idx":
+            columns.append(col_cells(s, fmt_first(h)))
+            foot_cells.append("Grand total" if i == 0 else "")
+        elif kind == "pct":
+            columns.append([format_pct(v) for v in s])
+            foot_cells.append("100%" if h.endswith("Share %") else "")
+            numeric.add(i)
+        else:
+            f = format_avg if a == "mean" else format_indian_number
+            columns.append([f(v) for v in s])
+            foot_cells.append(f(foot[h]))
+            numeric.add(i)
+    total_idx = {i for i, m in enumerate(metas) if m[0] == "total"}
+    table_html = render_table(headers, columns, "pivot", numeric, len(idx_cols), foot_cells, total_idx)
+
+    # ── KPIs (each one maps to table columns so the UI can highlight them)
+    metric_idx = [i for i, m in enumerate(metas) if m[0] == "metric"]
+    kpis = []
+    for i in metric_idx[:6]:
+        h, a = headers[i], metas[i][1]
+        f = format_avg if a == "mean" else format_indian_number
+        top = int(res.iloc[:, i].to_numpy().argmax()) if n else 0
+        group = [i] + [j for j, m in enumerate(metas) if m[0] == "pct" and headers[j].startswith(h + " · ")]
+        kpis.append({"label": h, "value": f(foot[h]),
+                     "sub": "Top · " + (labels_all[top][:26] + ("…" if len(labels_all[top]) > 26 else "")),
+                     "cols": group})
+    kpis.append({"label": "Groups", "value": format_indian_number(n),
+                 "sub": " › ".join(idx_cols)[:30], "cols": list(range(len(idx_cols)))})
+
+    # ── chart
+    sel, note = list(range(n)), ""
+    is_time = pd.api.types.is_datetime64_any_dtype(res[idx_cols[0]])
+    if n > CHART_MAX and metric_idx:
+        if is_time:
+            sel, note = list(range(n - CHART_MAX, n)), f"Showing the latest {CHART_MAX} of {format_indian_number(n)} groups"
+        else:
+            sel = sorted(res.iloc[:, metric_idx[0]].nlargest(CHART_MAX).index.tolist())
+            note = f"Showing the top {CHART_MAX} of {format_indian_number(n)} groups"
+    chart = {
+        "labels": [labels_all[i] for i in sel],
+        "series": [{"name": headers[i], "agg": metas[i][1], "col": i,
+                    "values": [num_or_none(v) for v in res.iloc[sel, i]]} for i in metric_idx],
+        "x_title": " › ".join(idx_cols), "is_time": bool(is_time), "note": note,
+    }
+
+    status = (f"{format_indian_number(n)} groups" if n <= PIVOT_ROW_LIMIT else
+              f"Showing first {format_indian_number(PIVOT_ROW_LIMIT)} of {format_indian_number(n)} groups · Excel has all")
+    payload = {**base, "title": title, "status": status, "table_html": table_html, "kpis": kpis, "chart": chart}
+
+    export = None
+    if want_export:
+        exp = res.copy()
+        for c in idx_cols:
+            if pd.api.types.is_datetime64_any_dtype(exp[c]):
+                exp[c] = exp[c].dt.strftime(fmt_first(c) or "%d-%b-%y")
+        row = {h: None for h in headers}
+        row[headers[0]] = "GRAND TOTAL"
+        for h, v in foot.items():
+            row[h] = v
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            exp = pd.concat([exp, pd.DataFrame([row], columns=headers)], ignore_index=True)
+        fmts = {}
+        for i, (kind, a) in enumerate(metas):
+            if kind == "pct":
+                fmts[i] = '0.0"%"'
+            elif kind in ("metric", "total"):
+                fmts[i] = "#,##0.00" if a == "mean" else "#,##0"
+        export = {"df": exp, "nidx": len(idx_cols), "fmts": fmts, "footer": True}
+    return payload, export, 200
+
+
+# ════════════════════════════════════════════════════════════════════
+#  EXCEL EXPORT (title, period, filters, styled header + footer)
+# ════════════════════════════════════════════════════════════════════
+def write_excel(payload, export):
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    df, hdr = export["df"], 5
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl", datetime_format="DD-MMM-YY") as xw:
+        df.to_excel(xw, index=False, sheet_name="Report", startrow=hdr - 1)
+        ws = xw.sheets["Report"]
+        ws.sheet_view.showGridLines = False
+        ws["A1"], ws["A2"] = payload["title"], f"Period: {payload['period']}"
+        pills = "  |  ".join(f"{k}: {v}" for k, v in payload.get("filters", []))
+        ws["A3"] = f"Filters: {pills}" if pills else "Filters: none"
+        ws["A1"].font = Font(size=16, bold=True, color="1D1D1F")
+        ws["A2"].font = Font(size=11, bold=True, color="0071E3")
+        ws["A3"].font = Font(size=10, color="86868B")
+        ncols, nrows = len(df.columns), len(df)
+        nidx = export["nidx"]
+        blue, line = PatternFill("solid", fgColor="0071E3"), Side(style="thin", color="0071E3")
+        for c in range(1, ncols + 1):
+            cell = ws.cell(row=hdr, column=c)
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = blue
+            cell.alignment = Alignment(horizontal="left" if c <= nidx else "right", vertical="center", wrap_text=True)
+        ws.row_dimensions[hdr].height = 26
+        for c, fmt in export["fmts"].items():
+            for r in range(hdr + 1, hdr + 1 + nrows):
+                cell = ws.cell(row=r, column=c + 1)
+                cell.number_format = fmt
+                cell.alignment = Alignment(horizontal="right")
+        if export["footer"] and nrows:
+            fill = PatternFill("solid", fgColor="E8F1FD")
+            for c in range(1, ncols + 1):
+                cell = ws.cell(row=hdr + nrows, column=c)
+                cell.font = Font(bold=True, color="1D1D1F")
+                cell.fill = fill
+                cell.border = Border(top=line)
+        for c in range(ncols):
+            sample = [len(str(v)) for v in df.iloc[:200, c].tolist()]
+            ws.column_dimensions[get_column_letter(c + 1)].width = min(
+                44, max(len(str(df.columns[c])) * 0.95, max(sample, default=0)) + 3)
+        ws.freeze_panes = ws.cell(row=hdr + 1, column=max(nidx, 1) + 1)
+    out.seek(0)
+    return out
+
+
+# ════════════════════════════════════════════════════════════════════
+#  ROUTES
+# ════════════════════════════════════════════════════════════════════
+@app.get("/")
 def home():
-    df = get_master_data()
-    if df is not None:
-        cols = df.columns.tolist()
-        grouping = [c for c in df.select_dtypes(exclude=['number']).columns.tolist() if c != 'Month']
-        if 'Month' not in grouping: grouping.insert(0, 'Month')
-        
-        if 'Tentative DP' in df.columns:
-            df['Tentative DP'] = pd.to_numeric(df['Tentative DP'].astype(str).str.replace(',', ''), errors='coerce')
-        num_cols = df.select_dtypes(include='number').columns.tolist()
-        
-        status_col = next((c for c in cols if c.lower() in ['finalstatus', 'final record status']), None)
-        if not status_col:
-            status_col = next((c for c in cols if 'status' in c.lower()), None)
-            
-        status_list = []
-        if status_col:
-            raw_vals = df[status_col].dropna().astype(str).unique().tolist()
-            status_list = sorted([v for v in raw_vals if v.lower() != 'finalstatus' and v.strip() != ''])
-        
-        return render_template_string(WORKSPACE_HTML, all_cols=cols, grouping_cols=grouping, num_cols=num_cols, status_list=status_list)
-    return render_template_string(UPLOAD_HTML, error=None)
+    st = get_state()
+    if st is None:
+        return render_template_string(UPLOAD_HTML, error=None)
+    return render_template_string(WORKSPACE_HTML, ctx=st["ctx"], upload_time=get_upload_time())
 
-@app.route("/upload", methods=["GET"])
+
+@app.get("/upload")
 def upload_page():
     return render_template_string(UPLOAD_HTML, error=None)
 
-@app.route("/dashboard", methods=["POST"])
+
+@app.post("/dashboard")
 def dashboard():
-    f = request.files.get('file')
+    f = request.files.get("file")
     if not f or not f.filename:
-        return redirect(url_for('home'))
+        return redirect(url_for("home"))
+    name = f.filename.lower()
     try:
-        name = f.filename.lower()
-        if name.endswith('.csv'):
+        if name.endswith(".csv"):
             df = pd.read_csv(f)
-        elif name.endswith(('.xlsx', '.xls')):
-            xls = pd.ExcelFile(f)
-            dfs = []
-            for sheet in xls.sheet_names:
-                temp_df = pd.read_excel(xls, sheet_name=sheet)
-                if not temp_df.empty:
-                    dfs.append(temp_df)
-            df = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+        elif name.endswith((".xlsx", ".xls")):
+            df = pd.read_excel(f)
         else:
-            return render_template_string(UPLOAD_HTML, error="Unsupported file type."), 400
-        
-        if df.empty: return render_template_string(UPLOAD_HTML, error="File contains no data."), 400
-
-        date_col_name = ""
-        for c in ("Customized Sales Date", "Sale Date", "Sales Date"):
-            if c in df.columns:
-                date_col_name = c
-                break
-        if not date_col_name:
-            for c in df.columns:
-                if "date" in c.lower() and "activation" not in c.lower() and "tertiary" not in c.lower():
-                    date_col_name = c
-                    break
-        
-        if date_col_name:
-            parsed_dates = pd.to_datetime(df[date_col_name], errors='coerce')
-            df['Month'] = parsed_dates.dt.strftime('%b %Y').fillna('Unknown')
-        else:
-            df['Month'] = 'Current'
-
-        df.to_pickle(DATA_FILE_PATH)
-        return redirect(url_for('home'))
-    except Exception as e:
-        return render_template_string(UPLOAD_HTML, error=f"Error reading file: {str(e)}"), 400
-
-@app.route("/calculate", methods=["POST"])
-def calculate():
-    try:
-        df = get_master_data()
-        if df is None: return jsonify({"error": "No data available. Please re-upload."}), 400
-        
-        mode = request.form.get('view_mode', 'dashboard')
-        filter_texts = []
-        
-        status_col = next((c for c in df.columns if c.lower() in ['finalstatus', 'final record status']), None)
-        if not status_col:
-            status_col = next((c for c in df.columns if 'status' in c.lower()), None)
-            
-        status_filters = request.form.getlist('status_filters')
-        if status_col and status_filters:
-            df = df[df[status_col].astype(str).isin(status_filters)]
-            if len(status_filters) <= 3: filter_texts.append(f"Status: {', '.join(status_filters)}")
-            else: filter_texts.append(f"Status: {len(status_filters)} selected")
-
-        date_cols = df.columns.tolist()
-        date_col_name = ""
-        for c in ("Customized Sales Date", "Sale Date", "Sales Date"):
-            if c in date_cols:
-                date_col_name = c
-                break
-        if not date_col_name:
-            for c in date_cols:
-                if "date" in c.lower() and "activation" not in c.lower() and "tertiary" not in c.lower():
-                    date_col_name = c
-                    break
-                    
-        if date_col_name: df[date_col_name] = pd.to_datetime(df[date_col_name], errors='coerce')
-
-        start_date = request.form.get('start_date')
-        end_date = request.form.get('end_date')
-        compare_mode = request.form.get('compare_mode')
-        
-        if date_col_name:
-            if compare_mode == 'lmtd' and start_date and end_date:
-                s_dt = pd.to_datetime(start_date)
-                e_dt = pd.to_datetime(end_date)
-                delta = (e_dt - s_dt).days + 1
-                
-                ls_dt = s_dt - pd.Timedelta(days=delta)
-                le_dt = e_dt - pd.Timedelta(days=delta)
-                
-                df_curr = df[(df[date_col_name] >= s_dt) & (df[date_col_name] <= e_dt + pd.Timedelta(days=1) - pd.Timedelta(seconds=1))]
-                df_prev = df[(df[date_col_name] >= ls_dt) & (df[date_col_name] <= le_dt + pd.Timedelta(days=1) - pd.Timedelta(seconds=1))]
-                
-                df_curr['Period'] = f"Current ({s_dt.strftime('%d-%b')} - {e_dt.strftime('%d-%b')})"
-                df_prev['Period'] = f"Previous ({ls_dt.strftime('%d-%b')} - {le_dt.strftime('%d-%b')})"
-                df = pd.concat([df_curr, df_prev], ignore_index=True)
-                filter_texts.append(f"Comparison Mode Active")
-            else:
-                if start_date: 
-                    df = df[df[date_col_name] >= pd.to_datetime(start_date)]
-                    filter_texts.append(f"{pd.to_datetime(start_date).strftime('%d-%b-%y')}")
-                if end_date: 
-                    df = df[df[date_col_name] <= pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)]
-                    filter_texts.append(f"{pd.to_datetime(end_date).strftime('%d-%b-%y')}")
-
-        idx = request.form.getlist('index_cols')
-        if compare_mode == 'lmtd' and 'Period' not in idx: idx.insert(0, 'Period')
-        
-        date_subtitle = " – ".join(filter_texts[:2]) if len(filter_texts)>=2 and "From" not in filter_texts[0] else (" · ".join(filter_texts) if filter_texts else "All Time")
-        
-        val_col = request.form.get('value_col')
-        if val_col and val_col in df.columns:
-            if df[val_col].dtype == object: df[val_col] = pd.to_numeric(df[val_col].astype(str).str.replace(',', ''), errors='coerce')
-        else:
-            num_cols = df.select_dtypes(include='number').columns.tolist()
-            val_col = num_cols[0] if num_cols else None
-
-        aggs = request.form.getlist('agg_funcs')
-        if not aggs: aggs = ['sum']
-        
-        kpi_html = ""
-        if not df.empty and val_col:
-            active = format_indian_number(df[idx[0]].nunique()) if idx and idx[0] in df.columns else "N/A"
-            kpi_html = f"""
-                <div class="kpi"><div class="kpi-label">Total Volume</div><div class="kpi-val">{format_indian_number(df[val_col].sum())}</div></div>
-                <div class="kpi"><div class="kpi-label">Records</div><div class="kpi-val">{format_indian_number(len(df))}</div></div>
-                <div class="kpi"><div class="kpi-label">Active Entities</div><div class="kpi-val">{active}</div></div>
-            """
-
+            raise ValueError("unsupported file type, please use .xlsx, .xls or .csv")
         if df.empty:
-            return jsonify({"table_html": '<div style="padding:60px; text-align:center;">No data found for selected filters.</div>', "summary_text": f"<b>Date</b> {date_subtitle} · 0 groups", "kpi_html": kpi_html})
+            raise ValueError("the file has no rows")
+        save_data(df)
+    except Exception as exc:  # noqa: BLE001
+        return render_template_string(UPLOAD_HTML, error=f"Couldn't read that file: {exc}"), 400
+    return redirect(url_for("home"))
 
-        cols = request.form.getlist('columns_cols')
-        show_total = request.form.get('show_row_total') == 'true'
 
-        if not idx or not aggs: return jsonify({"error": "Select rows and metrics from the sidebar."})
-        if not val_col: return jsonify({"error": "No numeric data found to aggregate."})
-
-        kwargs = {'data': df, 'index': idx, 'values': [val_col], 'aggfunc': aggs}
-        if cols: kwargs['columns'] = cols
-        
-        pivot = pd.pivot_table(**kwargs).reset_index().fillna(0)
-        
-        new_headers = []
-        for c in pivot.columns:
-            if isinstance(c, tuple):
-                if c[0] in idx and all(x == '' for x in c[1:]): 
-                    new_headers.append(str(c[0]))
-                else:
-                    parts = []
-                    for x in c:
-                        if str(x) and str(x) not in [val_col, 'sum', 'count', 'mean']:
-                            if isinstance(x, pd.Timestamp): parts.append(x.strftime('%d-%b-%y'))
-                            else: parts.append(str(x))
-                    new_headers.append(" - ".join(parts) if parts else str(c[-1]))
-            else: 
-                new_headers.append(c.strftime('%d-%b-%y') if isinstance(c, pd.Timestamp) else str(c))
-        
-        pivot.columns = new_headers
-        metric_cols = [c for c in pivot.columns if c not in idx]
-
-        if show_total and len(metric_cols) > 1 and not ('sum' in aggs and 'count' in aggs):
-            pivot['TOTAL'] = pivot[metric_cols].sum(axis=1)
-            metric_cols.append('TOTAL')
-            
-        chart_data = None
-        if mode == 'chart':
-            chart_df = pivot.sort_values(by=metric_cols[0], ascending=False).head(15) if metric_cols else pivot.head(15)
-            labels = chart_df[idx[0]].apply(lambda x: x.strftime('%d-%b-%y') if isinstance(x, pd.Timestamp) else str(x)).tolist() if idx else ["Total"]
-            
-            palette = ['#0071e3', '#34c759', '#ff9500', '#af52de', '#ff3b30', '#5ac8fa', '#ffcc00', '#5856d6']
-            datasets = []
-            for i, m in enumerate(metric_cols):
-                if m != "TOTAL":
-                    color = palette[i % len(palette)]
-                    datasets.append({"label": m, "data": chart_df[m].tolist(), "backgroundColor": color, "borderRadius": 6})
-            chart_data = {"labels": labels, "datasets": datasets}
-
-        if not pivot.empty:
-            totals = {c: pivot[c].sum() if c in metric_cols else ('' if c != idx[0] else 'GRAND TOTAL') for c in pivot.columns}
-            pivot = pd.concat([pivot, pd.DataFrame([totals])], ignore_index=True)
-
-        for c in idx:
-            if c in pivot.columns and pd.api.types.is_datetime64_any_dtype(pivot[c]):
-                pivot[c] = pivot[c].dt.strftime('%d-%b-%y')
-                
-        for c in metric_cols: pivot[c] = pivot[c].apply(format_indian_number)
-
-        html = pivot.to_html(classes='excel-table', border=0, index=False)
-        html = html.replace('<th>TOTAL</th>', '<th class="total-col">TOTAL</th>')
-        if 'TOTAL' in metric_cols: html = re.sub(r'(<td>)([\d,-]+)(</td></tr>)', r'<td class="total-col">\2\3', html)
-        
-        pivot.to_pickle(os.path.join(UPLOAD_DIR, "summary_data.pkl"))
-        summary_text = f"<b>Date</b> {date_subtitle} · <b>Filters</b> {' + '.join(idx)} · {len(pivot)-1} groups"
-        
-        return jsonify({
-            "table_html": html, "chart_data": chart_data,
-            "summary_text": summary_text, "kpi_html": kpi_html
-        })
-        
-    except Exception as e:
-        traceback.print_exc()
-        return jsonify({"error": f"Backend Error: {str(e)}"}), 500
-
-@app.route("/download", methods=["GET"])
-def download():
+@app.post("/calculate")
+def calculate():
+    st = get_state()
+    if st is None:
+        return jsonify({"error": "No data available."}), 400
     try:
-        summary_path = os.path.join(UPLOAD_DIR, "summary_data.pkl")
-        if not os.path.exists(summary_path): return "No data to download", 400
-        df = pd.read_pickle(summary_path)
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer: df.to_excel(writer, index=False, sheet_name='Dashboard_Report')
-        output.seek(0)
-        return send_file(output, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", download_name="Executive_Report.xlsx", as_attachment=True)
-    except Exception as e:
-        traceback.print_exc()
-        return f"Download Failed: {str(e)}", 500
+        payload, _, code = build_view(st, request.form)
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"An error occurred: {exc}"}), 500
+    return jsonify(payload), code
 
-if __name__ == '__main__':
-    app.run(debug=True)
+
+@app.get("/download")
+def download():
+    st = get_state()
+    if st is None:
+        return "No data to download", 400
+    try:
+        payload, export, _ = build_view(st, request.args, want_export=True)
+        if export is None:
+            return payload.get("error", "Nothing to export"), 400
+        out = write_excel(payload, export)
+    except Exception as exc:  # noqa: BLE001
+        return f"Export failed: {exc}", 500
+    return send_file(out, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                     download_name=f"{slug(payload['title'])}.xlsx", as_attachment=True)
+
+
+@app.get("/assets/app.css")
+def asset_css():
+    return Response(APP_CSS, mimetype="text/css", headers={"Cache-Control": "public, max-age=31536000, immutable"})
+
+
+@app.get("/assets/app.js")
+def asset_js():
+    return Response(APP_JS, mimetype="application/javascript",
+                    headers={"Cache-Control": "public, max-age=31536000, immutable"})
+
+
+@app.context_processor
+def inject_assets():
+    return {"asset_v": ASSET_VERSION, "sprite": SPRITE}
+
+
+# ════════════════════════════════════════════════════════════════════
+#  FRONT END  (iOS 27 "Liquid Glass" language)
+# ════════════════════════════════════════════════════════════════════
+SPRITE = """
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+<symbol id="i-chev" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></symbol>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></symbol>
+<symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 16V4m0 0L8 8m4-4l4 4M4 15v3a2 2 0 002 2h12a2 2 0 002-2v-3"/></symbol>
+<symbol id="i-share" viewBox="0 0 24 24"><path d="M12 15V3m0 0L8 7m4-4l4 4M5 12v7a2 2 0 002 2h10a2 2 0 002-2v-7"/></symbol>
+<symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/></symbol>
+<symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="9" cy="10" r="1.5"/><path d="M21 16l-5-5-8 8"/></symbol>
+<symbol id="i-sheet" viewBox="0 0 24 24"><path d="M7 3h7l5 5v11a2 2 0 01-2 2H7a2 2 0 01-2-2V5a2 2 0 012-2z"/><path d="M14 3v5h5M9 13h6M9 17h6"/></symbol>
+<symbol id="i-chart" viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M2 20h20"/></symbol>
+<symbol id="i-reset" viewBox="0 0 24 24"><path d="M3 12a9 9 0 109-9 9 9 0 00-6.4 2.6L3 8"/><path d="M3 3v5h5"/></symbol>
+<symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></symbol>
+<symbol id="i-moon" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1111.2 3a7 7 0 009.8 9.8z"/></symbol>
+<symbol id="i-auto" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 010 18z" fill="currentColor"/></symbol>
+<symbol id="i-glass" viewBox="0 0 24 24"><path d="M12 3s6 6.2 6 10.5a6 6 0 01-12 0C6 9.2 12 3 12 3z"/></symbol>
+<symbol id="i-cal" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="16" rx="3.5"/><path d="M8 3v4M16 3v4M3 10h18"/></symbol>
+<symbol id="i-table" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M3 10h18M9 10v10"/></symbol>
+<symbol id="i-rows" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></symbol>
+<symbol id="i-bars" viewBox="0 0 24 24"><path d="M6 20v-7M12 20V5M18 20v-10"/></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+</defs></svg>
+"""
+
+HEAD = """<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<script>(function(){try{var d=document.documentElement,t=localStorage.getItem('ap-theme'),g=localStorage.getItem('ap-glass');
+if(t==='light'||t==='dark')d.dataset.theme=t;if(g)d.style.setProperty('--glass',g);}catch(e){}})();</script>
+<link rel="stylesheet" href="/assets/app.css?v={{ asset_v }}">
+<script src="/assets/app.js?v={{ asset_v }}" defer></script>"""
+
+MACROS = """
+{% macro controls(layout=False) %}
+<div class="nav-right">
+  <div class="menu-wrap" id="glassWrap">
+    <button type="button" class="icon-btn" id="glassBtn" aria-label="Liquid Glass transparency" aria-expanded="false" title="Liquid Glass"><svg class="ic"><use href="#i-glass"/></svg></button>
+    <div class="popover" id="glassPop">
+      <div class="pop-title">Liquid Glass</div>
+      <input type="range" id="glassRange" min="30" max="96" step="1" aria-label="Glass transparency">
+      <div class="pop-scale"><span>Clear</span><span>Frosted</span></div>
+    </div>
+  </div>
+  <div class="seg seg-icons" id="themeSeg" data-n="3" role="radiogroup" aria-label="Appearance">
+    <span class="seg-thumb"></span>
+    <input type="radio" name="theme" id="th_light" value="light"><label for="th_light" title="Light" aria-label="Light"><svg class="ic"><use href="#i-sun"/></svg></label>
+    <input type="radio" name="theme" id="th_auto" value="auto"><label for="th_auto" title="Match system" aria-label="Automatic"><svg class="ic"><use href="#i-auto"/></svg></label>
+    <input type="radio" name="theme" id="th_dark" value="dark"><label for="th_dark" title="Dark" aria-label="Dark"><svg class="ic"><use href="#i-moon"/></svg></label>
+  </div>
+  {% if layout %}
+  <label class="ios-switch" title="Switch between desktop and mobile layout">
+    <span class="sw-text">Mobile</span>
+    <input type="checkbox" id="mobileSwitch" role="switch"><span class="track"><span class="knob"></span></span>
+  </label>
+  <a class="icon-btn" href="/upload" aria-label="Upload new file" title="Upload new file"><svg class="ic"><use href="#i-upload"/></svg></a>
+  {% endif %}
+</div>
+{% endmacro %}
+"""
+
+UPLOAD_HTML = """<!doctype html>
+<html lang="en"><head><title>Analytics Pro</title>""" + HEAD + """</head>
+<body class="upload-page">""" + MACROS + """
+{{ sprite|safe }}
+<header class="nav glass"><span class="brand"><span class="brand-mark"></span>Analytics Pro</span>{{ controls() }}</header>
+<main class="upload-wrap">
+  <h1 class="hero-title">Analytics Engine.</h1>
+  <p class="hero-sub">Upload your sales data to launch the workspace.</p>
+  <form class="upload-card glass" action="/dashboard" method="post" enctype="multipart/form-data" id="uploadForm">
+    {% if error %}<div class="alert" role="alert">{{ error }}</div>{% endif %}
+    <label class="dropzone" id="dropzone" for="file">
+      <svg class="ic ic-lg"><use href="#i-upload"/></svg>
+      <span class="dz-title" id="dzTitle">Choose a file</span>
+      <span class="dz-sub" id="dzSub">or drag it here · .xlsx, .xls, .csv</span>
+    </label>
+    <input id="file" class="sr-only" type="file" name="file" accept=".xlsx,.xls,.csv" required>
+    <button type="submit" class="btn-primary block" id="launchBtn" disabled>Launch workspace</button>
+  </form>
+</main>
+</body></html>"""
+
+WORKSPACE_HTML = """<!doctype html>
+<html lang="en"><head><title>Analytics Pro</title>""" + HEAD + """</head>
+<body>
+<script>(function(){var m=null;try{m=localStorage.getItem('ap-mobile')}catch(e){}
+var mob=m===null?innerWidth<=768:m==='1';document.body.classList.add(mob?'mobile-mode':'desktop-mode');
+if(mob)document.body.classList.add('sidebar-collapsed');})();</script>
+""" + MACROS + """
+{{ sprite|safe }}
+
+{% macro acc(title, badge, open=False, structural=False) %}
+<section class="acc{% if open %} open{% endif %}"{% if structural %} data-structural{% endif %}>
+  <button type="button" class="acc-head" aria-expanded="{{ 'true' if open else 'false' }}">
+    <span class="acc-title">{{ title }}</span>
+    <span class="badge" data-badge-for="{{ badge }}" hidden>0</span>
+    <svg class="ic chev"><use href="#i-chev"/></svg>
+  </button>
+  <div class="acc-panel"><div class="acc-inner"><div class="acc-body">{{ caller() }}</div></div></div>
+</section>
+{% endmacro %}
+
+{% macro checklist(name, items, ordered=False) %}
+{% set searchable = items|length > 7 %}
+<div class="tools{% if not searchable %} end{% endif %}">
+  {% if searchable %}<label class="search"><svg class="ic"><use href="#i-search"/></svg><input type="search" placeholder="Search" autocomplete="off" data-search="{{ name }}"></label>{% endif %}
+  <span class="tool-btns">
+    <button type="button" class="btn-micro" data-select="{{ name }}" data-on="1">All</button>
+    <button type="button" class="btn-micro" data-select="{{ name }}" data-on="0">Clear</button>
+  </span>
+</div>
+<div class="list" data-list="{{ name }}">
+  {% for it in items %}<label class="row" data-val="{{ it.name }}"><input type="checkbox" name="{{ name }}" value="{{ it.name }}"{% if it.checked %} checked{% endif %}><span class="box"></span><span class="label" title="{{ it.name }}">{{ it.name }}</span>{% if it.hint %}<em class="tag">{{ it.hint }}</em>{% endif %}{% if ordered %}<span class="ord"></span>{% endif %}</label>{% endfor %}
+</div>
+{% endmacro %}
+
+<header class="nav glass">
+  <div class="nav-left">
+    <button type="button" class="icon-btn only-mobile" id="sidebarToggle" aria-label="Show or hide controls" aria-expanded="false"><svg class="ic"><use href="#i-sliders"/></svg></button>
+    <span class="brand"><span class="brand-mark"></span>Analytics Pro</span>
+  </div>
+  {{ controls(True) }}
+</header>
+<div id="loadbar" aria-hidden="true"></div>
+
+<div class="app">
+  <aside class="sidebar glass" id="appSidebar">
+    <div class="sidebar-head">
+      <div class="head-row">
+        <h2>Controls</h2>
+        <button type="button" class="btn-text" id="resetBtn"><svg class="ic"><use href="#i-reset"/></svg>Reset</button>
+      </div>
+      <div class="sidebar-meta">{% if upload_time %}Updated {{ upload_time }}{% endif %}</div>
+    </div>
+
+    <form id="config-form" class="sidebar-scroll" autocomplete="off">
+      <h3 class="group-cap">Period</h3>
+      {% call acc('Date range', '__period', True) %}
+        {% if ctx.date %}
+        <div class="anchor"><span>Relative to</span>
+          <div class="mini-seg" id="anchorSeg"><button type="button" data-anchor="today" class="on">Today</button><button type="button" data-anchor="data">Last data day</button></div>
+        </div>
+        <div class="chips">
+          <button type="button" class="chip" data-preset="today">Today</button>
+          <button type="button" class="chip" data-preset="yesterday">Yesterday</button>
+          <button type="button" class="chip" data-preset="last7">7 days</button>
+          <button type="button" class="chip" data-preset="last14">14 days</button>
+          <button type="button" class="chip" data-preset="last30">30 days</button>
+          <button type="button" class="chip" data-preset="last90">90 days</button>
+          <button type="button" class="chip" data-preset="thisweek">This week</button>
+          <button type="button" class="chip" data-preset="lastweek">Last week</button>
+          <button type="button" class="chip" data-preset="mtd">Month to date</button>
+          <button type="button" class="chip" data-preset="lastmonth">Last month</button>
+          <button type="button" class="chip" data-preset="qtd">Quarter to date</button>
+          <button type="button" class="chip" data-preset="lastqtr">Last quarter</button>
+          <button type="button" class="chip" data-preset="ytd">Year to date</button>
+          <button type="button" class="chip" data-preset="fytd">Fiscal YTD</button>
+          <button type="button" class="chip" data-preset="all">All time</button>
+        </div>
+        <div class="date-grid">
+          <div class="field"><label for="start_date">From</label><input type="date" name="start_date" id="start_date"></div>
+          <div class="field"><label for="end_date">To</label><input type="date" name="end_date" id="end_date"></div>
+        </div>
+        {% if ctx.weeks %}
+        <div class="sub-head"><span>Weeks <small>pick several</small></span>
+          <span class="tool-btns"><button type="button" class="btn-micro" data-latest="4">Last 4</button><button type="button" class="btn-micro" data-select="weeks" data-on="0">Clear</button></span></div>
+        <div class="wk-grid" data-list="weeks">
+          {% for w in ctx.weeks|reverse %}<label class="wk"><input type="checkbox" name="weeks" value="{{ w.key }}"><span class="wk-chip"><b>{{ w.label }}</b><small>{{ w.range }} ’{{ w.year }}</small></span></label>{% endfor %}
+        </div>
+        {% endif %}
+        {% if ctx.months %}
+        <div class="sub-head"><span>Months <small>pick several</small></span>
+          <span class="tool-btns"><button type="button" class="btn-micro" data-select="months" data-on="0">Clear</button></span></div>
+        <div class="mo-grid" data-list="months">
+          {% for m in ctx.months|reverse %}<label class="wk"><input type="checkbox" name="months" value="{{ m.key }}"><span class="wk-chip"><b>{{ m.label }}</b></span></label>{% endfor %}
+        </div>
+        {% endif %}
+        {% else %}<p class="muted">No date column was detected in this file.</p>{% endif %}
+      {% endcall %}
+
+      {% if ctx.spc_opts or ctx.seg_opts or ctx.fam_opts %}<h3 class="group-cap">Filters</h3>{% endif %}
+      {% if ctx.spc_opts %}{% call acc('SPC name', 'spc_filters') %}{{ checklist('spc_filters', ctx.spc_opts) }}{% endcall %}{% endif %}
+      {% if ctx.seg_opts %}{% call acc('Segment 1', 'seg1_filters') %}{{ checklist('seg1_filters', ctx.seg_opts) }}{% endcall %}{% endif %}
+      {% if ctx.fam_opts %}{% call acc('Family name', 'family_filters') %}{{ checklist('family_filters', ctx.fam_opts) }}{% endcall %}{% endif %}
+
+      <h3 class="group-cap">Table</h3>
+      {% call acc('X axis · group by', 'index_cols', True, True) %}{{ checklist('index_cols', ctx.x_opts, True) }}{% endcall %}
+      {% call acc('Y axis · values', 'value_cols', True, True) %}{{ checklist('value_cols', ctx.y_opts, True) }}{% endcall %}
+      {% call acc('Measures', 'agg_funcs', True, True) %}
+        <div class="chips agg">
+          <label class="chip-check"><input type="checkbox" name="agg_funcs" value="sum" checked><span>Sum</span></label>
+          <label class="chip-check"><input type="checkbox" name="agg_funcs" value="count"><span>Count</span></label>
+          <label class="chip-check"><input type="checkbox" name="agg_funcs" value="mean"><span>Average</span></label>
+        </div>
+        <div class="list static">
+          <label class="row switch"><span class="label">Share %<small>Contribution to the total</small></span><input type="checkbox" name="share" value="1"><span class="track"><span class="knob"></span></span></label>
+          <label class="row switch"><span class="label">Growth %<small>Change versus previous row</small></span><input type="checkbox" name="growth" value="1"><span class="track"><span class="knob"></span></span></label>
+          <label class="row switch"><span class="label">Total column<small>Adds across several Y columns</small></span><input type="checkbox" name="row_total" value="1" checked><span class="track"><span class="knob"></span></span></label>
+        </div>
+      {% endcall %}
+    </form>
+  </aside>
+
+  <div class="sidebar-resizer" id="sidebarResizer" role="separator" aria-orientation="vertical" title="Drag to resize · double-click to reset"></div>
+
+  <main class="main">
+    <div class="page-head">
+      <div class="seg seg-text" id="viewSeg" data-n="3" role="radiogroup" aria-label="View">
+        <span class="seg-thumb"></span>
+        <input type="radio" id="view_pivot" name="view_mode_toggle" value="pivot" checked><label for="view_pivot">Pivot</label>
+        <input type="radio" id="view_raw" name="view_mode_toggle" value="raw"><label for="view_raw">Raw data</label>
+        <input type="radio" id="view_chart" name="view_mode_toggle" value="chart"><label for="view_chart">Chart</label>
+      </div>
+      <div class="menu-wrap" id="exportWrap">
+        <button type="button" class="btn-primary" id="exportBtn" aria-haspopup="true" aria-expanded="false"><svg class="ic"><use href="#i-share"/></svg>Export</button>
+        <div class="menu glass" id="exportMenu" role="menu">
+          <div class="menu-cap" id="exportCap">Exports the current view</div>
+          <button type="button" class="menu-item" id="dlImage" role="menuitem"><svg class="ic"><use href="#i-image"/></svg>Save image</button>
+          <button type="button" class="menu-item" id="dlExcel" role="menuitem"><svg class="ic"><use href="#i-sheet"/></svg>Download Excel</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="report-area">
+      <header class="report-head">
+        <h1 id="reportTitle" class="report-title">Build your report</h1>
+        <div class="report-meta">
+          <span class="period-pill" id="periodPill"><svg class="ic"><use href="#i-cal"/></svg><span id="periodText"></span></span>
+          <span class="pills" id="filterPills"></span>
+        </div>
+      </header>
+      <div id="kpi-banner" class="kpis" hidden></div>
+
+      <section id="tableCard" class="card table-card">
+        <div class="table-bar" id="table-bar" hidden><span id="statusText"></span><span class="no-export">Tap a header to sort</span></div>
+        <div id="table-wrapper" class="table-scroll"></div>
+      </section>
+
+      <section id="chartCard" class="card chart-card" hidden>
+        <div class="chart-bar">
+          <div class="legend" id="legend"></div>
+          <div class="chart-ctl no-export">
+            <div class="seg seg-mini" id="typeSeg" data-n="3" role="radiogroup" aria-label="Chart type">
+              <span class="seg-thumb"></span>
+              <input type="radio" name="ctype" id="ct_bar" value="bar" checked><label for="ct_bar">Bar</label>
+              <input type="radio" name="ctype" id="ct_line" value="line"><label for="ct_line">Line</label>
+              <input type="radio" name="ctype" id="ct_area" value="area"><label for="ct_area">Area</label>
+            </div>
+            <div class="seg seg-mini" id="sortSeg" data-n="2" role="radiogroup" aria-label="Sort">
+              <span class="seg-thumb"></span>
+              <input type="radio" name="csort" id="cs_nat" value="natural" checked><label for="cs_nat">Natural</label>
+              <input type="radio" name="csort" id="cs_val" value="value"><label for="cs_val">Highest</label>
+            </div>
+          </div>
+        </div>
+        <div id="chartBody" class="chart-body"></div>
+        <div class="chart-note" id="chartNote"></div>
+      </section>
+    </div>
+  </main>
+</div>
+<script id="boot" type="application/json">{{ ctx.boot_json|safe }}</script>
+</body></html>"""
+
+APP_CSS = r"""
+/* ═══════ tokens ═══════ */
+:root{
+  color-scheme:light;
+  --glass:72;
+  --bg:#f2f2f7;--surface-base:#ffffff;--surface-solid:#ffffff;--table-bg:#ffffff;
+  --nav-base:#fbfbfd;
+  --hairline:rgba(60,60,67,.14);--hairline-strong:rgba(60,60,67,.3);
+  --fill:rgba(120,120,128,.12);--fill-2:rgba(120,120,128,.07);--seg-thumb:#fff;
+  --label:#1d1d1f;--label-2:#515154;--label-3:#86868b;
+  --blue:#0071e3;--blue-h:#0077ed;--blue-a:#006edb;--blue-tint:rgba(0,113,227,.1);--hl:rgba(0,113,227,.12);
+  --green:#34c759;--pos:#1f8a3c;--neg:#d70015;
+  --th-bg:rgba(246,246,250,.9);--foot-bg:#e9f2fe;
+  --spec:rgba(255,255,255,.7);
+  --shadow-1:0 1px 2px rgba(0,0,0,.04),0 8px 24px rgba(0,0,0,.05);--shadow-2:0 18px 50px rgba(0,0,0,.18);
+  --amb1:rgba(0,122,255,.16);--amb2:rgba(175,82,222,.12);--amb3:rgba(52,199,89,.10);
+  --c1:#007aff;--c2:#34c759;--c3:#ff9500;--c4:#ff2d55;--c5:#af52de;--c6:#30b0c7;--c7:#e5a800;--c8:#5856d6;
+}
+:root[data-theme=dark]{
+  color-scheme:dark;
+  --bg:#000;--surface-base:#1c1c1e;--surface-solid:#1c1c1e;--table-bg:#1c1c1e;--nav-base:#161618;
+  --hairline:rgba(255,255,255,.13);--hairline-strong:rgba(255,255,255,.28);
+  --fill:rgba(120,120,128,.3);--fill-2:rgba(120,120,128,.16);--seg-thumb:#636366;
+  --label:#f5f5f7;--label-2:#c7c7cc;--label-3:#8e8e93;
+  --blue:#2997ff;--blue-h:#4aa8ff;--blue-a:#1a85ec;--blue-tint:rgba(41,151,255,.2);--hl:rgba(41,151,255,.2);
+  --green:#30d158;--pos:#32d74b;--neg:#ff453a;
+  --th-bg:rgba(40,40,43,.92);--foot-bg:#112741;
+  --spec:rgba(255,255,255,.14);
+  --shadow-1:0 1px 2px rgba(0,0,0,.5),0 8px 24px rgba(0,0,0,.35);--shadow-2:0 18px 50px rgba(0,0,0,.7);
+  --amb1:rgba(10,132,255,.22);--amb2:rgba(191,90,242,.16);--amb3:rgba(48,209,88,.10);
+  --c1:#0a84ff;--c2:#30d158;--c3:#ff9f0a;--c4:#ff375f;--c5:#bf5af2;--c6:#64d2ff;--c7:#ffd60a;--c8:#5e5ce6;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){
+  color-scheme:dark;
+  --bg:#000;--surface-base:#1c1c1e;--surface-solid:#1c1c1e;--table-bg:#1c1c1e;--nav-base:#161618;
+  --hairline:rgba(255,255,255,.13);--hairline-strong:rgba(255,255,255,.28);
+  --fill:rgba(120,120,128,.3);--fill-2:rgba(120,120,128,.16);--seg-thumb:#636366;
+  --label:#f5f5f7;--label-2:#c7c7cc;--label-3:#8e8e93;
+  --blue:#2997ff;--blue-h:#4aa8ff;--blue-a:#1a85ec;--blue-tint:rgba(41,151,255,.2);--hl:rgba(41,151,255,.2);
+  --green:#30d158;--pos:#32d74b;--neg:#ff453a;
+  --th-bg:rgba(40,40,43,.92);--foot-bg:#112741;
+  --spec:rgba(255,255,255,.14);
+  --shadow-1:0 1px 2px rgba(0,0,0,.5),0 8px 24px rgba(0,0,0,.35);--shadow-2:0 18px 50px rgba(0,0,0,.7);
+  --amb1:rgba(10,132,255,.22);--amb2:rgba(191,90,242,.16);--amb3:rgba(48,209,88,.10);
+  --c1:#0a84ff;--c2:#30d158;--c3:#ff9f0a;--c4:#ff375f;--c5:#bf5af2;--c6:#64d2ff;--c7:#ffd60a;--c8:#5e5ce6;
+}}
+:root{
+  --surface:color-mix(in srgb,var(--surface-base) calc(var(--glass) * 1%),transparent);
+  --nav-bg:color-mix(in srgb,var(--nav-base) calc(var(--glass) * 1%),transparent);
+  --font:-apple-system,BlinkMacSystemFont,"SF Pro Display","SF Pro Text","Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  --r-sm:10px;--r-md:16px;--r-lg:22px;--r-xl:30px;--nav-h:56px;
+  --ease:cubic-bezier(.32,.72,0,1);--spring:cubic-bezier(.34,1.5,.64,1);
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+[hidden]{display:none!important}
+body{margin:0;min-height:100vh;font-family:var(--font);background:var(--bg);color:var(--label);-webkit-font-smoothing:antialiased;letter-spacing:-.011em;line-height:1.4;transition:background-color .4s,color .4s}
+body::before{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;
+  background:radial-gradient(60% 50% at 8% 0%,var(--amb1),transparent 70%),radial-gradient(50% 45% at 100% 10%,var(--amb2),transparent 70%),radial-gradient(55% 45% at 70% 100%,var(--amb3),transparent 70%)}
+button,input{font:inherit;color:inherit;letter-spacing:inherit}
+button{cursor:pointer;-webkit-tap-highlight-color:transparent}
+:focus-visible{outline:3px solid color-mix(in srgb,var(--blue) 50%,transparent);outline-offset:1px}
+.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+.ic{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex:none}
+.ic-lg{width:44px;height:44px;stroke-width:1.4}
+.muted{margin:0;font-size:13px;color:var(--label-3)}
+/* Liquid Glass material: blur + saturation + specular top edge */
+.glass{-webkit-backdrop-filter:saturate(190%) blur(26px);backdrop-filter:saturate(190%) blur(26px)}
+
+/* ═══════ nav ═══════ */
+.nav{position:fixed;inset:0 0 auto 0;height:var(--nav-h);z-index:1000;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:0 18px;background:var(--nav-bg);box-shadow:0 .5px 0 var(--hairline),inset 0 -1px 0 var(--spec)}
+.nav-left,.nav-right{display:flex;align-items:center;gap:10px}
+.brand{display:flex;align-items:center;gap:10px;font-size:15px;font-weight:600;letter-spacing:-.02em;white-space:nowrap}
+.brand-mark{width:24px;height:24px;border-radius:8px;background:linear-gradient(135deg,#64d2ff,#0a84ff 55%,#5e5ce6);box-shadow:inset 0 0 0 .5px rgba(255,255,255,.5),inset 0 1px 1px rgba(255,255,255,.5),0 3px 8px rgba(10,132,255,.4)}
+.icon-btn{width:34px;height:34px;display:grid;place-items:center;border:0;border-radius:50%;background:var(--fill);color:var(--label);text-decoration:none;transition:background .2s,transform .35s var(--spring)}
+.icon-btn:hover{background:var(--hairline-strong)} .icon-btn:active{transform:scale(.88)}
+.only-mobile{display:none}
+.mobile-mode .only-mobile{display:grid}
+#loadbar{position:fixed;top:var(--nav-h);left:0;width:100%;height:2px;z-index:999;overflow:hidden;opacity:0;transition:opacity .25s}
+#loadbar::after{content:"";position:absolute;inset:0;width:40%;background:var(--blue);border-radius:2px}
+body.loading #loadbar{opacity:1}
+body.loading #loadbar::after{animation:slide 1.1s var(--ease) infinite}
+@keyframes slide{from{transform:translateX(-100%)}to{transform:translateX(250%)}}
+
+/* popover (glass slider) */
+.menu-wrap{position:relative}
+.popover{position:absolute;right:0;top:calc(100% + 10px);z-index:60;width:240px;padding:14px 16px 12px;border-radius:var(--r-md);background:var(--surface);box-shadow:0 0 0 .5px var(--hairline),inset 0 1px 0 var(--spec),var(--shadow-2);-webkit-backdrop-filter:saturate(190%) blur(30px);backdrop-filter:saturate(190%) blur(30px);transform-origin:top right;opacity:0;visibility:hidden;pointer-events:none;transform:scale(.88) translateY(-8px);transition:opacity .2s,transform .4s var(--spring),visibility 0s .4s}
+.popover.show{opacity:1;visibility:visible;pointer-events:auto;transform:none;transition-delay:0s}
+.pop-title{margin-bottom:10px;font-size:13px;font-weight:600}
+.pop-scale{display:flex;justify-content:space-between;margin-top:6px;font-size:11px;color:var(--label-3)}
+input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:28px;background:none;--p:50%}
+input[type=range]::-webkit-slider-runnable-track{height:6px;border-radius:3px;background:linear-gradient(90deg,var(--blue) var(--p),var(--fill) var(--p))}
+input[type=range]::-moz-range-track{height:6px;border-radius:3px;background:var(--fill)}
+input[type=range]::-moz-range-progress{height:6px;border-radius:3px;background:var(--blue)}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:26px;height:26px;margin-top:-10px;border-radius:50%;background:#fff;box-shadow:0 2px 6px rgba(0,0,0,.3),0 0 0 .5px rgba(0,0,0,.1);transition:transform .25s var(--spring)}
+input[type=range]::-moz-range-thumb{width:26px;height:26px;border:0;border-radius:50%;background:#fff;box-shadow:0 2px 6px rgba(0,0,0,.3)}
+input[type=range]:active::-webkit-slider-thumb{transform:scale(1.12)}
+
+/* ═══════ segmented control ═══════ */
+.seg{--n:2;--i:0;position:relative;display:inline-grid;grid-auto-flow:column;grid-auto-columns:1fr;padding:2px;border-radius:12px;background:var(--fill);isolation:isolate}
+.seg[data-n="3"]{--n:3}
+.seg:has(input:nth-of-type(2):checked){--i:1}
+.seg:has(input:nth-of-type(3):checked){--i:2}
+.seg-thumb{position:absolute;z-index:-1;top:2px;bottom:2px;left:2px;width:calc((100% - 4px) / var(--n));border-radius:10px;background:var(--seg-thumb);box-shadow:0 3px 10px rgba(0,0,0,.14),0 1px 1px rgba(0,0,0,.08),inset 0 .5px 0 var(--spec);transform:translateX(calc(var(--i) * 100%));transition:transform .45s var(--ease)}
+.seg input{position:absolute;opacity:0;pointer-events:none}
+.seg label{display:flex;align-items:center;justify-content:center;gap:6px;border-radius:10px;font-size:13px;font-weight:500;color:var(--label-2);cursor:pointer;white-space:nowrap;transition:color .25s}
+.seg-text label{padding:7px 22px}
+.seg-icons label{width:34px;height:30px}
+.seg-icons{border-radius:15px}.seg-icons .seg-thumb{border-radius:13px}
+.seg-mini{border-radius:9px}.seg-mini .seg-thumb{border-radius:7px}
+.seg-mini label{padding:4px 11px;font-size:12px}
+.seg input:checked+label{color:var(--label)}
+.seg input:focus-visible+label{outline:3px solid color-mix(in srgb,var(--blue) 50%,transparent)}
+
+/* iOS switch */
+.ios-switch{display:flex;align-items:center;gap:8px;cursor:pointer;font-size:12px;font-weight:500;color:var(--label-2);user-select:none}
+.ios-switch input,.row.switch input{position:absolute;opacity:0;pointer-events:none}
+.track{position:relative;flex:none;width:51px;height:31px;border-radius:16px;background:var(--fill);transition:background .3s var(--ease)}
+.knob{position:absolute;top:2px;left:2px;width:27px;height:27px;border-radius:50%;background:#fff;box-shadow:0 3px 8px rgba(0,0,0,.25),0 1px 1px rgba(0,0,0,.15);transition:transform .45s var(--spring),width .25s var(--ease)}
+.ios-switch input:checked+.track,.row.switch input:checked+.track{background:var(--green)}
+.ios-switch input:checked+.track .knob,.row.switch input:checked+.track .knob{transform:translateX(20px)}
+.ios-switch:active .knob,.row.switch:active .knob{width:33px}
+.ios-switch:active input:checked+.track .knob,.row.switch:active input:checked+.track .knob{transform:translateX(14px)}
+.ios-switch input:focus-visible+.track,.row.switch input:focus-visible+.track{outline:3px solid color-mix(in srgb,var(--blue) 50%,transparent);outline-offset:2px}
+.nav .track{width:44px;height:26px;border-radius:13px}.nav .knob{width:22px;height:22px}
+.nav .ios-switch input:checked+.track .knob{transform:translateX(18px)}
+.nav .ios-switch:active .knob{width:28px}.nav .ios-switch:active input:checked+.track .knob{transform:translateX(12px)}
+
+/* ═══════ layout ═══════ */
+body.desktop-mode{overflow:hidden}
+.desktop-mode .app{display:flex;height:100vh;padding-top:var(--nav-h)}
+.mobile-mode .app{display:block;padding-top:var(--nav-h);max-width:520px;margin:0 auto}
+.sidebar{display:flex;flex-direction:column;flex:none;width:var(--sidebar-w,350px);min-width:270px;margin:12px 0 12px 12px;height:calc(100vh - var(--nav-h) - 24px);border-radius:var(--r-xl);background:var(--surface);box-shadow:0 0 0 .5px var(--hairline),inset 0 1px 0 var(--spec),var(--shadow-1);overflow:hidden}
+.sidebar-head{padding:20px 20px 10px}
+.head-row{display:flex;align-items:center;justify-content:space-between}
+.sidebar-head h2{margin:0;font-size:26px;font-weight:700;letter-spacing:-.03em;line-height:1.1}
+.sidebar-meta{margin-top:3px;font-size:12px;color:var(--label-3);min-height:16px}
+.sidebar-scroll{flex:1;overflow-y:auto;padding:2px 12px 20px;overscroll-behavior:contain}
+.group-cap{margin:16px 10px 6px;font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--label-3)}
+.sidebar-resizer{position:relative;flex:none;width:14px;cursor:col-resize}
+.sidebar-resizer::after{content:"";position:absolute;left:50%;top:50%;width:4px;height:48px;margin:-24px 0 0 -2px;border-radius:2px;background:var(--hairline-strong);opacity:0;transition:opacity .2s,background .2s,height .3s var(--ease)}
+.sidebar-resizer:hover::after,.sidebar-resizer.resizing::after{opacity:1}
+.sidebar-resizer.resizing::after{background:var(--blue);height:72px}
+.main{flex:1;min-width:0;height:calc(100vh - var(--nav-h));overflow-y:auto;padding:16px 28px 40px 6px}
+.page-head{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:18px}
+
+/* ═══════ accordion ═══════ */
+.acc{margin-bottom:8px;border-radius:var(--r-md);background:var(--surface-solid);box-shadow:0 0 0 .5px var(--hairline);overflow:hidden;transition:opacity .3s,filter .3s}
+.acc.is-disabled{opacity:.4;filter:saturate(.3);pointer-events:none}
+.acc-head{display:flex;align-items:center;gap:8px;width:100%;padding:13px 14px;border:0;background:none;text-align:left;font-size:14px;font-weight:600;transition:background .2s}
+.acc-head:hover{background:var(--fill-2)}
+.acc-title{flex:1}
+.chev{width:14px;height:14px;color:var(--label-3);transition:transform .45s var(--ease)}
+.acc.open .chev{transform:rotate(90deg)}
+.acc-panel{display:grid;grid-template-rows:0fr;transition:grid-template-rows .5s var(--ease)}
+.acc.open .acc-panel{grid-template-rows:1fr}
+.acc-inner{min-height:0;overflow:hidden;visibility:hidden;opacity:0;transition:opacity .25s,visibility 0s .5s}
+.acc.open .acc-inner{visibility:visible;opacity:1;transition:opacity .4s .08s,visibility 0s}
+.acc-body{padding:2px 12px 14px}
+.badge{min-width:22px;height:22px;padding:0 7px;display:grid;place-items:center;border-radius:11px;background:var(--blue);color:#fff;font-size:12px;font-weight:600;animation:pop .4s var(--spring)}
+@keyframes pop{from{transform:scale(.4);opacity:0}to{transform:none;opacity:1}}
+
+/* lists */
+.tools{display:flex;align-items:center;gap:8px;margin:0 0 10px}
+.tools.end{justify-content:flex-end}
+.tool-btns{display:flex;gap:6px}
+.search{position:relative;flex:1;min-width:0}
+.search .ic{position:absolute;left:10px;top:50%;width:14px;height:14px;transform:translateY(-50%);color:var(--label-3)}
+.search input{width:100%;height:32px;padding:0 10px 0 30px;border:0;border-radius:10px;background:var(--fill);font-size:14px;transition:background .2s,box-shadow .2s}
+.search input:focus{outline:0;background:var(--surface-solid);box-shadow:0 0 0 3px color-mix(in srgb,var(--blue) 35%,transparent)}
+.btn-micro{height:26px;padding:0 12px;border:0;border-radius:13px;background:var(--blue-tint);color:var(--blue);font-size:12px;font-weight:500;white-space:nowrap;transition:background .2s,transform .3s var(--spring)}
+.btn-micro:hover{background:color-mix(in srgb,var(--blue) 22%,transparent)} .btn-micro:active{transform:scale(.92)}
+.list{max-height:210px;overflow-y:auto;border-radius:12px;background:var(--fill-2)}
+.list.static{max-height:none;overflow:visible}
+.list+.list,.chips+.list{margin-top:10px}
+.row{position:relative;display:flex;align-items:center;gap:11px;min-height:42px;padding:9px 12px;font-size:14px;cursor:pointer;transition:background .15s}
+.row+.row::before{content:"";position:absolute;top:0;left:43px;right:0;height:.5px;background:var(--hairline)}
+.row:hover{background:var(--fill-2)} .row:active{background:var(--fill)}
+.row[data-casc="1"],.row[data-srch="1"]{display:none}
+.row .label{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.row small{display:block;margin-top:1px;font-size:11px;color:var(--label-3);white-space:normal}
+.row:not(.switch) input{position:absolute;opacity:0;pointer-events:none}
+.tag{flex:none;padding:1px 7px;border-radius:7px;background:var(--fill);font-size:10px;font-style:normal;font-weight:600;letter-spacing:.03em;text-transform:uppercase;color:var(--label-3)}
+.ord{flex:none;min-width:16px;font-size:12px;font-weight:700;color:var(--blue);text-align:right}
+.box{flex:none;width:22px;height:22px;display:grid;place-items:center;border-radius:50%;border:1.5px solid color-mix(in srgb,var(--label-3) 70%,transparent);transition:background .25s var(--ease),border-color .25s,transform .35s var(--spring)}
+.box::after{content:"";width:10px;height:5px;margin-top:-2px;border:2px solid #fff;border-top:0;border-right:0;transform:rotate(-45deg) scale(0);transition:transform .4s var(--spring)}
+.row input:checked+.box{background:var(--blue);border-color:var(--blue)}
+.row input:checked+.box::after{transform:rotate(-45deg) scale(1)}
+.row input:focus-visible+.box{outline:3px solid color-mix(in srgb,var(--blue) 50%,transparent);outline-offset:1px}
+.row:active .box{transform:scale(.84)}
+.row.switch{padding:10px 14px}.row.switch::before{display:none}.row.switch+.row.switch::before{display:block;left:14px}
+
+/* period */
+.anchor{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:12px;font-size:12px;color:var(--label-3)}
+.mini-seg{display:inline-flex;padding:2px;border-radius:9px;background:var(--fill)}
+.mini-seg button{height:24px;padding:0 10px;border:0;border-radius:7px;background:none;font-size:12px;font-weight:500;color:var(--label-2);transition:background .3s var(--ease),color .2s,box-shadow .3s}
+.mini-seg button.on{background:var(--seg-thumb);color:var(--label);box-shadow:0 2px 6px rgba(0,0,0,.14)}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:14px}
+.chip,.chip-check span{display:inline-flex;align-items:center;height:30px;padding:0 13px;border:0;border-radius:15px;background:var(--fill);font-size:13px;font-weight:500;transition:background .2s,color .2s,transform .35s var(--spring)}
+.chip:hover,.chip-check:hover span{background:var(--blue-tint);color:var(--blue)}
+.chip:active,.chip-check:active span{transform:scale(.93)}
+.chip.active,.chip-check input:checked+span{background:var(--blue);color:#fff}
+.chip-check input{position:absolute;opacity:0;pointer-events:none}
+.chip-check{position:relative;cursor:pointer}
+.chips.agg{margin-bottom:12px}.chips.agg .chip-check span{height:34px;padding:0 18px;font-size:14px}
+.date-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:6px}
+.field label{display:block;margin:0 0 4px 3px;font-size:11px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--label-3)}
+.field input{width:100%;height:38px;padding:0 8px;border:0;border-radius:10px;background:var(--fill);font-size:14px;transition:box-shadow .2s,background .2s}
+.field input:focus{outline:0;background:var(--surface-solid);box-shadow:0 0 0 3px color-mix(in srgb,var(--blue) 40%,transparent)}
+.sub-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:16px 0 8px;font-size:13px;font-weight:600}
+.sub-head small{margin-left:4px;font-size:11px;font-weight:400;color:var(--label-3)}
+.wk-grid,.mo-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px;max-height:190px;overflow-y:auto;padding:2px}
+.mo-grid{max-height:140px}
+.wk{position:relative;cursor:pointer}
+.wk input{position:absolute;opacity:0;pointer-events:none}
+.wk-chip{display:flex;flex-direction:column;justify-content:center;min-height:42px;padding:6px 11px;border-radius:12px;background:var(--fill-2);box-shadow:inset 0 0 0 .5px var(--hairline);transition:background .25s,color .2s,transform .35s var(--spring),box-shadow .2s}
+.wk-chip b{font-size:13px;font-weight:600}
+.wk-chip small{font-size:11px;color:var(--label-3);transition:color .2s}
+.wk:hover .wk-chip{background:var(--blue-tint)}
+.wk:active .wk-chip{transform:scale(.95)}
+.wk input:checked+.wk-chip{background:var(--blue);color:#fff;box-shadow:none}
+.wk input:checked+.wk-chip small{color:rgba(255,255,255,.8)}
+.wk input:focus-visible+.wk-chip{outline:3px solid color-mix(in srgb,var(--blue) 50%,transparent);outline-offset:1px}
+
+/* ═══════ buttons ═══════ */
+.btn-primary{display:inline-flex;align-items:center;justify-content:center;gap:8px;height:40px;padding:0 22px;border:0;border-radius:980px;background:var(--blue);color:#fff;font-size:14px;font-weight:500;box-shadow:inset 0 1px 0 rgba(255,255,255,.3),0 4px 14px color-mix(in srgb,var(--blue) 30%,transparent);transition:background .2s,transform .35s var(--spring),box-shadow .2s}
+.btn-primary:hover{background:var(--blue-h)} .btn-primary:active{background:var(--blue-a);transform:scale(.95)}
+.btn-primary:disabled{opacity:.35;cursor:not-allowed;box-shadow:none;transform:none}
+.btn-primary.block{width:100%;height:46px;font-size:15px}
+.btn-primary.busy{pointer-events:none;opacity:.7}
+.btn-text{display:inline-flex;align-items:center;gap:5px;padding:6px 10px;border:0;border-radius:980px;background:none;color:var(--blue);font-size:14px;font-weight:500;transition:background .2s,transform .3s var(--spring)}
+.btn-text:hover{background:var(--blue-tint)} .btn-text:active{transform:scale(.94)}
+.btn-text .ic{width:14px;height:14px}
+
+/* export menu */
+.menu{position:absolute;right:0;top:calc(100% + 8px);z-index:50;min-width:230px;padding:6px;border-radius:var(--r-md);background:var(--surface);box-shadow:0 0 0 .5px var(--hairline),inset 0 1px 0 var(--spec),var(--shadow-2);transform-origin:top right;opacity:0;visibility:hidden;pointer-events:none;transform:scale(.88) translateY(-8px);transition:opacity .2s,transform .4s var(--spring),visibility 0s .4s}
+.menu.show{opacity:1;visibility:visible;pointer-events:auto;transform:none;transition-delay:0s}
+.menu-cap{padding:7px 10px 5px;font-size:11px;font-weight:600;letter-spacing:.03em;text-transform:uppercase;color:var(--label-3)}
+.menu-item{display:flex;align-items:center;gap:10px;width:100%;padding:10px 10px;border:0;border-radius:10px;background:none;font-size:14px;text-align:left;transition:background .15s,color .15s}
+.menu-item:hover{background:var(--blue);color:#fff}
+.menu-item:disabled{opacity:.4;pointer-events:none}
+
+/* ═══════ report ═══════ */
+#report-area{max-width:1500px}
+.report-head{margin-bottom:16px}
+.report-title{margin:0 0 10px;font-size:30px;font-weight:700;letter-spacing:-.032em;line-height:1.12;text-wrap:balance}
+.report-meta{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+.period-pill{display:inline-flex;align-items:center;gap:7px;padding:6px 13px;border-radius:980px;background:var(--blue-tint);color:var(--blue);font-size:13px;font-weight:600}
+.period-pill .ic{width:15px;height:15px}
+.pills{display:contents}
+.pill{padding:6px 12px;border-radius:980px;background:var(--fill);font-size:12px;color:var(--label-2)}
+.pill b{font-weight:600;color:var(--label)}
+.kpis{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(178px,1fr);gap:12px;margin-bottom:16px;overflow-x:auto;padding:3px;margin-inline:-3px;scroll-snap-type:x proximity;scrollbar-width:none}
+.kpis::-webkit-scrollbar{display:none}
+.kpi{display:flex;flex-direction:column;align-items:flex-start;gap:2px;min-width:0;padding:15px 17px;border:0;border-radius:var(--r-lg);background:var(--surface);text-align:left;scroll-snap-align:start;box-shadow:0 0 0 .5px var(--hairline),inset 0 1px 0 var(--spec),var(--shadow-1);-webkit-backdrop-filter:saturate(190%) blur(24px);backdrop-filter:saturate(190%) blur(24px);transition:transform .4s var(--spring),box-shadow .25s,background .25s}
+.kpi:hover{transform:translateY(-2px)} .kpi:active{transform:scale(.97)}
+.kpi-label{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;font-weight:600;color:var(--label-3)}
+.kpi-val{max-width:100%;overflow:hidden;text-overflow:ellipsis;font-size:27px;font-weight:700;letter-spacing:-.03em;line-height:1.15;font-variant-numeric:tabular-nums}
+.kpi-sub{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:var(--label-3)}
+.kpi.active{background:color-mix(in srgb,var(--blue) 12%,var(--surface-solid));box-shadow:0 0 0 2px var(--blue),var(--shadow-1)}
+.kpi.active .kpi-label{color:var(--blue)}
+.kpi.static{cursor:default}.kpi.static:hover,.kpi.static:active{transform:none}
+
+.card{border-radius:var(--r-lg);background:var(--table-bg);box-shadow:0 0 0 .5px var(--hairline),var(--shadow-1);overflow:hidden}
+.table-card{display:flex;flex-direction:column}
+.table-bar{display:flex;justify-content:space-between;gap:16px;padding:11px 18px;font-size:12px;font-weight:500;color:var(--label-2);background:var(--th-bg);border-bottom:.5px solid var(--hairline)}
+.table-bar span:last-child{color:var(--label-3);font-weight:400}
+.table-scroll{max-height:calc(100vh - 330px);min-height:140px;overflow:auto;-webkit-overflow-scrolling:touch;transition:opacity .25s}
+.table-card.updating .table-scroll,.chart-card.updating .chart-body{opacity:.5}
+.excel-table{width:max-content;min-width:100%;border-collapse:separate;border-spacing:0;font-size:13.5px;font-variant-numeric:tabular-nums}
+.excel-table th,.excel-table td{padding:12px 18px;border-bottom:.5px solid var(--hairline);text-align:left;white-space:nowrap}
+.excel-table td{background-color:var(--table-bg)}
+.excel-table .num{text-align:right}
+/* header: frosted material, small caps */
+.excel-table thead th{position:sticky;top:0;z-index:3;padding:13px 18px;background:var(--th-bg);-webkit-backdrop-filter:saturate(180%) blur(18px);backdrop-filter:saturate(180%) blur(18px);border-bottom:1px solid var(--hairline-strong);font-size:11px;font-weight:700;letter-spacing:.055em;text-transform:uppercase;color:var(--label-2);cursor:pointer;user-select:none;transition:color .2s,background .2s}
+.excel-table thead th:hover{color:var(--blue)}
+.excel-table th[data-dir]{color:var(--blue)}
+.excel-table th[data-dir=asc]::after{content:" ▲";font-size:8px}
+.excel-table th[data-dir=desc]::after{content:" ▼";font-size:8px}
+/* footer: tinted accent material, pinned */
+.excel-table tfoot td{position:sticky;bottom:0;z-index:3;padding:14px 18px;background:var(--foot-bg);border-top:1.5px solid var(--blue);border-bottom:0;font-weight:700;color:var(--label);-webkit-backdrop-filter:blur(18px);backdrop-filter:blur(18px)}
+.excel-table tfoot td:first-child{font-size:11px;letter-spacing:.055em;text-transform:uppercase;color:var(--blue)}
+.excel-table td:first-child,.excel-table th:first-child{position:sticky;left:0}
+.excel-table td:first-child{z-index:1;font-weight:500}
+.excel-table thead th:first-child{z-index:5}
+.excel-table tfoot td:first-child{z-index:5}
+.excel-table tbody tr td{transition:background-color .15s}
+.excel-table tbody tr:hover td{background-image:linear-gradient(var(--blue-tint),var(--blue-tint))}
+.excel-table tbody tr:last-child td{border-bottom:0}
+.excel-table th.total-col{color:var(--blue)}
+.excel-table td.total-col{font-weight:600;border-left:.5px solid var(--hairline);background-image:linear-gradient(var(--blue-tint),var(--blue-tint))}
+.pct-positive{color:var(--pos);font-weight:600}.pct-negative{color:var(--neg);font-weight:600}.pct-neutral{color:var(--label-3)}
+.resizer{position:absolute;top:0;right:0;bottom:0;width:10px;cursor:col-resize;touch-action:none}
+.resizer::after{content:"";position:absolute;right:4px;top:28%;bottom:28%;width:1px;background:var(--hairline-strong);transition:background .2s,width .2s}
+.resizer:hover::after{background:var(--blue);width:2px}
+tr.hl-row td{background-image:linear-gradient(var(--hl),var(--hl))!important}
+.empty{display:grid;justify-items:center;gap:6px;padding:80px 24px;text-align:center;color:var(--label-3)}
+.empty .ic{width:46px;height:46px;stroke-width:1.3;opacity:.65}
+.empty h3{margin:10px 0 0;font-size:20px;font-weight:600;letter-spacing:-.02em;color:var(--label)}
+.empty p{max-width:360px;margin:0;font-size:14px}
+.empty.err h3{color:var(--neg)}
+
+/* ═══════ chart ═══════ */
+.chart-bar{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;padding:14px 18px 6px}
+.legend{display:flex;flex-wrap:wrap;gap:6px}
+.lg{display:inline-flex;align-items:center;gap:7px;height:28px;padding:0 12px;border:0;border-radius:14px;background:var(--fill-2);box-shadow:inset 0 0 0 .5px var(--hairline);font-size:12px;font-weight:500;transition:opacity .25s,background .2s,transform .3s var(--spring)}
+.lg i{width:9px;height:9px;border-radius:50%}
+.lg:active{transform:scale(.94)}
+.lg.off{opacity:.45}.lg.off i{background:var(--label-3)!important}
+.chart-ctl{display:flex;gap:8px;flex-wrap:wrap}
+.chart-body{position:relative;display:flex;padding:6px 14px 6px 8px;transition:opacity .25s}
+.yaxis{flex:none}
+.plot-scroll{flex:1;min-width:0;overflow-x:auto;overflow-y:hidden}
+.plot,.yaxis{display:block;overflow:visible}
+.plot text,.yaxis text{font-family:var(--font);font-size:11px;fill:var(--label-3)}
+.plot .xtick{fill:var(--label-2)}
+.plot .grid{stroke:var(--hairline);stroke-width:1}
+.plot .zero{stroke:var(--hairline-strong);stroke-width:1}
+.plot .band{fill:var(--blue-tint);opacity:0;transition:opacity .15s}
+.plot .rule{stroke:var(--hairline-strong);stroke-width:1;stroke-dasharray:3 3;opacity:0}
+.plot .hit{fill:transparent;touch-action:pan-x pan-y}
+.plot .vlabel{font-size:10px;font-weight:600;fill:var(--label-2);text-anchor:middle}
+.plot .ser{transition:opacity .3s}
+.chart-body.hl .ser:not(.on){opacity:.18}
+.plot .bar{fill:var(--sc);transform-box:fill-box;transform-origin:50% 100%}
+.plot .line{fill:none;stroke:var(--sc);stroke-width:2.6;stroke-linecap:round;stroke-linejoin:round}
+.plot .dot{fill:var(--surface-solid);stroke:var(--sc);stroke-width:2}
+.plot .hdot{fill:var(--sc);stroke:var(--surface-solid);stroke-width:2.5;opacity:0}
+.plot.anim .bar{animation:grow .7s var(--ease) both;animation-delay:calc(var(--k) * 9ms)}
+.plot.anim .line{stroke-dasharray:1;stroke-dashoffset:1;animation:draw 1.1s var(--ease) forwards}
+.plot.anim .area{animation:fade .9s var(--ease) both}
+.plot.anim .dot{animation:fade .6s .5s both}
+@keyframes grow{from{transform:scaleY(0)}}
+@keyframes draw{to{stroke-dashoffset:0}}
+@keyframes fade{from{opacity:0}}
+.tip{position:absolute;top:10px;z-index:5;min-width:150px;max-width:280px;padding:10px 12px;border-radius:14px;background:var(--surface);box-shadow:0 0 0 .5px var(--hairline),inset 0 1px 0 var(--spec),var(--shadow-2);-webkit-backdrop-filter:saturate(190%) blur(24px);backdrop-filter:saturate(190%) blur(24px);pointer-events:none;opacity:0;transform:translateY(4px) scale(.97);transition:opacity .15s,transform .25s var(--spring)}
+.tip.show{opacity:1;transform:none}
+.tip-title{margin-bottom:6px;font-size:12px;font-weight:700;overflow-wrap:anywhere}
+.tip-row{display:flex;align-items:center;gap:8px;font-size:12px;line-height:1.7}
+.tip-row i{width:8px;height:8px;border-radius:50%;flex:none}
+.tip-row span{flex:1;color:var(--label-2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tip-row b{font-variant-numeric:tabular-nums}
+.chart-note{padding:0 18px 14px;font-size:12px;color:var(--label-3);min-height:14px}
+.chart-note:empty{padding:0}
+
+/* ═══════ upload page ═══════ */
+.upload-wrap{max-width:540px;margin:0 auto;padding:calc(var(--nav-h) + 72px) 20px 48px;animation:rise .7s var(--ease) both}
+.hero-title{margin:0 0 10px;text-align:center;font-size:clamp(38px,8vw,60px);font-weight:700;letter-spacing:-.04em;line-height:1.04}
+.hero-sub{margin:0 0 34px;text-align:center;font-size:18px;color:var(--label-3)}
+.upload-card{display:grid;gap:16px;padding:26px;border-radius:32px;background:var(--surface);box-shadow:0 0 0 .5px var(--hairline),inset 0 1px 0 var(--spec),var(--shadow-1)}
+.dropzone{display:grid;justify-items:center;gap:6px;padding:40px 20px;border:1.5px dashed var(--hairline-strong);border-radius:22px;background:var(--fill-2);color:var(--label-3);text-align:center;cursor:pointer;transition:border-color .3s var(--ease),background .3s,transform .45s var(--spring)}
+.dropzone:hover{border-color:var(--blue);color:var(--blue)}
+.dropzone.drag{border-color:var(--blue);background:var(--blue-tint);color:var(--blue);transform:scale(1.02)}
+.dropzone.has-file{border-style:solid;border-color:var(--blue);background:var(--blue-tint);color:var(--blue)}
+.dz-title{margin-top:6px;font-size:17px;font-weight:600;color:var(--label);word-break:break-all}
+.dz-sub{font-size:13px}
+.alert{padding:12px 14px;border-radius:14px;background:color-mix(in srgb,var(--neg) 12%,transparent);color:var(--neg);font-size:13px;font-weight:500}
+@keyframes rise{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:none}}
+
+/* toast + mobile preview */
+.toast{position:fixed;left:50%;bottom:28px;z-index:3000;padding:12px 20px;border-radius:980px;background:rgba(40,40,44,.92);color:#fff;font-size:13px;font-weight:500;transform:translate(-50%,16px);opacity:0;transition:opacity .3s,transform .45s var(--spring)}
+.toast.in{opacity:1;transform:translate(-50%,0)}
+.preview-modal{position:fixed;inset:0;z-index:5000;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;padding:20px;background:rgba(0,0,0,.92);animation:fadeIn .25s}
+.preview-modal img{max-width:94%;max-height:68%;border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.5)}
+.preview-modal p{margin:0;color:#fff;font-size:14px}
+.preview-modal .btn-primary{background:#fff;color:#1d1d1f}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+
+/* ═══════ mobile layout ═══════ */
+.mobile-mode .sidebar{width:auto;min-width:0;height:auto;max-height:5000px;margin:10px 12px 0;transition:max-height .6s var(--ease),opacity .3s,margin .5s var(--ease),visibility 0s}
+.mobile-mode.sidebar-collapsed .sidebar{max-height:0;opacity:0;visibility:hidden;margin-top:0;box-shadow:none;transition:max-height .5s var(--ease),opacity .3s,margin .5s var(--ease),visibility 0s .5s}
+.mobile-mode .sidebar-scroll{overflow:visible}
+.mobile-mode .sidebar-resizer{display:none}
+.mobile-mode .main{height:auto;overflow:visible;padding:14px 12px 36px}
+.mobile-mode .report-title{font-size:24px}
+.mobile-mode .page-head{flex-direction:column;align-items:stretch}
+.mobile-mode .seg-text{display:grid}
+.mobile-mode .menu-wrap .btn-primary{width:100%}
+.mobile-mode .menu{left:0;right:0;transform-origin:top center}
+.mobile-mode .table-scroll{max-height:68vh}
+.mobile-mode .excel-table{font-size:12.5px}
+.mobile-mode .excel-table th,.mobile-mode .excel-table td{padding:10px 13px}
+.mobile-mode .kpis{grid-auto-columns:minmax(150px,46%)}
+.mobile-mode .kpi-val{font-size:23px}
+.mobile-mode .nav .sw-text{display:none}
+@media (max-width:560px){.nav .sw-text,#glassWrap{display:none}.nav{padding:0 12px}.brand{font-size:14px}}
+
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--hairline-strong);border-radius:8px;border:2px solid transparent;background-clip:content-box}
+
+/* ═══════ export mode: flat, solid, in the current theme/layout ═══════ */
+body.exporting{--surface:var(--surface-solid)}
+body.exporting::before{display:none}
+body.exporting *{-webkit-backdrop-filter:none!important;backdrop-filter:none!important;animation:none!important;transition:none!important}
+body.exporting .no-export,body.exporting .resizer{display:none!important}
+body.exporting #report-area{padding:26px;background:var(--bg);max-width:none}
+body.exporting .card,body.exporting .kpi{box-shadow:0 0 0 1px var(--hairline)!important}
+body.exporting .card{overflow:visible}
+body.exporting .kpis{overflow:visible}
+body.exporting .excel-table thead th,body.exporting .excel-table tfoot td,body.exporting .excel-table td:first-child,body.exporting .excel-table th:first-child{position:static}
+body.exporting .lg.off{display:none}
+body.exporting .table-scroll,body.exporting .plot-scroll{overflow:visible!important;max-height:none!important}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{transition-duration:.01ms!important;animation-duration:.01ms!important}}
+"""
+
+APP_JS = r"""
+(() => {
+'use strict';
+const $ = (s, r = document) => r.querySelector(s);
+const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
+const root = document.documentElement, body = document.body;
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const store = {
+  get(k){ try { return localStorage.getItem(k); } catch (e) { return null; } },
+  set(k, v){ try { localStorage.setItem(k, v); } catch (e) {} }
+};
+function toast(msg){
+  const t = document.createElement('div');
+  t.className = 'toast'; t.textContent = msg; body.appendChild(t);
+  requestAnimationFrame(() => t.classList.add('in'));
+  setTimeout(() => { t.classList.remove('in'); setTimeout(() => t.remove(), 400); }, 3200);
+}
+
+/* ═══════ appearance: theme + Liquid Glass transparency ═══════ */
+const themeNow = store.get('ap-theme') || 'auto';
+$$('#themeSeg input').forEach(i => {
+  i.checked = i.value === themeNow;
+  i.addEventListener('change', () => {
+    if (!i.checked) return;
+    if (i.value === 'auto') delete root.dataset.theme; else root.dataset.theme = i.value;
+    store.set('ap-theme', i.value);
+  });
+});
+const gRange = $('#glassRange');
+if (gRange) {
+  const paint = () => gRange.style.setProperty('--p', ((gRange.value - gRange.min) / (gRange.max - gRange.min) * 100) + '%');
+  gRange.value = parseInt(store.get('ap-glass') || '72', 10) || 72; paint();
+  gRange.addEventListener('input', () => { root.style.setProperty('--glass', gRange.value); store.set('ap-glass', gRange.value); paint(); });
+}
+const popovers = [['#glassBtn', '#glassPop'], ['#exportBtn', '#exportMenu']].map(([b, p]) => [$(b), $(p)]).filter(([b, p]) => b && p);
+function closePops(except){ popovers.forEach(([b, p]) => { if (p !== except) { p.classList.remove('show'); b.setAttribute('aria-expanded', 'false'); } }); }
+popovers.forEach(([b, p]) => b.addEventListener('click', e => {
+  e.stopPropagation(); const open = !p.classList.contains('show');
+  closePops(open ? p : null); p.classList.toggle('show', open); b.setAttribute('aria-expanded', String(open));
+}));
+document.addEventListener('click', e => { if (!e.target.closest('.popover, .menu')) closePops(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closePops(); });
+
+/* ═══════ upload page ═══════ */
+const dz = $('#dropzone');
+if (dz) {
+  const input = $('#file'), title = $('#dzTitle'), sub = $('#dzSub'), btn = $('#launchBtn');
+  const size = n => n > 1048576 ? (n / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(n / 1024)) + ' KB';
+  const sync = () => {
+    const f = input.files[0];
+    dz.classList.toggle('has-file', !!f);
+    title.textContent = f ? f.name : 'Choose a file';
+    sub.textContent = f ? size(f.size) + ' · ready to launch' : 'or drag it here · .xlsx, .xls, .csv';
+    btn.disabled = !f;
+  };
+  input.addEventListener('change', sync);
+  ['dragenter', 'dragover'].forEach(ev => dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.add('drag'); }));
+  ['dragleave', 'drop'].forEach(ev => dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.remove('drag'); }));
+  dz.addEventListener('drop', e => { if (e.dataTransfer.files.length) { input.files = e.dataTransfer.files; sync(); } });
+  $('#uploadForm').addEventListener('submit', () => { btn.classList.add('busy'); btn.textContent = 'Uploading…'; });
+}
+
+const form = $('#config-form');
+if (!form) return;
+
+/* ═══════ layout switch (desktop / mobile) ═══════ */
+const sw = $('#mobileSwitch');
+sw.checked = body.classList.contains('mobile-mode');
+sw.addEventListener('change', () => {
+  const on = sw.checked;
+  body.classList.toggle('mobile-mode', on); body.classList.toggle('desktop-mode', !on);
+  body.classList.toggle('sidebar-collapsed', on);
+  $('#sidebarToggle').setAttribute('aria-expanded', String(!on));
+  store.set('ap-mobile', on ? '1' : '0');
+  redrawSoon();
+});
+$('#sidebarToggle').addEventListener('click', e => {
+  const c = body.classList.toggle('sidebar-collapsed');
+  e.currentTarget.setAttribute('aria-expanded', String(!c));
+});
+
+/* sidebar resizer */
+const rz = $('#sidebarResizer');
+const savedW = store.get('ap-sidebar-w');
+if (savedW) root.style.setProperty('--sidebar-w', savedW + 'px');
+rz.addEventListener('pointerdown', e => { rz.setPointerCapture(e.pointerId); rz.classList.add('resizing'); body.style.cursor = 'col-resize'; body.style.userSelect = 'none'; });
+rz.addEventListener('pointermove', e => { if (rz.hasPointerCapture(e.pointerId)) root.style.setProperty('--sidebar-w', Math.min(560, Math.max(270, e.clientX - 12)) + 'px'); });
+const endResize = () => {
+  rz.classList.remove('resizing'); body.style.cursor = ''; body.style.userSelect = '';
+  const w = parseInt(getComputedStyle(root).getPropertyValue('--sidebar-w'), 10); if (w) store.set('ap-sidebar-w', w);
+  redrawSoon();
+};
+rz.addEventListener('pointerup', endResize); rz.addEventListener('pointercancel', endResize);
+rz.addEventListener('dblclick', () => { root.style.removeProperty('--sidebar-w'); store.set('ap-sidebar-w', ''); redrawSoon(); });
+
+/* ═══════ state ═══════ */
+const boot = JSON.parse($('#boot').textContent || '{}');
+const filterMap = boot.map || [];
+const tableWrap = $('#table-wrapper'), tableCard = $('#tableCard'), chartCard = $('#chartCard');
+const bar = $('#table-bar'), kpiEl = $('#kpi-banner'), chartBody = $('#chartBody');
+const dlExcel = $('#dlExcel');
+const view = () => $('input[name="view_mode_toggle"]:checked').value;
+const order = { index_cols: [], value_cols: [] };
+let data = null, dataMode = null, lastParams = null, ctrl = null, timer = null;
+let periodLabel = '', activePreset = null, activeKpi = null, kpis = [];
+const emptyBlock = (t, m, err) => `<div class="empty${err ? ' err' : ''}"><svg class="ic"><use href="#i-chart"/></svg><h3>${esc(t)}</h3><p>${m}</p></div>`;
+const PROMPT = emptyBlock('Build your report', 'Pick at least one <b>X column</b>, one <b>Y column</b> and one <b>measure</b> in the sidebar.');
+
+const checked = name => $$(`input[name="${name}"]:checked`);
+const isShown = r => !r || (r.dataset.casc !== '1' && r.dataset.srch !== '1');
+
+function syncOrder(name){
+  const cur = checked(name).map(i => i.value), set = new Set(cur);
+  order[name] = order[name].filter(v => set.has(v));
+  cur.forEach(v => { if (!order[name].includes(v)) order[name].push(v); });
+  $$(`[data-list="${name}"] .row`).forEach(r => {
+    const o = r.querySelector('.ord'); if (!o) return;
+    const n = order[name].indexOf(r.dataset.val); o.textContent = n >= 0 ? n + 1 : '';
+  });
+}
+
+function updateBadges(){
+  const sd = $('#start_date'), ed = $('#end_date');
+  $$('[data-badge-for]').forEach(b => {
+    const k = b.dataset.badgeFor;
+    const n = k === '__period' ? (checked('weeks').length + checked('months').length || ((sd && sd.value) || (ed && ed.value) ? 1 : 0)) : checked(k).length;
+    const was = b.textContent; b.hidden = n === 0; b.textContent = n;
+    if (n && was !== String(n)) { b.style.animation = 'none'; void b.offsetWidth; b.style.animation = ''; }
+  });
+}
+
+/* ═══════ period presets ═══════ */
+const parseISO = s => { const [y, m, d] = s.split('-').map(Number); return new Date(y, m - 1, d); };
+const iso = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+const addD = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x; };
+const monday = d => addD(d, -((d.getDay() + 6) % 7));
+const PRESETS = {
+  today: a => [a, a], yesterday: a => [addD(a, -1), addD(a, -1)],
+  last7: a => [addD(a, -6), a], last14: a => [addD(a, -13), a], last30: a => [addD(a, -29), a], last90: a => [addD(a, -89), a],
+  thisweek: a => [monday(a), a], lastweek: a => { const s = addD(monday(a), -7); return [s, addD(s, 6)]; },
+  mtd: a => [new Date(a.getFullYear(), a.getMonth(), 1), a],
+  lastmonth: a => [new Date(a.getFullYear(), a.getMonth() - 1, 1), new Date(a.getFullYear(), a.getMonth(), 0)],
+  qtd: a => [new Date(a.getFullYear(), Math.floor(a.getMonth() / 3) * 3, 1), a],
+  lastqtr: a => { const q = Math.floor(a.getMonth() / 3) * 3; return [new Date(a.getFullYear(), q - 3, 1), new Date(a.getFullYear(), q, 0)]; },
+  ytd: a => [new Date(a.getFullYear(), 0, 1), a],
+  fytd: a => { const y = a.getMonth() >= 3 ? a.getFullYear() : a.getFullYear() - 1; return [new Date(y, 3, 1), a]; }
+};
+const today0 = new Date(); today0.setHours(0, 0, 0, 0);
+const dmax = boot.dmax ? parseISO(boot.dmax) : null;
+let anchor = dmax && (today0 - dmax) > 3 * 864e5 ? 'data' : 'today';
+function paintAnchor(){ $$('#anchorSeg button').forEach(b => b.classList.toggle('on', b.dataset.anchor === anchor)); }
+paintAnchor();
+
+function clearWM(){ $$('input[name="weeks"], input[name="months"]').forEach(i => { i.checked = false; }); }
+function clearDates(){ const s = $('#start_date'), e = $('#end_date'); if (s) { s.value = ''; e.value = ''; } }
+function setActiveChip(key){ activePreset = key; $$('.chip').forEach(c => c.classList.toggle('active', c.dataset.preset === key && key !== 'all')); }
+function applyPreset(key){
+  clearWM(); setActiveChip(key);
+  const chip = $(`.chip[data-preset="${key}"]`); periodLabel = key === 'all' ? '' : (chip ? chip.textContent : '');
+  if (key === 'all') { clearDates(); return; }
+  const a = anchor === 'data' && dmax ? dmax : today0;
+  const [s, e] = PRESETS[key](a);
+  $('#start_date').value = iso(s); $('#end_date').value = iso(e);
+}
+
+/* ═══════ requests ═══════ */
+function buildParams(server){
+  const fd = new FormData(form);
+  ['index_cols', 'value_cols'].forEach(n => { fd.delete(n); order[n].forEach(v => fd.append(n, v)); });
+  fd.append('view_mode', server); fd.append('period_label', periodLabel);
+  return fd;
+}
+function schedule(delay = 90){ clearTimeout(timer); timer = setTimeout(update, delay); }
+
+async function update(){
+  const server = view() === 'raw' ? 'raw' : 'pivot';
+  const fd = buildParams(server);
+  $$('[data-structural]').forEach(el => el.classList.toggle('is-disabled', server === 'raw'));
+  updateBadges();
+  if (server === 'pivot' && (!fd.getAll('index_cols').length || !fd.getAll('value_cols').length || !fd.getAll('agg_funcs').length)) {
+    if (ctrl) ctrl.abort();
+    body.classList.remove('loading'); data = null; lastParams = null; dataMode = server; render(); return;
+  }
+  if (ctrl) ctrl.abort();
+  const mine = ctrl = new AbortController();
+  body.classList.add('loading'); tableCard.classList.add('updating'); chartCard.classList.add('updating');
+  try {
+    const res = await fetch('/calculate', { method: 'POST', body: fd, signal: mine.signal });
+    const d = await res.json();
+    data = res.ok ? d : { error: d.error || 'Unknown error' };
+    dataMode = server; lastParams = res.ok ? new URLSearchParams(fd).toString() : null;
+    render();
+  } catch (err) {
+    if (err.name === 'AbortError') return;
+    data = { error: 'Could not reach the server. Please try again.' }; lastParams = null; render();
+  } finally {
+    if (mine === ctrl) { body.classList.remove('loading'); tableCard.classList.remove('updating'); chartCard.classList.remove('updating'); }
+  }
+}
+
+/* ═══════ rendering ═══════ */
+function setHead(title, period, filters){
+  $('#reportTitle').textContent = title; document.title = title + ' · Analytics Pro';
+  $('#periodText').textContent = period || ''; $('#periodPill').hidden = !period;
+  $('#filterPills').innerHTML = (filters || []).map(([k, v]) => `<span class="pill"><b>${esc(k)}</b> ${esc(v)}</span>`).join('');
+}
+function render(){
+  const mode = view(), d = data;
+  tableCard.hidden = mode === 'chart'; chartCard.hidden = mode !== 'chart';
+  $('#exportCap').textContent = `Exports the ${mode === 'raw' ? 'raw data' : mode === 'chart' ? 'chart' : 'pivot'} · ${body.classList.contains('mobile-mode') ? 'mobile' : 'desktop'} layout`;
+  dlExcel.disabled = !(d && !d.error && lastParams);
+  const block = html => { kpiEl.hidden = true; bar.hidden = true; tableWrap.innerHTML = html; chartBody.innerHTML = html; $('#legend').innerHTML = ''; $('#chartNote').textContent = ''; kpis = []; activeKpi = null; };
+  if (!d) { setHead('Build your report', boot.all, []); block(PROMPT); return; }
+  if (d.error) { setHead('Something went wrong', '', []); block(emptyBlock('Something went wrong', esc(d.error), true)); return; }
+  setHead(d.title, d.period, d.filters);
+
+  const prevLabel = kpis[activeKpi] && kpis[activeKpi].label;
+  kpis = d.kpis || []; activeKpi = Math.max(-1, kpis.findIndex(k => k.label === prevLabel)); if (activeKpi < 0) activeKpi = null;
+  kpiEl.hidden = !kpis.length;
+  kpiEl.innerHTML = kpis.map((k, i) => `<button type="button" class="kpi${k.cols && k.cols.length ? '' : ' static'}" data-i="${i}"><span class="kpi-label">${esc(k.label)}</span><span class="kpi-val" title="${esc(k.value)}">${esc(k.value)}</span><span class="kpi-sub">${esc(k.sub || '')}</span></button>`).join('');
+
+  if (mode === 'chart') { drawLegend(); drawChart(true); }
+  else {
+    bar.hidden = false; $('#statusText').textContent = d.status || '';
+    tableWrap.innerHTML = d.table_html;
+    $$('tbody tr', tableWrap).forEach((tr, i) => { tr.dataset.o = i; });
+    addResizers();
+  }
+  applyHighlight();
+}
+
+/* KPI buttons highlight the matching columns (table) and series (chart) */
+const hlStyle = document.head.appendChild(document.createElement('style'));
+kpiEl.addEventListener('click', e => {
+  const b = e.target.closest('.kpi'); if (!b) return;
+  const i = +b.dataset.i; if (!kpis[i].cols || !kpis[i].cols.length) return;
+  activeKpi = activeKpi === i ? null : i; applyHighlight();
+});
+function applyHighlight(){
+  const k = activeKpi != null ? kpis[activeKpi] : null;
+  $$('.kpi', kpiEl).forEach((b, i) => b.classList.toggle('active', i === activeKpi));
+  const tbl = $('.excel-table', tableWrap);
+  let css = '';
+  if (tbl) {
+    tbl.classList.toggle('hl', !!k);
+    if (k) {
+      const nidx = Math.max(+tbl.dataset.nidx || 0, 1);
+      const sel = k.cols.map(c => `:nth-child(${c + 1})`).join(',');
+      css = `.excel-table.hl :is(td,th):not(:nth-child(-n+${nidx})){color:var(--label-3)!important}` +
+            `.excel-table.hl td:not(:nth-child(-n+${nidx})) span{opacity:.5}` +
+            `.excel-table.hl :is(td,th):is(${sel}){color:var(--label)!important;background-image:linear-gradient(var(--hl),var(--hl))}` +
+            `.excel-table.hl th:is(${sel}){color:var(--blue)!important}` +
+            `.excel-table.hl td:is(${sel}) span{opacity:1}`;
+    }
+  }
+  hlStyle.textContent = css;
+  const set = k ? new Set(k.cols) : null;
+  const match = !!(set && chartData && chartData.series.some(s => set.has(s.col)));
+  chartBody.classList.toggle('hl', match);
+  $$('.ser', chartBody).forEach(g => g.classList.toggle('on', !!set && set.has(+g.dataset.col)));
+  if (match) { /* make sure highlighted series is visible */
+    const need = chartData.series.map((s, i) => set.has(s.col) && hidden.has(i) ? i : -1).filter(i => i >= 0);
+    if (need.length) { need.forEach(i => hidden.delete(i)); drawLegend(); drawChart(false); }
+  }
+}
+
+/* ═══════ interactions ═══════ */
+form.addEventListener('submit', e => e.preventDefault());
+form.addEventListener('change', e => {
+  const t = e.target, n = t.name;
+  if (n === 'weeks' || n === 'months') {
+    $$(`input[name="${n === 'weeks' ? 'months' : 'weeks'}"]`).forEach(i => { i.checked = false; });
+    clearDates(); setActiveChip(null); periodLabel = '';
+  } else if (t.type === 'date') { clearWM(); setActiveChip(null); periodLabel = ''; }
+  if (n === 'index_cols' || n === 'value_cols') syncOrder(n);
+  if (n === 'spc_filters' || n === 'seg1_filters') cascade();
+  schedule();
+});
+form.addEventListener('input', e => {
+  const q = e.target.dataset && e.target.dataset.search; if (!q) return;
+  const needle = e.target.value.trim().toLowerCase();
+  $$('.row', $(`[data-list="${q}"]`)).forEach(r => { r.dataset.srch = r.dataset.val.toLowerCase().includes(needle) ? '0' : '1'; });
+});
+form.addEventListener('click', e => {
+  const head = e.target.closest('.acc-head');
+  if (head) { const open = head.parentElement.classList.toggle('open'); head.setAttribute('aria-expanded', String(open)); return; }
+  const sel = e.target.closest('[data-select]');
+  if (sel) {
+    const on = sel.dataset.on === '1', name = sel.dataset.select;
+    $$(`input[name="${name}"]`).forEach(i => { if (!on || isShown(i.closest('.row'))) i.checked = on; });
+    if (name === 'weeks' || name === 'months') { clearDates(); setActiveChip(null); periodLabel = ''; }
+    if (name === 'index_cols' || name === 'value_cols') syncOrder(name);
+    if (name === 'spc_filters' || name === 'seg1_filters') cascade();
+    schedule(0); return;
+  }
+  const lat = e.target.closest('[data-latest]');
+  if (lat) {
+    const n = +lat.dataset.latest; clearDates(); setActiveChip(null); periodLabel = ''; $$('input[name="months"]').forEach(i => { i.checked = false; });
+    $$('input[name="weeks"]').forEach((i, k) => { i.checked = k < n; }); schedule(0); return;
+  }
+  const chip = e.target.closest('.chip');
+  if (chip) { applyPreset(chip.dataset.preset); schedule(0); return; }
+  const an = e.target.closest('[data-anchor]');
+  if (an) { anchor = an.dataset.anchor; paintAnchor(); if (activePreset && activePreset !== 'all') { applyPreset(activePreset); schedule(0); } }
+});
+$$('input[name="view_mode_toggle"]').forEach(r => r.addEventListener('change', () => {
+  const server = view() === 'raw' ? 'raw' : 'pivot';
+  if (server !== dataMode) { activeKpi = null; update(); } else { updateBadges(); render(); }
+  $$('[data-structural]').forEach(el => el.classList.toggle('is-disabled', server === 'raw'));
+}));
+
+function cascade(){
+  const spc = new Set(checked('spc_filters').map(i => i.value));
+  const apply = (name, valid) => $$('.row', $(`[data-list="${name}"]`) || document.createElement('div')).forEach(r => {
+    const hide = !valid.has(r.dataset.val); r.dataset.casc = hide ? '1' : '0';
+    if (hide) r.querySelector('input').checked = false;
+  });
+  apply('seg1_filters', new Set(filterMap.filter(r => !spc.size || spc.has(r.spc)).map(r => r.seg)));
+  const seg = new Set(checked('seg1_filters').map(i => i.value));
+  apply('family_filters', new Set(filterMap.filter(r => (!spc.size || spc.has(r.spc)) && (!seg.size || seg.has(r.seg))).map(r => r.fam)));
+}
+
+$('#resetBtn').addEventListener('click', () => {
+  form.reset(); setActiveChip(null); periodLabel = ''; activeKpi = null;
+  $$('.row').forEach(r => { delete r.dataset.casc; delete r.dataset.srch; });
+  $$('[data-search]').forEach(i => { i.value = ''; });
+  order.index_cols = []; order.value_cols = []; syncOrder('index_cols'); syncOrder('value_cols');
+  $('#view_pivot').checked = true; schedule(0);
+});
+
+/* table: sortable headers, resizable columns */
+function addResizers(){
+  $$('.excel-table th', tableWrap).forEach(th => { if (!th.querySelector('.resizer')) th.appendChild(Object.assign(document.createElement('div'), { className: 'resizer' })); });
+}
+const MON = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
+function sortKey(text, numeric){
+  const t = text.trim();
+  if (numeric) { const m = t.replace(/,/g, '').match(/-?\d+(\.\d+)?/); if (!m) return -Infinity; const v = parseFloat(m[0]); return /↓/.test(t) ? -Math.abs(v) : v; }
+  const d = t.match(/^(\d{1,2})[ -]([A-Za-z]{3})[ -](\d{2,4})$/);
+  if (d) { const y = +d[3] < 100 ? 2000 + +d[3] : +d[3]; return new Date(y, MON[d[2].toLowerCase()], +d[1]).getTime(); }
+  return t.toLowerCase();
+}
+tableWrap.addEventListener('click', e => {
+  const th = e.target.closest('th'); if (!th || e.target.closest('.resizer')) return;
+  const table = th.closest('table'), ci = th.cellIndex, tb = table.tBodies[0];
+  const dir = th.dataset.dir === 'asc' ? 'desc' : th.dataset.dir === 'desc' ? '' : 'asc';
+  $$('th', table).forEach(h => { delete h.dataset.dir; }); if (dir) th.dataset.dir = dir;
+  const numeric = th.classList.contains('num'), rows = Array.from(tb.rows);
+  if (!dir) rows.sort((a, b) => a.dataset.o - b.dataset.o);
+  else {
+    const keys = new Map(rows.map(r => [r, sortKey(r.cells[ci].textContent, numeric)]));
+    rows.sort((a, b) => { const x = keys.get(a), y = keys.get(b); const c = x < y ? -1 : x > y ? 1 : 0; return dir === 'asc' ? c : -c; });
+  }
+  const frag = document.createDocumentFragment(); rows.forEach(r => frag.appendChild(r)); tb.appendChild(frag);
+});
+tableWrap.addEventListener('pointerdown', e => {
+  const h = e.target.closest('.resizer'); if (!h) return;
+  const th = h.parentElement, sx = e.clientX, sw0 = th.offsetWidth;
+  h.setPointerCapture(e.pointerId);
+  const move = ev => { th.style.width = th.style.minWidth = Math.max(60, sw0 + ev.clientX - sx) + 'px'; };
+  const up = () => { h.removeEventListener('pointermove', move); h.removeEventListener('pointerup', up); };
+  h.addEventListener('pointermove', move); h.addEventListener('pointerup', up);
+  e.preventDefault(); e.stopPropagation();
+});
+
+/* ═══════ chart (interactive SVG) ═══════ */
+let ctype = 'bar', csort = 'natural', hidden = new Set(), chartData = null, chartSig = '', chartX = '', redrawT = null, uid = 0;
+const fmtFull = v => v == null ? '–' : (Math.abs(v) < 100 && v % 1 !== 0 ? v.toLocaleString('en-IN', { maximumFractionDigits: 2 }) : Math.round(v).toLocaleString('en-IN'));
+const trim1 = n => String(Math.round(n * 10) / 10);
+const fmtAxis = v => { const a = Math.abs(v); return a >= 1e7 ? trim1(v / 1e7) + ' Cr' : a >= 1e5 ? trim1(v / 1e5) + ' L' : a >= 1e3 ? trim1(v / 1e3) + 'K' : trim1(v); };
+function niceTicks(lo, hi, n = 5){
+  if (hi === lo) hi = lo + 1;
+  const raw = (hi - lo) / n, mag = Math.pow(10, Math.floor(Math.log10(raw))), nm = raw / mag;
+  const step = (nm <= 1 ? 1 : nm <= 2 ? 2 : nm <= 2.5 ? 2.5 : nm <= 5 ? 5 : 10) * mag;
+  const out = []; for (let v = Math.floor(lo / step) * step; v <= Math.ceil(hi / step) * step + step / 2; v += step) out.push(+v.toFixed(10));
+  return out;
+}
+function monoPath(p){  /* monotone cubic: smooth like Apple charts, never overshoots */
+  const n = p.length; if (n < 2) return `M${p[0][0]},${p[0][1]}`;
+  const dx = [], m = [], t = new Array(n);
+  for (let i = 0; i < n - 1; i++) { dx[i] = p[i + 1][0] - p[i][0]; m[i] = (p[i + 1][1] - p[i][1]) / dx[i]; }
+  t[0] = m[0]; t[n - 1] = m[n - 2];
+  for (let i = 1; i < n - 1; i++) t[i] = m[i - 1] * m[i] <= 0 ? 0 : (m[i - 1] + m[i]) / 2;
+  for (let i = 0; i < n - 1; i++) {
+    if (m[i] === 0) { t[i] = 0; t[i + 1] = 0; continue; }
+    const a = t[i] / m[i], b = t[i + 1] / m[i], s = a * a + b * b;
+    if (s > 9) { const k = 3 / Math.sqrt(s); t[i] = k * a * m[i]; t[i + 1] = k * b * m[i]; }
+  }
+  let d = `M${p[0][0]},${p[0][1]}`;
+  for (let i = 0; i < n - 1; i++) { const h = dx[i] / 3; d += `C${p[i][0] + h},${p[i][1] + t[i] * h} ${p[i + 1][0] - h},${p[i + 1][1] - t[i + 1] * h} ${p[i + 1][0]},${p[i + 1][1]}`; }
+  return d;
+}
+function drawLegend(){
+  const c = chartData; $('#legend').innerHTML = c ? c.series.map((s, i) => `<button type="button" class="lg${hidden.has(i) ? ' off' : ''}" data-i="${i}" title="Show or hide"><i style="background:var(--c${i % 8 + 1})"></i>${esc(s.name)}</button>`).join('') : '';
+}
+$('#legend').addEventListener('click', e => {
+  const b = e.target.closest('.lg'); if (!b) return; const i = +b.dataset.i;
+  if (hidden.has(i)) hidden.delete(i); else if (chartData.series.length - hidden.size > 1) hidden.add(i);
+  drawLegend(); drawChart(false); applyHighlight();
+});
+$$('input[name="ctype"]').forEach(r => r.addEventListener('change', () => { ctype = r.value; drawChart(true); applyHighlight(); }));
+$$('input[name="csort"]').forEach(r => r.addEventListener('change', () => { csort = r.value; drawChart(true); applyHighlight(); }));
+const redrawSoon = () => { clearTimeout(redrawT); redrawT = setTimeout(() => { if (!chartCard.hidden && chartData) { drawChart(false); applyHighlight(); } }, 160); };
+window.addEventListener('resize', redrawSoon);
+
+function drawChart(animate){
+  const d = data && data.chart;
+  if (!d || !d.series.length || !d.labels.length) { chartData = null; chartBody.innerHTML = emptyBlock('Nothing to chart', 'Choose at least one X column and a measure.'); $('#chartNote').textContent = ''; return; }
+  const sig = d.series.map(s => s.name).join('|');
+  if (sig !== chartSig) {  /* new measures → sensible default: first 4 series sharing the first aggregate */
+    chartSig = sig; hidden = new Set(); const a = d.series[0].agg;
+    d.series.forEach((s, i) => { if (s.agg !== a || i >= 4) hidden.add(i); });
+    drawLegendFor(d);
+  }
+  if (d.x_title !== chartX) {
+    chartX = d.x_title; ctype = d.is_time ? 'line' : 'bar'; csort = 'natural';
+    $(`#ct_${ctype}`).checked = true; $('#cs_nat').checked = true;
+  }
+  chartData = d; drawLegend();
+  $('#chartNote').textContent = d.note || '';
+  const mobile = body.classList.contains('mobile-mode');
+  const vis = d.series.map((s, i) => i).filter(i => !hidden.has(i));
+  let idx = d.labels.map((_, i) => i);
+  if (csort === 'value') { const s = d.series[vis[0]]; idx.sort((a, b) => (s.values[b] ?? -Infinity) - (s.values[a] ?? -Infinity)); }
+  const labels = idx.map(i => d.labels[i]);
+  const ser = vis.map(i => ({ i, s: d.series[i], v: idx.map(k => d.series[i].values[k]) }));
+  const n = labels.length, ns = ser.length;
+  const H = mobile ? 300 : 380, m = { t: 22, r: 12, l: 8 };
+  const longest = Math.max(...labels.map(l => l.length));
+  const rotate = n > 6 || longest > 10; m.b = rotate ? 92 : 44;
+  const avail = Math.max(chartBody.clientWidth - 70, 240);
+  const minStep = ctype === 'bar' ? Math.max(38, ns * 15 + 22) : 36;
+  const step = Math.max((avail - m.l - m.r) / n, minStep), plotW = step * n, W = m.l + plotW + m.r;
+  const all = ser.flatMap(x => x.v).filter(v => v != null);
+  const ticks = niceTicks(Math.min(0, ...all), Math.max(0, ...all));
+  const y0 = ticks[0], y1 = ticks[ticks.length - 1], ph = H - m.t - m.b;
+  const Y = v => m.t + (1 - (v - y0) / (y1 - y0)) * ph, X = i => m.l + step * (i + .5);
+  const id = ++uid;
+
+  let ya = `<svg class="yaxis" width="54" height="${H}" aria-hidden="true">`;
+  ticks.forEach(t => { ya += `<text x="46" y="${Y(t) + 4}" text-anchor="end">${fmtAxis(t)}</text>`; });
+  ya += '</svg>';
+
+  let s = `<svg class="plot${animate ? ' anim' : ''}" width="${W}" height="${H}" role="img" aria-label="${esc(d.x_title)}">`;
+  if (ctype === 'area') s += '<defs>' + ser.map(x => `<linearGradient id="g${id}_${x.i}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--c${x.i % 8 + 1})" stop-opacity=".45"/><stop offset="1" stop-color="var(--c${x.i % 8 + 1})" stop-opacity=".02"/></linearGradient>`).join('') + '</defs>';
+  ticks.forEach(t => { s += `<line class="${t === 0 ? 'zero' : 'grid'}" x1="0" x2="${W}" y1="${Y(t)}" y2="${Y(t)}"/>`; });
+  s += '<rect class="band" id="band" y="0" height="' + H + '" width="' + step + '" rx="8"/><line class="rule" id="rule" y1="' + m.t + '" y2="' + (H - m.b) + '"/>';
+  const every = Math.ceil((rotate ? 17 : 70) / step);
+  labels.forEach((l, i) => {
+    if (i % every) return; const t = l.length > 18 ? l.slice(0, 17) + '…' : l;
+    s += rotate ? `<text class="xtick" transform="translate(${X(i) + 4},${H - m.b + 16}) rotate(-38)" text-anchor="end">${esc(t)}</text>` : `<text class="xtick" x="${X(i)}" y="${H - m.b + 20}" text-anchor="middle">${esc(t)}</text>`;
+  });
+  const showVals = ctype === 'bar' && n * ns <= 14;
+  ser.forEach(x => {
+    s += `<g class="ser" data-col="${x.s.col}" style="--sc:var(--c${x.i % 8 + 1})">`;
+    if (ctype === 'bar') {
+      const gw = Math.min(step * .72, ns * 44), bw = gw / ns;
+      x.v.forEach((v, i) => {
+        if (v == null) return; const j = ser.indexOf(x), bx = X(i) - gw / 2 + j * bw + (ns > 1 ? 1 : 0), top = Y(Math.max(v, 0)), bot = Y(Math.min(v, 0));
+        s += `<rect class="bar" style="--k:${i}" x="${bx}" y="${top}" width="${Math.max(bw - (ns > 1 ? 2 : 0), 2)}" height="${Math.max(bot - top, 1.5)}" rx="${Math.min(6, bw / 2)}"/>`;
+        if (showVals) s += `<text class="vlabel" x="${bx + (bw - 2) / 2}" y="${top - 6}">${fmtAxis(v)}</text>`;
+      });
+    } else {
+      const pts = x.v.map((v, i) => v == null ? null : [X(i), Y(v)]).filter(Boolean);
+      if (pts.length) {
+        const path = monoPath(pts);
+        if (ctype === 'area') s += `<path class="area" d="${path}L${pts[pts.length - 1][0]},${Y(0)}L${pts[0][0]},${Y(0)}Z" fill="url(#g${id}_${x.i})"/>`;
+        s += `<path class="line" pathLength="1" d="${path}"/>`;
+        if (n <= 60) pts.forEach(p => { s += `<circle class="dot" cx="${p[0]}" cy="${p[1]}" r="3.5"/>`; });
+        x.v.forEach((v, i) => { if (v != null) s += `<circle class="hdot" data-s="${x.i}" data-i="${i}" cx="${X(i)}" cy="${Y(v)}" r="5.5"/>`; });
+      }
+    }
+    s += '</g>';
+  });
+  s += `<rect class="hit" id="hit" x="0" y="0" width="${W}" height="${H}"/></svg>`;
+  chartBody.innerHTML = `${ya}<div class="plot-scroll">${s}</div><div class="tip" id="tip"></div>`;
+
+  const hit = $('#hit'), band = $('#band'), rule = $('#rule'), tip = $('#tip'), scroller = $('.plot-scroll', chartBody);
+  const hdots = $$('.hdot', chartBody);
+  const hide = () => { band.style.opacity = 0; rule.style.opacity = 0; tip.classList.remove('show'); hdots.forEach(c => { c.style.opacity = 0; }); };
+  hit.addEventListener('pointermove', e => {
+    const r = hit.getBoundingClientRect(), i = Math.min(n - 1, Math.max(0, Math.floor((e.clientX - r.left - m.l) / step)));
+    if (ctype === 'bar') { band.setAttribute('x', m.l + step * i); band.style.opacity = 1; rule.style.opacity = 0; }
+    else { rule.setAttribute('x1', X(i)); rule.setAttribute('x2', X(i)); rule.style.opacity = 1; band.style.opacity = 0; }
+    hdots.forEach(c => { c.style.opacity = +c.dataset.i === i ? 1 : 0; });
+    tip.innerHTML = `<div class="tip-title">${esc(labels[i])}</div>` + ser.map(x => `<div class="tip-row"><i style="background:var(--c${x.i % 8 + 1})"></i><span>${esc(x.s.name)}</span><b>${fmtFull(x.v[i])}</b></div>`).join('');
+    const cb = chartBody.getBoundingClientRect(); let left = e.clientX - cb.left + 16;
+    if (left + tip.offsetWidth > cb.width - 6) left = e.clientX - cb.left - tip.offsetWidth - 16;
+    tip.style.left = Math.max(4, left) + 'px'; tip.classList.add('show');
+  });
+  hit.addEventListener('pointerleave', hide);
+  scroller.scrollLeft = 0;
+}
+function drawLegendFor(d){ chartData = d; drawLegend(); }
+
+/* ═══════ export (current view · current theme · current layout) ═══════ */
+dlExcel.addEventListener('click', () => { closePops(); if (lastParams) location.href = '/download?' + lastParams; });
+let d2i = null;
+const loadD2I = () => d2i || (d2i = new Promise((ok, fail) => {
+  const s = document.createElement('script');
+  s.src = 'https://cdnjs.cloudflare.com/ajax/libs/dom-to-image/2.6.0/dom-to-image.min.js';
+  s.onload = ok; s.onerror = () => { d2i = null; fail(new Error('load')); }; document.head.appendChild(s);
+}));
+$('#dlImage').addEventListener('click', async () => {
+  closePops();
+  const area = $('#report-area'), mode = view();
+  try {
+    await loadD2I();
+    body.classList.add('exporting'); area.style.width = '';
+    if (mode === 'chart') { drawChart(false); applyHighlight(); }
+    await sleep(380);
+    let need = area.offsetWidth;
+    if (mode === 'chart') {
+      const ya = $('.yaxis', chartBody), pl = $('.plot', chartBody);
+      if (ya && pl) need = Math.max(need, ya.getBoundingClientRect().width + pl.getBoundingClientRect().width + (area.getBoundingClientRect().width - chartBody.getBoundingClientRect().width) + 24);
+    } else {
+      const t = $('.excel-table', tableWrap);
+      if (t) need = Math.max(need, t.getBoundingClientRect().width + (area.getBoundingClientRect().width - tableWrap.getBoundingClientRect().width) + 2);
+    }
+    area.style.width = Math.ceil(need) + 'px'; await sleep(120);
+    const w = area.offsetWidth, h = area.offsetHeight, sc = (w * h * 4 > 22e6) ? 1 : 2;
+    const bg = getComputedStyle(body).backgroundColor;
+    const url = await domtoimage.toPng(area, { bgcolor: bg, cacheBust: true, width: w * sc, height: h * sc, style: { transform: `scale(${sc})`, transformOrigin: 'top left', width: w + 'px', height: h + 'px' } });
+    const name = ($('#reportTitle').textContent.replace(/[^A-Za-z0-9]+/g, '_').replace(/^_|_$/g, '').slice(0, 70) || 'Report') + `_${mode}.png`;
+    if (/Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)) {
+      const m = document.createElement('div'); m.className = 'preview-modal';
+      m.innerHTML = '<button class="btn-primary" type="button">Close preview</button><p>Press and hold the image to save it to Photos.</p><img alt="Report">';
+      m.querySelector('img').src = url; m.querySelector('button').onclick = () => m.remove(); body.appendChild(m);
+    } else { const a = document.createElement('a'); a.download = name; a.href = url; a.click(); }
+  } catch (err) { console.error(err); toast('Could not export the image. Please try again.'); }
+  finally { area.style.width = ''; body.classList.remove('exporting'); if (mode === 'chart') { drawChart(false); applyHighlight(); } }
+});
+
+/* ═══════ go ═══════ */
+syncOrder('index_cols'); syncOrder('value_cols'); updateBadges(); update();
+})();
+"""
+
+ASSET_VERSION = hashlib.md5((APP_CSS + APP_JS).encode()).hexdigest()[:8]
+
+if __name__ == "__main__":
+    app.run(debug=os.environ.get("FLASK_DEBUG", "1") == "1")
