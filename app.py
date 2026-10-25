@@ -15,11 +15,11 @@ UPLOAD_DIR = "/tmp/dashboard_uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 DATA_FILE_PATH = os.path.join(UPLOAD_DIR, "shared_data.pkl")
 
-# --- iOS LIQUID GLASS & DARK MODE UI ---
+# --- iOS LIQUID GLASS & RESPONSIVE APPLE UI ---
 GLOBAL_HEAD = """
 <style>
     :root {
-        --bg-main: #f5f5f7; --glass-sidebar: rgba(255, 255, 255, 0.85);
+        --bg-main: #f5f5f7; --glass-sidebar: rgba(255, 255, 255, 0.88);
         --glass-border: rgba(0, 0, 0, 0.1); --text-primary: #1d1d1f; --text-secondary: #86868b;
         --shadow-glass: 0 10px 30px rgba(0,0,0,0.05); --blue-apple: #0071e3; --blue-hover: #0077ed;
         --header-bg: #f9f9fb; --header-text: #515154;
@@ -27,46 +27,51 @@ GLOBAL_HEAD = """
         --green: #34c759; --card-bg: #ffffff;
     }
     body.dark-mode {
-        --bg-main: #000000; --glass-sidebar: rgba(20, 20, 22, 0.85);
+        --bg-main: #000000; --glass-sidebar: rgba(20, 20, 22, 0.92);
         --glass-border: rgba(255, 255, 255, 0.15); --text-primary: #f5f5f7; --text-secondary: #a1a1a6;
         --shadow-glass: 0 10px 30px rgba(0,0,0,0.5); --header-bg: #1c1c1e; --header-text: #a1a1a6;
         --total-bg: #10243b; --total-text: #f5f5f7;
         --green: #30d158; --card-bg: #151516;
     }
-    body { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", sans-serif; background: var(--bg-main); color: var(--text-primary); margin: 0; padding: 0; transition: background 0.3s, color 0.3s; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", sans-serif; background: var(--bg-main); color: var(--text-primary); margin: 0; padding: 0; transition: background 0.3s, color 0.3s; -webkit-tap-highlight-color: transparent; }
     
-    .nav { background: var(--glass-sidebar); backdrop-filter: saturate(180%) blur(20px); border-bottom: 1px solid var(--glass-border); padding: 0 24px; height: 60px; display: flex; justify-content: space-between; align-items: center; position: fixed; top: 0; width: 100%; z-index: 1000; box-sizing: border-box; }
-    .nav-brand { font-weight: 700; font-size: 18px; letter-spacing: -0.5px; }
-    .nav-controls { display: flex; gap: 12px; align-items: center; }
+    .nav { background: var(--glass-sidebar); backdrop-filter: saturate(180%) blur(20px); border-bottom: 1px solid var(--glass-border); padding: 0 16px; height: 60px; display: flex; justify-content: space-between; align-items: center; position: fixed; top: 0; width: 100%; z-index: 1000; box-sizing: border-box; }
+    .nav-brand { font-weight: 700; font-size: 17px; letter-spacing: -0.5px; display: flex; align-items: center; gap: 10px; }
+    .nav-controls { display: flex; gap: 8px; align-items: center; }
     
-    .btn-liquid { background: rgba(120, 120, 128, 0.1); border: 1px solid var(--glass-border); color: var(--text-primary); border-radius: 980px; padding: 8px 16px; font-size: 13px; font-weight: 600; cursor: pointer; transition: 0.2s; }
+    .menu-btn { display: none; background: none; border: none; font-size: 22px; cursor: pointer; color: var(--text-primary); padding: 4px; }
+    
+    .btn-liquid { background: rgba(120, 120, 128, 0.1); border: 1px solid var(--glass-border); color: var(--text-primary); border-radius: 980px; padding: 8px 14px; font-size: 12px; font-weight: 600; cursor: pointer; transition: 0.2s; white-space: nowrap; }
     .btn-liquid:hover { background: rgba(120, 120, 128, 0.15); transform: scale(1.02); }
     .btn-primary { background: var(--blue-apple); color: #fff; border: none; }
     .btn-primary:hover { background: var(--blue-hover); }
     
-    .app-layout { display: flex; height: 100vh; padding-top: 60px; box-sizing: border-box; }
-    .sidebar { width: 350px; background: var(--glass-sidebar); backdrop-filter: blur(40px); border-right: 1px solid var(--glass-border); padding: 24px 20px; overflow-y: auto; flex-shrink: 0; }
-    .main-content { flex: 1; padding: 32px 40px; overflow: hidden; display: flex; flex-direction: column; }
+    .app-layout { display: flex; height: 100vh; padding-top: 60px; box-sizing: border-box; position: relative; overflow: hidden; }
     
-    .section-title { font-size: 12px; font-weight: 700; color: var(--text-secondary); text-transform: uppercase; margin: 24px 0 10px; letter-spacing: 0.5px; }
-    .checkbox-group { background: rgba(120,120,128,0.05); border: 1px solid var(--glass-border); border-radius: 12px; padding: 8px; max-height: 220px; overflow-y: auto; }
-    .checkbox-item { display: flex; align-items: center; padding: 8px 10px; font-size: 13px; cursor: pointer; border-radius: 8px; font-weight: 500; }
+    /* Apple-style smooth sidebar transition */
+    .sidebar { width: 340px; background: var(--glass-sidebar); backdrop-filter: blur(40px); border-right: 1px solid var(--glass-border); padding: 20px 16px; overflow-y: auto; flex-shrink: 0; transition: transform 0.4s cubic-bezier(0.25, 1, 0.5, 1); z-index: 900; box-sizing: border-box; }
+    
+    .main-content { flex: 1; padding: 20px; overflow: hidden; display: flex; flex-direction: column; box-sizing: border-box; }
+    
+    .section-title { font-size: 11px; font-weight: 700; color: var(--text-secondary); text-transform: uppercase; margin: 20px 0 8px; letter-spacing: 0.5px; }
+    .checkbox-group { background: rgba(120,120,128,0.05); border: 1px solid var(--glass-border); border-radius: 12px; padding: 6px; max-height: 200px; overflow-y: auto; }
+    .checkbox-item { display: flex; align-items: center; padding: 8px; font-size: 13px; cursor: pointer; border-radius: 8px; font-weight: 500; }
     .checkbox-item:hover { background: rgba(120,120,128,0.1); }
-    .checkbox-item input[type="checkbox"]:not(.ios-switch), .checkbox-item input[type="radio"] { margin-right: 10px; accent-color: var(--blue-apple); width: 16px; height: 16px; }
+    .checkbox-item input[type="checkbox"]:not(.ios-switch), .checkbox-item input[type="radio"] { margin-right: 10px; accent-color: var(--blue-apple); width: 16px; height: 16px; flex-shrink: 0; }
     
     .btn-segmented { display: flex; background: rgba(120,120,128,0.1); border-radius: 12px; padding: 4px; gap: 4px; }
-    .btn-segmented label { flex: 1; text-align: center; font-size: 13px; font-weight: 600; padding: 6px 16px; border-radius: 8px; cursor: pointer; color: var(--text-secondary); transition: 0.2s; z-index: 2; }
+    .btn-segmented label { flex: 1; text-align: center; font-size: 12px; font-weight: 600; padding: 6px 12px; border-radius: 8px; cursor: pointer; color: var(--text-secondary); transition: 0.2s; z-index: 2; }
     .btn-segmented input { display: none; }
     .btn-segmented input:checked + label { color: var(--text-primary); }
     
     .table-container { background: var(--card-bg); border-radius: 16px; border: 1px solid var(--glass-border); flex: 1; overflow: hidden; display: flex; flex-direction: column; box-shadow: var(--shadow-glass); }
     
-    .summary-bar { background: var(--card-bg); padding: 16px 20px; border-bottom: 1px solid var(--glass-border); font-size: 13px; font-weight: 500; display: flex; justify-content: space-between; align-items: center; color: var(--text-secondary); }
+    .summary-bar { background: var(--card-bg); padding: 14px 16px; border-bottom: 1px solid var(--glass-border); font-size: 12px; font-weight: 500; display: flex; justify-content: space-between; align-items: center; color: var(--text-secondary); flex-wrap: wrap; gap: 8px; }
     .summary-bar b { color: var(--text-primary); font-weight: 600; }
     
-    .table-scroll { flex: 1; overflow: auto; }
+    .table-scroll { flex: 1; overflow: auto; -webkit-overflow-scrolling: touch; }
     .excel-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-    .excel-table th, .excel-table td { padding: 12px 20px; text-align: left; border-bottom: 1px solid var(--glass-border); white-space: nowrap; }
+    .excel-table th, .excel-table td { padding: 12px 16px; text-align: left; border-bottom: 1px solid var(--glass-border); white-space: nowrap; }
     .excel-table th { background: var(--header-bg); color: var(--header-text); font-size: 11px; text-transform: uppercase; position: sticky; top: 0; z-index: 10; font-weight: 600; letter-spacing: 0.05em; }
     .excel-table th:first-child, .excel-table td:first-child { position: sticky; left: 0; z-index: 20; background: var(--card-bg); font-weight: 600; box-shadow: 1px 0 0 var(--glass-border); }
     .excel-table th:first-child { z-index: 30; background: var(--header-bg); }
@@ -74,22 +79,33 @@ GLOBAL_HEAD = """
     .excel-table tbody tr:last-child td { font-weight: 700; background: var(--total-bg); color: var(--total-text); border-top: 1px solid var(--glass-border); border-bottom: none; position: sticky; bottom: 0; z-index: 15; }
     .excel-table tbody tr:last-child td:first-child { z-index: 25; }
     
-    .kpis { display: flex; gap: 60px; margin-bottom: 32px; }
-    .kpi { display: flex; flex-direction: column; }
-    .kpi-label { font-size: 13px; font-weight: 600; color: var(--text-secondary); margin-bottom: 6px; }
-    .kpi-val { font-size: 34px; font-weight: 700; color: var(--text-primary); letter-spacing: -0.03em; }
+    .kpis { display: flex; gap: 24px; margin-bottom: 20px; overflow-x: auto; padding-bottom: 4px; }
+    .kpi { display: flex; flex-direction: column; background: var(--card-bg); border: 1px solid var(--glass-border); padding: 14px 18px; border-radius: 14px; min-width: 140px; box-shadow: var(--shadow-glass); flex-shrink: 0; }
+    .kpi-label { font-size: 11px; font-weight: 600; color: var(--text-secondary); margin-bottom: 4px; text-transform: uppercase; }
+    .kpi-val { font-size: 26px; font-weight: 700; color: var(--text-primary); letter-spacing: -0.03em; }
 
     /* iOS Toggle Switch */
-    .switch-container { display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; cursor: pointer; }
-    .switch { position: relative; width: 44px; height: 24px; background: rgba(120,120,128,0.3); border-radius: 12px; transition: 0.3s; flex-shrink: 0; }
-    .switch::after { content: ''; position: absolute; top: 2px; left: 2px; width: 20px; height: 20px; background: #fff; border-radius: 50%; box-shadow: 0 2px 4px rgba(0,0,0,0.2); transition: 0.3s; }
+    .switch-container { display: flex; align-items: center; justify-content: space-between; padding: 8px; cursor: pointer; }
+    .switch { position: relative; width: 40px; height: 22px; background: rgba(120,120,128,0.3); border-radius: 12px; transition: 0.3s; flex-shrink: 0; }
+    .switch::after { content: ''; position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; background: #fff; border-radius: 50%; box-shadow: 0 2px 4px rgba(0,0,0,0.2); transition: 0.3s; }
     input:checked + .switch { background: var(--green); }
-    input:checked + .switch::after { transform: translateX(20px); }
+    input:checked + .switch::after { transform: translateX(18px); }
     input.ios-switch { display: none; }
     
-    .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
-    .chip { padding: 6px 12px; border-radius: 8px; background: rgba(120,120,128,0.1); font-size: 12px; font-weight: 600; cursor: pointer; transition: 0.2s; border: none; color: var(--text-primary); }
+    .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+    .chip { padding: 5px 10px; border-radius: 8px; background: rgba(120,120,128,0.1); font-size: 11px; font-weight: 600; cursor: pointer; transition: 0.2s; border: none; color: var(--text-primary); }
     .chip.active { background: var(--blue-apple); color: #fff; }
+
+    /* Mobile Responsive Media Query */
+    @media (max-width: 900px) {
+        .menu-btn { display: block; }
+        .sidebar { position: fixed; top: 60px; bottom: 0; left: 0; transform: translateX(-100%); width: 280px; box-shadow: 20px 0 40px rgba(0,0,0,0.15); }
+        .sidebar.open { transform: translateX(0); }
+        .main-content { padding: 16px; }
+        .kpis { gap: 12px; }
+        .kpi { min-width: 120px; padding: 10px 14px; }
+        .kpi-val { font-size: 20px; }
+    }
 </style>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/dom-to-image/2.6.0/dom-to-image.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
@@ -102,8 +118,8 @@ UPLOAD_HTML = """
 <body>
     <div class="nav"><div class="nav-brand">Analytics Pro</div></div>
     <div style="max-width: 480px; margin: 120px auto; padding: 20px; text-align: center;">
-        <h1 style="font-size: 32px; margin-bottom: 8px;">Analytics Engine.</h1>
-        <p style="color: var(--text-secondary); margin-bottom: 32px;">Upload data to launch the Business Intelligence workspace.</p>
+        <h1 style="font-size: 28px; margin-bottom: 8px;">Analytics Engine.</h1>
+        <p style="color: var(--text-secondary); margin-bottom: 32px; font-size: 14px;">Upload data to launch the Business Intelligence workspace.</p>
         
         {% if error %}
         <div style="background: rgba(255, 59, 48, 0.1); color: #ff3b30; padding: 12px; border-radius: 12px; margin-bottom: 16px; font-weight: 600; font-size: 13px;">
@@ -111,9 +127,9 @@ UPLOAD_HTML = """
         </div>
         {% endif %}
         
-        <form action="/dashboard" method="post" enctype="multipart/form-data" style="background: var(--card-bg); padding: 32px; border-radius: 24px; border: 1px solid var(--glass-border); box-shadow: var(--shadow-glass);">
-            <input type="file" name="file" accept=".xlsx, .xls, .csv" required style="width: 100%; margin-bottom: 24px; padding: 16px; border: 2px dashed var(--glass-border); border-radius: 12px; cursor: pointer; color: var(--text-primary);">
-            <button type="submit" class="btn-liquid btn-primary" style="width: 100%; padding: 14px; font-size: 15px;">Launch Workspace →</button>
+        <form action="/dashboard" method="post" enctype="multipart/form-data" style="background: var(--card-bg); padding: 28px; border-radius: 24px; border: 1px solid var(--glass-border); box-shadow: var(--shadow-glass);">
+            <input type="file" name="file" accept=".xlsx, .xls, .csv" required style="width: 100%; margin-bottom: 24px; padding: 14px; border: 2px dashed var(--glass-border); border-radius: 12px; cursor: pointer; color: var(--text-primary); font-size: 12px;">
+            <button type="submit" class="btn-liquid btn-primary" style="width: 100%; padding: 14px; font-size: 14px;">Launch Workspace →</button>
         </form>
     </div>
 </body>
@@ -126,16 +142,19 @@ WORKSPACE_HTML = """
 <head><title>Executive Dashboard</title><meta name="viewport" content="width=device-width, initial-scale=1.0">""" + GLOBAL_HEAD + """</head>
 <body>
     <div class="nav">
-        <div class="nav-brand">Analytics Pro</div>
+        <div class="nav-brand">
+            <button class="menu-btn" onclick="toggleSidebar()">☰</button>
+            <span>Analytics Pro</span>
+        </div>
         <div class="nav-controls">
             <button class="btn-liquid" onclick="toggleDarkMode()" id="dm-btn">🌙 Dark</button>
             <button class="btn-liquid btn-primary" onclick="exportImage()">📸 Save Image</button>
-            <button class="btn-liquid" id="dlExcel">📊 Download Excel</button>
+            <button class="btn-liquid" id="dlExcel">📊 Excel</button>
         </div>
     </div>
 
     <div class="app-layout">
-        <div class="sidebar">
+        <div class="sidebar" id="sidebar">
             <form id="config-form">
                 
                 <div class="section-title" style="margin-top: 0;">Configure Axis Fields</div>
@@ -198,21 +217,6 @@ WORKSPACE_HTML = """
                         <div class="switch"></div>
                     </label>
                 </div>
-                
-                <div class="section-title">Filter by Weeks</div>
-                <div class="checkbox-group" style="margin-bottom: 12px;">
-                    <label class="switch-container">
-                        <span style="font-size: 13px; font-weight: 500;">Select All Weeks</span>
-                        <input type="checkbox" class="ios-switch" onchange="toggleAll('week_num', this.checked)">
-                        <div class="switch"></div>
-                    </label>
-                    <div style="height: 1px; background: var(--glass-border); margin: 4px 0;"></div>
-                    <label class="checkbox-item"><input type="checkbox" name="week_num" value="1" onchange="updateDashboard()"> <span>Week 1 (Days 1–7)</span></label>
-                    <label class="checkbox-item"><input type="checkbox" name="week_num" value="2" onchange="updateDashboard()"> <span>Week 2 (Days 8–14)</span></label>
-                    <label class="checkbox-item"><input type="checkbox" name="week_num" value="3" onchange="updateDashboard()"> <span>Week 3 (Days 15–21)</span></label>
-                    <label class="checkbox-item"><input type="checkbox" name="week_num" value="4" onchange="updateDashboard()"> <span>Week 4 (Days 22–28)</span></label>
-                    <label class="checkbox-item"><input type="checkbox" name="week_num" value="5" onchange="updateDashboard()"> <span>Week 5 (Days 29+)</span></label>
-                </div>
 
                 <div id="pivot-controls">
                     <div class="section-title">Rows (Y-Axis)</div>
@@ -271,15 +275,15 @@ WORKSPACE_HTML = """
                     </div>
                 </div>
                 
-                <div style="text-align: center; margin-top: 24px;">
+                <div style="text-align: center; margin-top: 24px; padding-bottom: 20px;">
                     <a href="/upload" style="color: #ff3b30; font-size: 12px; text-decoration: none; font-weight: 600; padding: 8px 16px; border-radius: 980px; background: rgba(255, 59, 48, 0.1);">← Upload New File</a>
                 </div>
             </form>
         </div>
         
-        <div class="main-content">
+        <div class="main-content" onclick="closeSidebarOnMobile(event)">
             <div style="display: flex; justify-content: flex-end; margin-bottom: 12px;">
-                <div class="btn-segmented" style="position: relative; width: 200px;">
+                <div class="btn-segmented" style="position: relative; width: 180px;">
                     <div class="seg-thumb" style="position: absolute; top: 4px; bottom: 4px; left: 4px; width: calc(50% - 4px); background: var(--card-bg); border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); transition: 0.3s; z-index: 1;"></div>
                     <input type="radio" id="view_dash" name="view_mode_toggle" value="dashboard" checked onchange="updateDashboard()">
                     <label for="view_dash">Pivot</label>
@@ -293,14 +297,27 @@ WORKSPACE_HTML = """
             <div class="table-container" id="capture-area">
                 <div class="summary-bar" id="summaryBar">Select fields to build your view.</div>
                 <div id="table-wrapper" class="table-scroll">
-                    <div style="padding: 60px; text-align: center; color: var(--text-secondary); font-size: 15px;">Configure Y-Axis and metrics to preview data.</div>
+                    <div style="padding: 60px; text-align: center; color: var(--text-secondary); font-size: 14px;">Configure Y-Axis and metrics to preview data.</div>
                 </div>
-                <div id="chart-wrapper" style="display:none; padding: 20px; flex: 1; min-height: 450px;"><canvas id="dataChart"></canvas></div>
+                <div id="chart-wrapper" style="display:none; padding: 16px; flex: 1; min-height: 400px;"><canvas id="dataChart"></canvas></div>
             </div>
         </div>
     </div>
 
     <script>
+        function toggleSidebar() {
+            document.getElementById('sidebar').classList.toggle('open');
+        }
+
+        function closeSidebarOnMobile(e) {
+            if (window.innerWidth <= 900) {
+                const sidebar = document.getElementById('sidebar');
+                if (sidebar.classList.contains('open') && !sidebar.contains(e.target)) {
+                    sidebar.classList.remove('open');
+                }
+            }
+        }
+
         function updateAxisVisibility() {
             const selectedFields = Array.from(document.querySelectorAll('input[name="master_fields"]:checked')).map(cb => cb.value);
             
@@ -454,7 +471,7 @@ WORKSPACE_HTML = """
                 scrollEl.style.overflow = 'visible';
                 scrollEl.style.height = 'auto';
                 
-                domtoimage.toJpeg(area, { quality: 1.0, bgcolor: bgColor, height: area.scrollHeight })
+                domtoimage.toJpeg(area, { quality: 0.95, bgcolor: bgColor, width: area.scrollWidth, height: area.scrollHeight })
                     .then(url => {
                         const a = document.createElement('a'); a.download = 'Executive_Report.jpeg'; a.href = url; a.click();
                         scrollEl.style.overflow = origOverflow;
@@ -610,7 +627,6 @@ def calculate():
 
         start_date = request.form.get('start_date')
         end_date = request.form.get('end_date')
-        weeks = request.form.getlist("week_num")
         compare_mode = request.form.get('compare_mode')
         
         if date_col_name:
@@ -636,21 +652,6 @@ def calculate():
                 if end_date: 
                     df = df[df[date_col_name] <= pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)]
                     filter_texts.append(f"{pd.to_datetime(end_date).strftime('%d-%b-%y')}")
-                    
-            if weeks and date_col_name and 'Period' not in df.columns:
-                week_masks = []
-                for w in weeks:
-                    w = int(w)
-                    if w == 1: week_masks.append(df[date_col_name].dt.day <= 7)
-                    elif w == 2: week_masks.append((df[date_col_name].dt.day > 7) & (df[date_col_name].dt.day <= 14))
-                    elif w == 3: week_masks.append((df[date_col_name].dt.day > 14) & (df[date_col_name].dt.day <= 21))
-                    elif w == 4: week_masks.append((df[date_col_name].dt.day > 21) & (df[date_col_name].dt.day <= 28))
-                    elif w == 5: week_masks.append(df[date_col_name].dt.day > 28)
-                if week_masks:
-                    combined = week_masks[0]
-                    for wm in week_masks[1:]: combined = combined | wm
-                    df = df[combined]
-                filter_texts.append(f"Weeks: {', '.join([f'W{w}' for w in weeks])}")
 
         idx = request.form.getlist('index_cols')
         if compare_mode == 'lmtd' and 'Period' not in idx: idx.insert(0, 'Period')
