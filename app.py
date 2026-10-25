@@ -19,7 +19,7 @@ DATA_FILE_PATH = os.path.join(UPLOAD_DIR, "shared_data.pkl")
 GLOBAL_HEAD = """
 <style>
     :root {
-        --bg-main: #f5f5f7; --glass-sidebar: rgba(255, 255, 255, 0.88);
+        --bg-main: #f5f5f7; --glass-sidebar: rgba(255, 255, 255, 0.95);
         --glass-border: rgba(0, 0, 0, 0.1); --text-primary: #1d1d1f; --text-secondary: #86868b;
         --shadow-glass: 0 10px 30px rgba(0,0,0,0.05); --blue-apple: #0071e3; --blue-hover: #0077ed;
         --header-bg: #f9f9fb; --header-text: #515154;
@@ -27,7 +27,7 @@ GLOBAL_HEAD = """
         --green: #34c759; --card-bg: #ffffff;
     }
     body.dark-mode {
-        --bg-main: #000000; --glass-sidebar: rgba(20, 20, 22, 0.92);
+        --bg-main: #000000; --glass-sidebar: rgba(20, 20, 22, 0.95);
         --glass-border: rgba(255, 255, 255, 0.15); --text-primary: #f5f5f7; --text-secondary: #a1a1a6;
         --shadow-glass: 0 10px 30px rgba(0,0,0,0.5); --header-bg: #1c1c1e; --header-text: #a1a1a6;
         --total-bg: #10243b; --total-text: #f5f5f7;
@@ -44,30 +44,29 @@ GLOBAL_HEAD = """
     .btn-icon { background: rgba(120, 120, 128, 0.1); border: 1px solid var(--glass-border); color: var(--text-primary); border-radius: 50%; width: 36px; height: 36px; display: flex; align-items: center; justify-content: center; font-size: 15px; cursor: pointer; transition: 0.2s; flex-shrink: 0; }
     .btn-icon:hover { background: rgba(120, 120, 128, 0.2); transform: scale(1.05); }
     
-    .btn-liquid { background: rgba(120, 120, 128, 0.1); border: 1px solid var(--glass-border); color: var(--text-primary); border-radius: 980px; padding: 8px 14px; font-size: 12px; font-weight: 600; cursor: pointer; transition: 0.2s; white-space: nowrap; }
-    .btn-liquid:hover { background: rgba(120, 120, 128, 0.15); transform: scale(1.02); }
+    .btn-liquid { background: rgba(120, 120, 128, 0.1); border: 1px solid var(--glass-border); color: var(--text-primary); border-radius: 12px; padding: 8px 12px; font-size: 12px; font-weight: 600; cursor: pointer; transition: 0.2s; white-space: nowrap; box-sizing: border-box; }
+    .btn-liquid:hover { background: rgba(120, 120, 128, 0.15); }
     .btn-primary { background: var(--blue-apple); color: #fff; border: none; }
-    .btn-primary:hover { background: var(--blue-hover); }
     
     .app-layout { display: flex; height: 100vh; padding-top: 60px; box-sizing: border-box; position: relative; overflow: hidden; }
     
-    .sidebar { width: 340px; background: var(--glass-sidebar); backdrop-filter: blur(40px); border-right: 1px solid var(--glass-border); padding: 20px 16px; overflow-y: auto; flex-shrink: 0; transition: transform 0.4s cubic-bezier(0.25, 1, 0.5, 1); z-index: 900; box-sizing: border-box; }
-    .main-content { flex: 1; padding: 20px; overflow: hidden; display: flex; flex-direction: column; box-sizing: border-box; }
+    .sidebar { width: 320px; background: var(--glass-sidebar); backdrop-filter: blur(40px); border-right: 1px solid var(--glass-border); padding: 16px; overflow-y: auto; flex-shrink: 0; transition: transform 0.4s cubic-bezier(0.25, 1, 0.5, 1); z-index: 900; box-sizing: border-box; }
+    .main-content { flex: 1; padding: 16px; overflow: hidden; display: flex; flex-direction: column; box-sizing: border-box; }
     
-    .section-title { font-size: 11px; font-weight: 700; color: var(--text-secondary); text-transform: uppercase; margin: 20px 0 8px; letter-spacing: 0.5px; }
-    .checkbox-group { background: rgba(120,120,128,0.05); border: 1px solid var(--glass-border); border-radius: 12px; padding: 6px; max-height: 200px; overflow-y: auto; }
+    .section-title { font-size: 11px; font-weight: 700; color: var(--text-secondary); text-transform: uppercase; margin: 18px 0 6px; letter-spacing: 0.5px; }
+    .checkbox-group { background: rgba(120,120,128,0.05); border: 1px solid var(--glass-border); border-radius: 12px; padding: 6px; max-height: 180px; overflow-y: auto; }
     .checkbox-item { display: flex; align-items: center; padding: 8px; font-size: 13px; cursor: pointer; border-radius: 8px; font-weight: 500; }
     .checkbox-item:hover { background: rgba(120,120,128,0.1); }
     .checkbox-item input[type="checkbox"]:not(.ios-switch), .checkbox-item input[type="radio"] { margin-right: 10px; accent-color: var(--blue-apple); width: 16px; height: 16px; flex-shrink: 0; }
     
-    .btn-segmented { display: flex; background: rgba(120,120,128,0.1); border-radius: 12px; padding: 4px; gap: 4px; }
-    .btn-segmented label { flex: 1; text-align: center; font-size: 12px; font-weight: 600; padding: 6px 12px; border-radius: 8px; cursor: pointer; color: var(--text-secondary); transition: 0.2s; z-index: 2; }
+    .btn-segmented { display: flex; background: rgba(120,120,128,0.1); border-radius: 12px; padding: 4px; gap: 4px; width: 100%; max-width: 180px; margin-left: auto; }
+    .btn-segmented label { flex: 1; text-align: center; font-size: 12px; font-weight: 600; padding: 6px 10px; border-radius: 8px; cursor: pointer; color: var(--text-secondary); transition: 0.2s; z-index: 2; }
     .btn-segmented input { display: none; }
     .btn-segmented input:checked + label { color: var(--text-primary); }
     
     .table-container { background: var(--card-bg); border-radius: 16px; border: 1px solid var(--glass-border); flex: 1; overflow: hidden; display: flex; flex-direction: column; box-shadow: var(--shadow-glass); }
     
-    .summary-bar { background: var(--card-bg); padding: 14px 16px; border-bottom: 1px solid var(--glass-border); font-size: 12px; font-weight: 500; display: flex; justify-content: space-between; align-items: center; color: var(--text-secondary); flex-wrap: wrap; gap: 8px; }
+    .summary-bar { background: var(--card-bg); padding: 12px 16px; border-bottom: 1px solid var(--glass-border); font-size: 12px; font-weight: 500; display: flex; justify-content: space-between; align-items: center; color: var(--text-secondary); flex-wrap: wrap; gap: 8px; }
     .summary-bar b { color: var(--text-primary); font-weight: 600; }
     
     .table-scroll { flex: 1; overflow: auto; -webkit-overflow-scrolling: touch; }
@@ -80,35 +79,32 @@ GLOBAL_HEAD = """
     .excel-table tbody tr:last-child td { font-weight: 700; background: var(--total-bg); color: var(--total-text); border-top: 1px solid var(--glass-border); border-bottom: none; position: sticky; bottom: 0; z-index: 15; }
     .excel-table tbody tr:last-child td:first-child { z-index: 25; }
     
-    .kpis { display: flex; gap: 24px; margin-bottom: 20px; overflow-x: auto; padding-bottom: 4px; }
-    .kpi { display: flex; flex-direction: column; background: var(--card-bg); border: 1px solid var(--glass-border); padding: 14px 18px; border-radius: 14px; min-width: 140px; box-shadow: var(--shadow-glass); flex-shrink: 0; }
-    .kpi-label { font-size: 11px; font-weight: 600; color: var(--text-secondary); margin-bottom: 4px; text-transform: uppercase; }
-    .kpi-val { font-size: 26px; font-weight: 700; color: var(--text-primary); letter-spacing: -0.03em; }
+    /* Responsive KPI Grid */
+    .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 10px; margin-bottom: 16px; }
+    .kpi { display: flex; flex-direction: column; background: var(--card-bg); border: 1px solid var(--glass-border); padding: 10px 14px; border-radius: 12px; box-shadow: var(--shadow-glass); box-sizing: border-box; overflow: hidden; }
+    .kpi-label { font-size: 10px; font-weight: 600; color: var(--text-secondary); margin-bottom: 2px; text-transform: uppercase; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .kpi-val { font-size: 20px; font-weight: 700; color: var(--text-primary); letter-spacing: -0.03em; word-break: break-all; }
 
     /* iOS Toggle Switch */
-    .switch-container { display: flex; align-items: center; justify-content: space-between; padding: 8px; cursor: pointer; }
+    .switch-container { display: flex; align-items: center; justify-content: space-between; padding: 6px 8px; cursor: pointer; }
     .switch { position: relative; width: 40px; height: 22px; background: rgba(120,120,128,0.3); border-radius: 12px; transition: 0.3s; flex-shrink: 0; }
     .switch::after { content: ''; position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; background: #fff; border-radius: 50%; box-shadow: 0 2px 4px rgba(0,0,0,0.2); transition: 0.3s; }
     input:checked + .switch { background: var(--green); }
     input:checked + .switch::after { transform: translateX(18px); }
     input.ios-switch { display: none; }
     
-    .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+    .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
     .chip { padding: 5px 10px; border-radius: 8px; background: rgba(120,120,128,0.1); font-size: 11px; font-weight: 600; cursor: pointer; transition: 0.2s; border: none; color: var(--text-primary); }
     .chip.active { background: var(--blue-apple); color: #fff; }
 
     /* Mobile Responsive Media Query */
     @media (max-width: 900px) {
         .menu-btn { display: block; }
-        .sidebar { position: fixed; top: 60px; bottom: 0; left: 0; transform: translateX(-100%); width: 280px; box-shadow: 20px 0 40px rgba(0,0,0,0.15); }
+        .sidebar { position: fixed; top: 60px; bottom: 0; left: 0; transform: translateX(-100%); width: 270px; box-shadow: 20px 0 40px rgba(0,0,0,0.15); }
         .sidebar.open { transform: translateX(0); }
-        .main-content { padding: 16px; }
-        .kpis { gap: 12px; }
-        .kpi { min-width: 120px; padding: 10px 14px; }
-        .kpi-val { font-size: 20px; }
+        .main-content { padding: 12px; }
     }
 </style>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 """
 
@@ -176,7 +172,7 @@ WORKSPACE_HTML = """
 
                 {% if status_list %}
                 <div class="section-title">Final Status Filter</div>
-                <div class="checkbox-group" style="max-height: 160px;">
+                <div class="checkbox-group" style="max-height: 150px;">
                     <label class="switch-container">
                         <span style="font-size: 13px; font-weight: 500;">Select All Statuses</span>
                         <input type="checkbox" class="ios-switch" onchange="toggleAll('status_filters', this.checked)" checked>
@@ -200,15 +196,15 @@ WORKSPACE_HTML = """
                     <button type="button" class="chip" onclick="preset('lytd', this)">LYTD</button>
                 </div>
                 
-                <!-- Non-overlapping Date Grid -->
-                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px;">
+                <!-- Non-overlapping Stacked Date Grid for Mobile -->
+                <div style="display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px;">
                     <div>
                         <label style="font-size: 10px; color: var(--text-secondary); font-weight: 700; display: block; margin-bottom: 2px;">FROM</label>
-                        <input type="date" name="start_date" id="start_date" class="btn-liquid" style="width: 100%; box-sizing: border-box;" onchange="updateDashboard()">
+                        <input type="date" name="start_date" id="start_date" class="btn-liquid" style="width: 100%;" onchange="updateDashboard()">
                     </div>
                     <div>
                         <label style="font-size: 10px; color: var(--text-secondary); font-weight: 700; display: block; margin-bottom: 2px;">TO</label>
-                        <input type="date" name="end_date" id="end_date" class="btn-liquid" style="width: 100%; box-sizing: border-box;" onchange="updateDashboard()">
+                        <input type="date" name="end_date" id="end_date" class="btn-liquid" style="width: 100%;" onchange="updateDashboard()">
                     </div>
                 </div>
 
@@ -285,7 +281,7 @@ WORKSPACE_HTML = """
         
         <div class="main-content" onclick="closeSidebarOnMobile(event)">
             <div style="display: flex; justify-content: flex-end; margin-bottom: 12px;">
-                <div class="btn-segmented" style="position: relative; width: 180px;">
+                <div class="btn-segmented">
                     <div class="seg-thumb" style="position: absolute; top: 4px; bottom: 4px; left: 4px; width: calc(50% - 4px); background: var(--card-bg); border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); transition: 0.3s; z-index: 1;"></div>
                     <input type="radio" id="view_dash" name="view_mode_toggle" value="dashboard" checked onchange="updateDashboard()">
                     <label for="view_dash">Pivot</label>
@@ -464,17 +460,50 @@ WORKSPACE_HTML = """
                 const a = document.createElement('a'); a.download = 'Chart_Export.png';
                 a.href = chartInstance.toBase64Image(); a.click();
             } else {
-                const area = document.getElementById('capture-area');
-                const bgColor = document.body.classList.contains('dark-mode') ? '#151516' : '#ffffff';
+                // Native canvas rendering approach for bulletproof mobile downloads
+                const table = document.querySelector('.excel-table');
+                if(!table) { alert("No table data to export"); return; }
                 
-                html2canvas(area, { backgroundColor: bgColor, scale: 2, logging: false, useCORS: true })
-                    .then(canvas => {
-                        const link = document.createElement('a');
-                        link.download = 'Executive_Report.png';
-                        link.href = canvas.toDataURL('image/png');
-                        link.click();
-                    })
-                    .catch(err => { console.error("Image Export Failed:", err); alert("Image export failed. Try taking a screenshot."); });
+                const rows = table.querySelectorAll('tr');
+                let canvas = document.createElement('canvas');
+                let ctx = canvas.getContext('2d');
+                
+                let rowHeight = 40;
+                let colWidth = 160;
+                let numRows = rows.length;
+                let numCols = table.querySelectorAll('th').length || 4;
+                
+                canvas.width = numCols * colWidth;
+                canvas.height = numRows * rowHeight + 60;
+                
+                const isDark = document.body.classList.contains('dark-mode');
+                ctx.fillStyle = isDark ? '#151516' : '#ffffff';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                
+                ctx.fillStyle = isDark ? '#f5f5f7' : '#1d1d1f';
+                ctx.font = 'bold 16px -apple-system, sans-serif';
+                ctx.fillText("Executive Sales Report", 20, 35);
+                
+                let y = 60;
+                rows.forEach((row, rIndex) => {
+                    let x = 20;
+                    let cells = row.querySelectorAll('th, td');
+                    cells.forEach((cell, cIndex) => {
+                        ctx.fillStyle = rIndex === 0 ? (isDark ? '#1c1c1e' : '#f9f9fb') : (isDark ? '#151516' : '#ffffff');
+                        ctx.fillRect(x, y, colWidth - 5, rowHeight - 5);
+                        
+                        ctx.fillStyle = isDark ? '#f5f5f7' : '#1d1d1f';
+                        ctx.font = rIndex === 0 ? 'bold 12px -apple-system' : '12px -apple-system';
+                        ctx.fillText(cell.innerText.trim().substring(0, 20), x + 10, y + 25);
+                        x += colWidth;
+                    });
+                    y += rowHeight;
+                });
+                
+                const link = document.createElement('a');
+                link.download = 'Executive_Report.png';
+                link.href = canvas.toDataURL('image/png');
+                link.click();
             }
         }
         
