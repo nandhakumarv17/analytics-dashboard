@@ -19,7 +19,7 @@ DATA_FILE_PATH = os.path.join(UPLOAD_DIR, "shared_data.pkl")
 GLOBAL_HEAD = """
 <style>
     :root {
-        --bg-main: #f5f5f7; --glass-sidebar: rgba(255, 255, 255, 0.95);
+        --bg-main: #f5f5f7; --glass-sidebar: rgba(255, 255, 255, 0.98);
         --glass-border: rgba(0, 0, 0, 0.1); --text-primary: #1d1d1f; --text-secondary: #86868b;
         --shadow-glass: 0 10px 30px rgba(0,0,0,0.05); --blue-apple: #0071e3; --blue-hover: #0077ed;
         --header-bg: #f9f9fb; --header-text: #515154;
@@ -27,7 +27,7 @@ GLOBAL_HEAD = """
         --green: #34c759; --card-bg: #ffffff;
     }
     body.dark-mode {
-        --bg-main: #000000; --glass-sidebar: rgba(20, 20, 22, 0.95);
+        --bg-main: #000000; --glass-sidebar: rgba(20, 20, 22, 0.98);
         --glass-border: rgba(255, 255, 255, 0.15); --text-primary: #f5f5f7; --text-secondary: #a1a1a6;
         --shadow-glass: 0 10px 30px rgba(0,0,0,0.5); --header-bg: #1c1c1e; --header-text: #a1a1a6;
         --total-bg: #10243b; --total-text: #f5f5f7;
@@ -35,7 +35,7 @@ GLOBAL_HEAD = """
     }
     body { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", sans-serif; background: var(--bg-main); color: var(--text-primary); margin: 0; padding: 0; transition: background 0.3s, color 0.3s; -webkit-tap-highlight-color: transparent; }
     
-    .nav { background: var(--glass-sidebar); backdrop-filter: saturate(180%) blur(20px); border-bottom: 1px solid var(--glass-border); padding: 0 16px; height: 60px; display: flex; justify-content: space-between; align-items: center; position: fixed; top: 0; width: 100%; z-index: 1000; box-sizing: border-box; }
+    .nav { background: var(--glass-sidebar); backdrop-filter: saturate(180%) blur(20px); border-bottom: 1px solid var(--glass-border); padding: 0 16px; height: 60px; display: flex; justify-content: space-between; align-items: center; position: fixed; top: 0; width: 100%; z-index: 2500; box-sizing: border-box; }
     .nav-brand { font-weight: 700; font-size: 17px; letter-spacing: -0.5px; display: flex; align-items: center; gap: 10px; }
     .nav-controls { display: flex; gap: 6px; align-items: center; }
     
@@ -50,7 +50,7 @@ GLOBAL_HEAD = """
     
     .app-layout { display: flex; height: 100vh; padding-top: 60px; box-sizing: border-box; position: relative; overflow: hidden; }
     
-    .sidebar { width: 320px; background: var(--glass-sidebar); backdrop-filter: blur(40px); border-right: 1px solid var(--glass-border); padding: 16px; overflow-y: auto; flex-shrink: 0; transition: transform 0.4s cubic-bezier(0.25, 1, 0.5, 1); z-index: 900; box-sizing: border-box; }
+    .sidebar { width: 320px; background: var(--glass-sidebar); backdrop-filter: blur(40px); border-right: 1px solid var(--glass-border); padding: 16px; overflow-y: auto; flex-shrink: 0; transition: transform 0.4s cubic-bezier(0.25, 1, 0.5, 1); z-index: 2000; box-sizing: border-box; }
     .main-content { flex: 1; padding: 16px; overflow: hidden; display: flex; flex-direction: column; box-sizing: border-box; }
     
     .section-title { font-size: 11px; font-weight: 700; color: var(--text-secondary); text-transform: uppercase; margin: 18px 0 6px; letter-spacing: 0.5px; }
@@ -79,7 +79,6 @@ GLOBAL_HEAD = """
     .excel-table tbody tr:last-child td { font-weight: 700; background: var(--total-bg); color: var(--total-text); border-top: 1px solid var(--glass-border); border-bottom: none; position: sticky; bottom: 0; z-index: 15; }
     .excel-table tbody tr:last-child td:first-child { z-index: 25; }
     
-    /* Responsive KPI Grid */
     .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 10px; margin-bottom: 16px; }
     .kpi { display: flex; flex-direction: column; background: var(--card-bg); border: 1px solid var(--glass-border); padding: 10px 14px; border-radius: 12px; box-shadow: var(--shadow-glass); box-sizing: border-box; overflow: hidden; }
     .kpi-label { font-size: 10px; font-weight: 600; color: var(--text-secondary); margin-bottom: 2px; text-transform: uppercase; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -100,7 +99,7 @@ GLOBAL_HEAD = """
     /* Mobile Responsive Media Query */
     @media (max-width: 900px) {
         .menu-btn { display: block; }
-        .sidebar { position: fixed; top: 60px; bottom: 0; left: 0; transform: translateX(-100%); width: 270px; box-shadow: 20px 0 40px rgba(0,0,0,0.15); }
+        .sidebar { position: fixed; top: 60px; bottom: 0; left: 0; transform: translateX(-100%); width: 280px; box-shadow: 20px 0 40px rgba(0,0,0,0.25); background: var(--glass-sidebar); }
         .sidebar.open { transform: translateX(0); }
         .main-content { padding: 12px; }
     }
@@ -144,6 +143,7 @@ WORKSPACE_HTML = """
             <span>Analytics Pro</span>
         </div>
         <div class="nav-controls">
+            <button class="btn-icon" onclick="location.reload()" title="Reload App">🔄</button>
             <button class="btn-icon" onclick="toggleDarkMode()" id="dm-btn" title="Toggle Theme">🌙</button>
             <button class="btn-icon" onclick="exportImage()" title="Save Image">📸</button>
             <button class="btn-icon" id="dlExcel" title="Download Excel">📊</button>
@@ -196,7 +196,6 @@ WORKSPACE_HTML = """
                     <button type="button" class="chip" onclick="preset('lytd', this)">LYTD</button>
                 </div>
                 
-                <!-- Non-overlapping Stacked Date Grid for Mobile -->
                 <div style="display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px;">
                     <div>
                         <label style="font-size: 10px; color: var(--text-secondary); font-weight: 700; display: block; margin-bottom: 2px;">FROM</label>
@@ -460,7 +459,6 @@ WORKSPACE_HTML = """
                 const a = document.createElement('a'); a.download = 'Chart_Export.png';
                 a.href = chartInstance.toBase64Image(); a.click();
             } else {
-                // Native canvas rendering approach for bulletproof mobile downloads
                 const table = document.querySelector('.excel-table');
                 if(!table) { alert("No table data to export"); return; }
                 
@@ -468,33 +466,33 @@ WORKSPACE_HTML = """
                 let canvas = document.createElement('canvas');
                 let ctx = canvas.getContext('2d');
                 
-                let rowHeight = 40;
-                let colWidth = 160;
+                let rowHeight = 44;
+                let colWidth = 180;
                 let numRows = rows.length;
                 let numCols = table.querySelectorAll('th').length || 4;
                 
                 canvas.width = numCols * colWidth;
-                canvas.height = numRows * rowHeight + 60;
+                canvas.height = numRows * rowHeight + 80;
                 
                 const isDark = document.body.classList.contains('dark-mode');
                 ctx.fillStyle = isDark ? '#151516' : '#ffffff';
                 ctx.fillRect(0, 0, canvas.width, canvas.height);
                 
                 ctx.fillStyle = isDark ? '#f5f5f7' : '#1d1d1f';
-                ctx.font = 'bold 16px -apple-system, sans-serif';
-                ctx.fillText("Executive Sales Report", 20, 35);
+                ctx.font = 'bold 18px -apple-system, sans-serif';
+                ctx.fillText("Executive Sales Report", 24, 40);
                 
-                let y = 60;
+                let y = 70;
                 rows.forEach((row, rIndex) => {
-                    let x = 20;
+                    let x = 24;
                     let cells = row.querySelectorAll('th, td');
                     cells.forEach((cell, cIndex) => {
                         ctx.fillStyle = rIndex === 0 ? (isDark ? '#1c1c1e' : '#f9f9fb') : (isDark ? '#151516' : '#ffffff');
-                        ctx.fillRect(x, y, colWidth - 5, rowHeight - 5);
+                        ctx.fillRect(x, y, colWidth - 6, rowHeight - 6);
                         
                         ctx.fillStyle = isDark ? '#f5f5f7' : '#1d1d1f';
-                        ctx.font = rIndex === 0 ? 'bold 12px -apple-system' : '12px -apple-system';
-                        ctx.fillText(cell.innerText.trim().substring(0, 20), x + 10, y + 25);
+                        ctx.font = rIndex === 0 ? 'bold 13px -apple-system' : '13px -apple-system';
+                        ctx.fillText(cell.innerText.trim().substring(0, 22), x + 12, y + 27);
                         x += colWidth;
                     });
                     y += rowHeight;
@@ -560,7 +558,11 @@ def home():
             df['Tentative DP'] = pd.to_numeric(df['Tentative DP'].astype(str).str.replace(',', ''), errors='coerce')
         num_cols = df.select_dtypes(include='number').columns.tolist()
         
-        status_col = next((c for c in cols if 'status' in c.lower() or 'remarks' in c.lower()), None)
+        # Prioritize FinalStatus / Final Record Status over general remarks
+        status_col = next((c for c in cols if c.lower() in ['finalstatus', 'final record status']), None)
+        if not status_col:
+            status_col = next((c for c in cols if 'status' in c.lower()), None)
+            
         status_list = []
         if status_col:
             raw_vals = df[status_col].dropna().astype(str).unique().tolist()
@@ -626,7 +628,10 @@ def calculate():
         mode = request.form.get('view_mode', 'dashboard')
         filter_texts = []
         
-        status_col = next((c for c in df.columns if 'status' in c.lower() or 'remarks' in c.lower()), None)
+        status_col = next((c for c in df.columns if c.lower() in ['finalstatus', 'final record status']), None)
+        if not status_col:
+            status_col = next((c for c in df.columns if 'status' in c.lower()), None)
+            
         status_filters = request.form.getlist('status_filters')
         if status_col and status_filters:
             df = df[df[status_col].astype(str).isin(status_filters)]
@@ -703,7 +708,7 @@ def calculate():
             return jsonify({"table_html": '<div style="padding:60px; text-align:center;">No data found for selected filters.</div>', "summary_text": f"<b>Date</b> {date_subtitle} · 0 groups", "kpi_html": kpi_html})
 
         cols = request.form.getlist('columns_cols')
-        show_total = request.form.get('show_row_total') == 'true'
+        show_total = request.form.get('show_row_total'] == 'true'
 
         if not idx or not aggs: return jsonify({"error": "Select rows and metrics from the sidebar."})
         if not val_col: return jsonify({"error": "No numeric data found to aggregate."})
