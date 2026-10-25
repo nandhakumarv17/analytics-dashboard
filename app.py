@@ -987,6 +987,20 @@ if(mob)document.body.classList.add('sidebar-collapsed');})();</script>
     </div>
 
     <form id="config-form" class="sidebar-scroll" autocomplete="off">
+      <h3 class="group-cap">View & Export</h3>
+      <div style="padding: 4px 8px 12px 8px;">
+        <div class="seg seg-text" id="viewSeg" data-n="3" role="radiogroup" aria-label="View" style="width: 100%; margin-bottom: 10px;">
+          <span class="seg-thumb"></span>
+          <input type="radio" id="view_pivot" name="view_mode_toggle" value="pivot" checked><label for="view_pivot">Pivot</label>
+          <input type="radio" id="view_raw" name="view_mode_toggle" value="raw"><label for="view_raw">Raw</label>
+          <input type="radio" id="view_chart" name="view_mode_toggle" value="chart"><label for="view_chart">Chart</label>
+        </div>
+        <div style="display: flex; gap: 6px;">
+          <button type="button" class="btn-primary" id="dlImage" style="flex: 1; height: 34px; font-size: 12px;"><svg class="ic" style="width:14px;height:14px"><use href="#i-image"/></svg>Image</button>
+          <button type="button" class="btn-primary" id="dlExcel" style="flex: 1; height: 34px; font-size: 12px;" disabled><svg class="ic" style="width:14px;height:14px"><use href="#i-sheet"/></svg>Excel</button>
+        </div>
+      </div>
+
       <h3 class="group-cap">Period</h3>
       {% call acc('Date range', '__period', True) %}
         {% if ctx.date %}
@@ -1053,23 +1067,6 @@ if(mob)document.body.classList.add('sidebar-collapsed');})();</script>
   <div class="sidebar-resizer" id="sidebarResizer" role="separator" aria-orientation="vertical" title="Drag to resize · double-click to reset"></div>
 
   <main class="main">
-    <div class="page-head">
-      <div class="seg seg-text" id="viewSeg" data-n="3" role="radiogroup" aria-label="View">
-        <span class="seg-thumb"></span>
-        <input type="radio" id="view_pivot" name="view_mode_toggle" value="pivot" checked><label for="view_pivot">Pivot</label>
-        <input type="radio" id="view_raw" name="view_mode_toggle" value="raw"><label for="view_raw">Raw data</label>
-        <input type="radio" id="view_chart" name="view_mode_toggle" value="chart"><label for="view_chart">Chart</label>
-      </div>
-      <div class="menu-wrap" id="exportWrap">
-        <button type="button" class="btn-primary" id="exportBtn" aria-haspopup="true" aria-expanded="false"><svg class="ic"><use href="#i-share"/></svg>Export</button>
-        <div class="menu glass" id="exportMenu" role="menu">
-          <div class="menu-cap" id="exportCap">Exports the current view</div>
-          <button type="button" class="menu-item" id="dlImage" role="menuitem"><svg class="ic"><use href="#i-image"/></svg>Save image</button>
-          <button type="button" class="menu-item" id="dlExcel" role="menuitem"><svg class="ic"><use href="#i-sheet"/></svg>Download Excel</button>
-        </div>
-      </div>
-    </div>
-
     <div id="report-area">
       <header class="report-head">
         <h1 id="reportTitle" class="report-title">Build your report</h1>
@@ -1230,7 +1227,6 @@ body.loading #loadbar{opacity:1}
 body.loading #loadbar::after{animation:slide 1.1s var(--ease) infinite}
 @keyframes slide{from{transform:translateX(-100%)}to{transform:translateX(250%)}}
 
-.menu-wrap{position:relative}
 .popover{position:absolute;right:0;top:calc(100% + 10px);z-index:60;width:240px;padding:14px 16px 12px;border-radius:var(--r-md);background:var(--surface);box-shadow:0 0 0 .5px var(--hairline),inset 0 1px 0 var(--spec),var(--shadow-2);-webkit-backdrop-filter:saturate(190%) blur(30px);backdrop-filter:saturate(190%) blur(30px);transform-origin:top right;opacity:0;visibility:hidden;pointer-events:none;transform:scale(.88) translateY(-8px);transition:opacity .2s,transform .4s var(--spring),visibility 0s .4s}
 .popover.show{opacity:1;visibility:visible;pointer-events:auto;transform:none;transition-delay:0s}
 .pop-title{margin-bottom:10px;font-size:13px;font-weight:600}
@@ -1934,7 +1930,6 @@ function setHead(title, period, filters){
 function render(){
   const mode = view(), d = data;
   tableCard.hidden = mode === 'chart'; chartCard.hidden = mode !== 'chart';
-  $('#exportCap').textContent = `Exports the ${mode === 'raw' ? 'raw data' : mode === 'chart' ? 'chart' : 'pivot'} · ${body.classList.contains('mobile-mode') ? 'mobile' : 'desktop'} layout`;
   dlExcel.disabled = !(d && !d.error && lastParams);
 
   const block = html => {
@@ -2269,8 +2264,6 @@ function drawChart(animate){
 }
 function drawLegendFor(d){ chartData = d; drawLegend(); }
 
-dlExcel.addEventListener('click', () => { closePops(); if (lastParams) location.href = '/download?' + lastParams; });
-
 let d2i = null;
 const loadD2I = () => d2i || (d2i = new Promise((ok, fail) => {
   const s = document.createElement('script');
@@ -2279,7 +2272,6 @@ const loadD2I = () => d2i || (d2i = new Promise((ok, fail) => {
 }));
 
 $('#dlImage').addEventListener('click', async () => {
-  closePops();
   const area = $('#report-area'), mode = view();
   const titleText = ($('#reportTitle').textContent || 'Report').replace(/[^A-Za-z0-9]+/g, '_').replace(/^_|_$/g, '').slice(0, 70) || 'Report';
   const fileName = `${titleText}_${mode}.png`;
