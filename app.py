@@ -240,6 +240,19 @@ def format_pct(v):
     return '<span class="pct-neutral">–</span>'
 
 
+def format_pct_share(v):
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return ""
+    if x != x:
+        return ""
+    x = max(0.0, min(100.0, x))
+    intensity = x / 100.0
+    color = f"rgba(0, 113, 227, {0.45 + intensity * 0.55})"
+    return f'<span class="pct-share" style="--share:{intensity:.3f}; color:{color}; font-weight:700;">{x:.1f}%</span>'
+
+
 def col_cells(s, fmt=None, esc=True):
     if pd.api.types.is_datetime64_any_dtype(s):
         return s.dt.strftime(fmt or "%d-%b-%y").fillna("").tolist()
@@ -535,7 +548,10 @@ def build_pivot(dff, ctx, p, base, want_export):
             columns.append(col_cells(s, fmt_first(h)))
             foot_cells.append("Grand total" if i == 0 else "")
         elif kind == "pct":
-            columns.append([format_pct(v) for v in s])
+            if h.endswith("Share %"):
+                columns.append([format_pct_share(v) for v in s])
+            else:
+                columns.append([format_pct(v) for v in s])
             foot_cells.append("100%" if h.endswith("Share %") else "")
             numeric.add(i)
         else:
@@ -601,9 +617,9 @@ def build_pivot(dff, ctx, p, base, want_export):
     return payload, export, 200
 
 
-# ════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════
 #  EXCEL EXPORT (title, period, filters, styled header + footer)
-# ════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════
 def write_excel(payload, export):
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
     from openpyxl.utils import get_column_letter
@@ -776,6 +792,16 @@ MACROS = """
       <div class="pop-scale"><span>Clear</span><span>Frosted</span></div>
     </div>
   </div>
+
+  <div class="net-status" id="netStatus" aria-live="polite" title="Connection status">
+    <span class="net-dot" id="netDot"></span>
+    <span class="net-text" id="netText">Online</span>
+    <span class="net-sep"></span>
+    <span class="net-text" id="netPing">Ping 0ms</span>
+    <span class="net-sep"></span>
+    <span class="net-text" id="netSpeed">Up 0MB/s · Down 0MB/s</span>
+  </div>
+
   <div class="seg seg-icons" id="themeSeg" data-n="2" role="radiogroup" aria-label="Appearance">
     <span class="seg-thumb"></span>
     <input type="radio" name="theme" id="th_light" value="light"><label for="th_light" title="Light" aria-label="Light"><svg class="ic"><use href="#i-sun"/></svg></label>
@@ -982,6 +1008,27 @@ WORKSPACE_HTML = """<!doctype html>
               <input type="radio" name="csort" id="cs_nat" value="natural" checked><label for="cs_nat">Natural</label>
               <input type="radio" name="csort" id="cs_val" value="value"><label for="cs_val">Highest</label>
             </div>
+
+            <div class="chart-more">
+              <button type="button" class="btn-micro" id="chartMoreBtn" aria-haspopup="true" aria-expanded="false">More</button>
+              <div class="chart-more-menu glass" id="chartMoreMenu" role="menu">
+                <button type="button" class="chart-more-item" data-chart-mode="labels">
+                  <span>Toggle labels</span><span class="small" id="chartLabelState">On</span>
+                </button>
+                <button type="button" class="chart-more-item" data-chart-mode="top20">
+                  <span>Top 20</span><span class="small">View</span>
+                </button>
+                <button type="button" class="chart-more-item" data-chart-mode="top50">
+                  <span>Top 50</span><span class="small">View</span>
+                </button>
+                <button type="button" class="chart-more-item" data-chart-mode="all">
+                  <span>Show all</span><span class="small">Reset</span>
+                </button>
+                <button type="button" class="chart-more-item" data-chart-mode="reset">
+                  <span>Reset series</span><span class="small">All</span>
+                </button>
+              </div>
+            </div>
           </div>
         </div>
         <div id="chartBody" class="chart-body"></div>
@@ -1089,6 +1136,45 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:26px;heigh
 input[type=range]::-moz-range-thumb{width:26px;height:26px;border:0;border-radius:50%;background:#fff;box-shadow:0 2px 6px rgba(0,0,0,.3)}
 input[type=range]:active::-webkit-slider-thumb{transform:scale(1.12)}
 
+/* network status */
+.net-status{
+  display:inline-flex;
+  align-items:center;
+  gap:8px;
+  height:30px;
+  padding:0 10px 0 8px;
+  border-radius:999px;
+  background:color-mix(in srgb,var(--fill) 80%, transparent);
+  border:1px solid var(--hairline);
+  color:var(--label-2);
+  font-size:11px;
+  font-weight:600;
+  white-space:nowrap;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.18);
+}
+.net-dot{
+  width:8px;
+  height:8px;
+  border-radius:50%;
+  background:var(--green);
+  box-shadow:0 0 0 3px color-mix(in srgb,var(--green) 18%, transparent);
+}
+.net-dot.offline{
+  background:var(--neg);
+  box-shadow:0 0 0 3px color-mix(in srgb,var(--neg) 16%, transparent);
+}
+.net-text{font-weight:600}
+.net-sep{
+  width:1px;
+  height:12px;
+  background:var(--hairline-strong);
+  opacity:.7;
+}
+.net-status.offline{color:var(--neg)}
+@media (max-width: 860px){
+  .net-status{display:none}
+}
+
 /* segmented */
 .seg{--n:2;--i:0;position:relative;display:inline-grid;grid-auto-flow:column;grid-auto-columns:1fr;padding:2px;border-radius:12px;background:var(--fill);isolation:isolate}
 .seg[data-n="3"]{--n:3}
@@ -1105,19 +1191,17 @@ input[type=range]:active::-webkit-slider-thumb{transform:scale(1.12)}
 .seg input:checked+label{color:var(--label)}
 .seg input:focus-visible+label{outline:3px solid color-mix(in srgb,var(--blue) 50%,transparent)}
 
-/* switch */
+/* smaller ios toggle */
 .ios-switch{display:flex;align-items:center;gap:8px;cursor:pointer;font-size:12px;font-weight:500;color:var(--label-2);user-select:none}
 .ios-switch input,.row.switch input{position:absolute;opacity:0;pointer-events:none}
-.track{position:relative;flex:none;width:51px;height:31px;border-radius:16px;background:var(--fill);transition:background .3s var(--ease)}
-.knob{position:absolute;top:2px;left:2px;width:27px;height:27px;border-radius:50%;background:#fff;box-shadow:0 3px 8px rgba(0,0,0,.25),0 1px 1px rgba(0,0,0,.15);transition:transform .45s var(--spring),width .25s var(--ease)}
-.ios-switch input:checked+.track,.row.switch input:checked+.track{background:var(--green)}
-.ios-switch input:checked+.track .knob,.row.switch input:checked+.track .knob{transform:translateX(20px)}
-.ios-switch:active .knob,.row.switch:active .knob{width:33px}
-.ios-switch:active input:checked+.track .knob,.row.switch:active input:checked+.track .knob{transform:translateX(14px)}
-.ios-switch input:focus-visible+.track,.row.switch input:focus-visible+.track{outline:3px solid color-mix(in srgb,var(--blue) 50%,transparent);outline-offset:2px}
-.nav .track{width:44px;height:26px;border-radius:13px}.nav .knob{width:22px;height:22px}
-.nav .ios-switch input:checked+.track .knob{transform:translateX(18px)}
-.nav .ios-switch:active .knob{width:28px}.nav .ios-switch:active input:checked+.track .knob{transform:translateX(12px)}
+.ios-switch .track{position:relative;flex:none;width:36px;height:22px;border-radius:999px;background:var(--fill);transition:background .3s var(--ease)}
+.ios-switch .knob{position:absolute;top:2px;left:2px;width:18px;height:18px;border-radius:50%;background:#fff;box-shadow:0 2px 6px rgba(0,0,0,.22);transition:transform .35s var(--spring)}
+.ios-switch input:checked + .track{background:var(--green)}
+.ios-switch input:checked + .track .knob{transform:translateX(14px)}
+.ios-switch:active .knob{transform:scale(.96)}
+.nav .ios-switch .track{width:36px;height:22px}
+.nav .ios-switch .knob{width:18px;height:18px}
+.nav .ios-switch input:checked + .track .knob{transform:translateX(14px)}
 
 /* layouts */
 body.desktop-mode{overflow:hidden}
@@ -1291,6 +1375,7 @@ body.desktop-mode{overflow:hidden}
 .excel-table thead th.highlight{color:var(--blue)}
 .excel-table tfoot td.highlight{color:var(--blue)}
 .pct-positive{color:var(--pos);font-weight:600}.pct-negative{color:var(--neg);font-weight:600}.pct-neutral{color:var(--label-3)}
+.pct-share{display:inline-block;padding:1px 4px;border-radius:8px;background:color-mix(in srgb, var(--blue) calc(var(--share) * 100%), transparent);opacity:.92}
 .resizer{position:absolute;top:0;right:0;bottom:0;width:10px;cursor:col-resize;touch-action:none}
 .resizer::after{content:"";position:absolute;right:4px;top:28%;bottom:28%;width:1px;background:var(--hairline-strong);transition:background .2s,width .2s}
 .resizer:hover::after{background:var(--blue);width:2px}
@@ -1302,6 +1387,48 @@ tr.hl-row td{background-image:linear-gradient(var(--hl),var(--hl))!important}
 .empty.err{border-color:color-mix(in srgb,var(--neg) 35%,transparent);background:color-mix(in srgb,var(--neg) 8%,transparent)}
 .empty.err h3{color:var(--neg)}
 
+/* chart more options */
+.chart-more{position:relative}
+.chart-more-menu{
+  position:absolute;
+  right:0;
+  top:calc(100% + 8px);
+  z-index:50;
+  min-width:210px;
+  padding:6px;
+  border-radius:var(--r-md);
+  background:var(--surface);
+  box-shadow:0 0 0 .5px var(--hairline),inset 0 1px 0 var(--spec),var(--shadow-2);
+  transform-origin:top right;
+  opacity:0;
+  visibility:hidden;
+  pointer-events:none;
+  transform:scale(.88) translateY(-8px);
+  transition:opacity .2s,transform .4s var(--spring),visibility 0s .4s;
+}
+.chart-more-menu.show{
+  opacity:1;
+  visibility:visible;
+  pointer-events:auto;
+  transform:none;
+  transition-delay:0s;
+}
+.chart-more-item{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  width:100%;
+  padding:9px 10px;
+  border:0;
+  border-radius:10px;
+  background:none;
+  text-align:left;
+  font-size:13px;
+  color:var(--label);
+}
+.chart-more-item:hover{background:var(--fill-2)}
+.chart-more-item .small{font-size:11px;color:var(--label-3)}
+
 /* chart */
 .chart-bar{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;padding:14px 18px 6px}
 .legend{display:flex;flex-wrap:wrap;gap:6px}
@@ -1309,7 +1436,7 @@ tr.hl-row td{background-image:linear-gradient(var(--hl),var(--hl))!important}
 .lg i{width:9px;height:9px;border-radius:50%}
 .lg:active{transform:scale(.94)}
 .lg.off{opacity:.45}.lg.off i{background:var(--label-3)!important}
-.chart-ctl{display:flex;gap:8px;flex-wrap:wrap}
+.chart-ctl{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .chart-body{position:relative;display:flex;min-height:420px;height:clamp(420px,52vh,760px);padding:6px 14px 6px 8px;transition:opacity .25s}
 .yaxis{flex:none}
 .plot-scroll{flex:1;min-width:0;overflow:auto;overflow-y:hidden;width:100%}
@@ -1349,7 +1476,7 @@ tr.hl-row td{background-image:linear-gradient(var(--hl),var(--hl))!important}
 .upload-wrap{max-width:540px;margin:0 auto;padding:calc(var(--nav-h) + 72px) 20px 48px;animation:rise .7s var(--ease) both}
 .hero-title{margin:0 0 10px;text-align:center;font-size:clamp(38px,8vw,60px);font-weight:700;letter-spacing:-.04em;line-height:1.04}
 .hero-sub{margin:0 0 34px;text-align:center;font-size:18px;color:var(--label-3)}
-.upload-card{display:grid;gap:16px;padding:26px;border-radius:32px;background:var(--surface);box-shadow:0 0 0 .5px var(--hairline),inset 0 1px 0 var(--spec),var(--shadow-1);backdrop-filter:saturate(160%) blur(18px)}
+.upload-card{display:grid;gap:16px;padding:26px;border-radius:32px;background:var(--surface);box-shadow:0 0 0 .5px var(--hairline),inset 0 1px 0 var(--spec),var(--shadow-1)}
 .dropzone{display:grid;justify-items:center;gap:6px;padding:40px 20px;border:1.5px dashed var(--hairline-strong);border-radius:22px;background:var(--fill-2);color:var(--label-3);text-align:center;cursor:pointer;transition:border-color .3s var(--ease),background .3s,transform .45s var(--spring)}
 .dropzone:hover{border-color:var(--blue);color:var(--blue)}
 .dropzone.drag{border-color:var(--blue);background:var(--blue-tint);color:var(--blue);transform:scale(1.02)}
@@ -1404,6 +1531,9 @@ body.exporting .kpis{overflow:visible}
 body.exporting .excel-table thead th,body.exporting .excel-table tfoot td,body.exporting .excel-table td:first-child,body.exporting .excel-table th:first-child{position:static}
 body.exporting .lg.off{display:none}
 body.exporting .table-scroll,body.exporting .plot-scroll{overflow:visible!important;max-height:none!important}
+body.exporting .kpi{box-shadow:none!important;border:1px solid var(--hairline)!important}
+body.exporting .kpi.active{box-shadow:none!important;border:2px solid var(--blue)!important}
+body.exporting .chart-more-menu{display:none!important}
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{transition-duration:.01ms!important;animation-duration:.01ms!important}}
 """
 
@@ -1452,7 +1582,6 @@ $$('#themeSeg input').forEach(i => {
     store.set('ap-theme', i.value);
   });
 });
-
 const gRange = $('#glassRange');
 if (gRange) {
   const paint = () => gRange.style.setProperty('--p', ((gRange.value - gRange.min) / (gRange.max - gRange.min) * 100) + '%');
@@ -1479,6 +1608,43 @@ document.addEventListener('click', e => {
   if (!insideGlass && !insideExport) closePops();
 });
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closePops(); });
+
+/* network status */
+function fmtMb(v){
+  if (!Number.isFinite(v) || v <= 0) return '0MB/s';
+  if (v >= 1) return `${v.toFixed(1)}MB/s`;
+  return `${(v * 1024).toFixed(0)}KB/s`;
+}
+function setNetState(online, ping, up, down){
+  const dot = $('#netDot'), text = $('#netText'), pingEl = $('#netPing'), speedEl = $('#netSpeed'), wrap = $('#netStatus');
+  if (!dot || !text || !pingEl || !speedEl || !wrap) return;
+  dot.classList.toggle('offline', !online);
+  wrap.classList.toggle('offline', !online);
+  text.textContent = online ? 'Online' : 'Offline';
+  pingEl.textContent = `Ping ${ping || 0}ms`;
+  speedEl.textContent = `Up ${fmtMb(up || 0)} · Down ${fmtMb(down || 0)}`;
+}
+function estimateRate(bytes, ms){
+  const secs = ms <= 0 ? 1 : ms / 1000;
+  return Math.max(0, bytes / secs / (1024 * 1024));
+}
+let net = {ping:0, up:0, down:0};
+async function measurePing(){
+  const start = performance.now();
+  try {
+    await fetch('/assets/app.js?ts=' + Date.now(), { method: 'GET', cache: 'no-store' });
+    const elapsed = Math.max(1, Math.round(performance.now() - start));
+    net.ping = elapsed;
+    setNetState(navigator.onLine, elapsed, net.up, net.down);
+  } catch {
+    setNetState(false, 0, net.up, net.down);
+  }
+}
+window.addEventListener('online', () => { setNetState(true, net.ping || 0, net.up, net.down); measurePing(); });
+window.addEventListener('offline', () => { setNetState(false, 0, net.up, net.down); });
+setNetState(navigator.onLine, 0, 0, 0);
+measurePing();
+setInterval(measurePing, 15000);
 
 /* upload */
 const dz = $('#dropzone');
@@ -1646,6 +1812,7 @@ function buildParams(server){
 function schedule(delay = 90){ clearTimeout(timer); timer = setTimeout(update, delay); }
 
 async function update(){
+  const requestStart = performance.now();
   const server = view() === 'raw' ? 'raw' : 'pivot';
   const fd = buildParams(server);
   $$('[data-structural]').forEach(el => el.classList.toggle('is-disabled', server === 'raw'));
@@ -1659,6 +1826,9 @@ async function update(){
   body.classList.add('loading'); tableCard.classList.add('updating'); chartCard.classList.add('updating');
   try {
     const res = await fetch('/calculate', { method: 'POST', body: fd, signal: mine.signal });
+    const elapsed = performance.now() - requestStart;
+    net.up = estimateRate(Math.max(1, Array.from(fd.entries()).reduce((s, [, v]) => s + (typeof v === 'string' ? v.length : 0), 0)), elapsed);
+    setNetState(navigator.onLine, net.ping || 0, net.up, net.down);
     const d = await res.json();
     data = res.ok ? d : { error: d.error || 'Unknown error' };
     dataMode = server; lastParams = res.ok ? new URLSearchParams(fd).toString() : null;
@@ -1684,11 +1854,6 @@ function render(){
 
   $('#exportCap').textContent = `Exports the ${mode === 'raw' ? 'raw data' : mode === 'chart' ? 'chart' : 'pivot'} · ${body.classList.contains('mobile-mode') ? 'mobile' : body.classList.contains('tablet-mode') ? 'tablet' : 'desktop'} layout`;
   dlExcel.disabled = !(d && !d.error && lastParams);
-
-  if (mode === 'chart') {
-    tableCard.classList.remove('updating');
-    chartCard.classList.remove('updating');
-  }
 
   const block = html => {
     kpiEl.hidden = true;
@@ -1843,6 +2008,7 @@ $('#resetBtn').addEventListener('click', () => {
   $('#view_pivot').checked = true; schedule(0);
 });
 
+/* table: sortable headers, resizable columns */
 function addResizers(){
   $$('.excel-table th', tableWrap).forEach(th => { if (!th.querySelector('.resizer')) th.appendChild(Object.assign(document.createElement('div'), { className: 'resizer' })); });
 }
@@ -1879,6 +2045,9 @@ tableWrap.addEventListener('pointerdown', e => {
 
 /* chart */
 let ctype = 'bar', csort = 'natural', hidden = new Set(), chartData = null, chartSig = '', chartX = '', redrawT = null, uid = 0;
+let chartLabelVisible = true;
+let chartMaxRows = null;
+
 const fmtFull = v => v == null ? '–' : (Math.abs(v) < 100 && v % 1 !== 0 ? v.toLocaleString('en-IN', { maximumFractionDigits: 2 }) : Math.round(v).toLocaleString('en-IN'));
 const trim1 = n => String(Math.round(n * 10) / 10);
 const fmtAxis = v => { const a = Math.abs(v); return a >= 1e7 ? trim1(v / 1e7) + ' Cr' : a >= 1e5 ? trim1(v / 1e5) + ' L' : a >= 1e3 ? trim1(v / 1e3) + 'K' : trim1(v); };
@@ -1917,6 +2086,45 @@ $$('input[name="csort"]').forEach(r => r.addEventListener('change', () => { csor
 const redrawSoon = () => { clearTimeout(redrawT); redrawT = setTimeout(() => { if (!chartCard.hidden && chartData) { drawChart(false); applyHighlight(); } }, 160); };
 window.addEventListener('resize', redrawSoon);
 
+const chartMoreBtn = $('#chartMoreBtn');
+const chartMoreMenu = $('#chartMoreMenu');
+if (chartMoreBtn && chartMoreMenu) {
+  chartMoreBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const open = !chartMoreMenu.classList.contains('show');
+    chartMoreMenu.classList.toggle('show', open);
+    chartMoreBtn.setAttribute('aria-expanded', String(open));
+  });
+  document.addEventListener('click', (e) => {
+    if (!e.target.closest('#chartMoreBtn') && !e.target.closest('#chartMoreMenu')) {
+      chartMoreMenu.classList.remove('show');
+      chartMoreBtn.setAttribute('aria-expanded', 'false');
+    }
+  });
+  document.querySelectorAll('[data-chart-mode]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const mode = btn.dataset.chartMode;
+      if (mode === 'labels') {
+        chartLabelVisible = !chartLabelVisible;
+        const state = document.getElementById('chartLabelState'); if (state) state.textContent = chartLabelVisible ? 'On' : 'Off';
+        drawChart(false);
+      }
+      if (mode === 'top20') { chartMaxRows = 20; drawChart(false); }
+      if (mode === 'top50') { chartMaxRows = 50; drawChart(false); }
+      if (mode === 'all') { chartMaxRows = null; drawChart(false); }
+      if (mode === 'reset') {
+        hidden = new Set();
+        chartSig = '';
+        chartX = '';
+        drawLegend();
+        drawChart(false);
+      }
+      chartMoreMenu.classList.remove('show');
+      chartMoreBtn.setAttribute('aria-expanded', 'false');
+    });
+  });
+}
+
 function drawChart(animate){
   const d = data && data.chart;
   if (!d || !d.series.length || !d.labels.length) {
@@ -1925,6 +2133,7 @@ function drawChart(animate){
     $('#chartNote').textContent = '';
     return;
   }
+
   const sig = d.series.map(s => s.name).join('|');
   if (sig !== chartSig) {
     chartSig = sig; hidden = new Set(); const a = d.series[0].agg;
@@ -1937,10 +2146,19 @@ function drawChart(animate){
   }
   chartData = d; drawLegend();
   $('#chartNote').textContent = d.note || '';
+
+  let idx = d.labels.map((_, i) => i);
+  const labelsAll = idx.map(i => d.labels[i]);
+  if (chartMaxRows && labelsAll.length > chartMaxRows) {
+    idx = idx.slice(0, chartMaxRows);
+  }
+
   const mobile = body.classList.contains('mobile-mode');
   const vis = d.series.map((s, i) => i).filter(i => !hidden.has(i));
-  let idx = d.labels.map((_, i) => i);
-  if (csort === 'value') { const s = d.series[vis[0]]; idx.sort((a, b) => (s.values[b] ?? -Infinity) - (s.values[a] ?? -Infinity)); }
+  if (csort === 'value') {
+    const s = d.series[vis[0]];
+    idx.sort((a, b) => (s.values[b] ?? -Infinity) - (s.values[a] ?? -Infinity));
+  }
   const labels = idx.map(i => d.labels[i]);
   const ser = vis.map(i => ({ i, s: d.series[i], v: idx.map(k => d.series[i].values[k]) }));
   const n = labels.length, ns = ser.length;
@@ -1966,8 +2184,11 @@ function drawChart(animate){
   s += '<rect class="band" id="band" y="0" height="' + H + '" width="' + step + '" rx="8"/><line class="rule" id="rule" y1="' + m.t + '" y2="' + (H - m.b) + '"/>';
   const every = Math.ceil((rotate ? 17 : 70) / step);
   labels.forEach((l, i) => {
-    if (i % every) return; const t = l.length > 18 ? l.slice(0, 17) + '…' : l;
-    s += rotate ? `<text class="xtick" transform="translate(${X(i) + 4},${H - m.b + 16}) rotate(-38)" text-anchor="end">${esc(t)}</text>` : `<text class="xtick" x="${X(i)}" y="${H - m.b + 20}" text-anchor="middle">${esc(t)}</text>`;
+    if (i % every) return;
+    const t = l.length > 18 ? l.slice(0, 17) + '…' : l;
+    if (chartLabelVisible) {
+      s += rotate ? `<text class="xtick" transform="translate(${X(i) + 4},${H - m.b + 16}) rotate(-38)" text-anchor="end">${esc(t)}</text>` : `<text class="xtick" x="${X(i)}" y="${H - m.b + 20}" text-anchor="middle">${esc(t)}</text>`;
+    }
   });
   const showVals = ctype === 'bar' && n * ns <= 14;
   ser.forEach(x => {
@@ -2050,6 +2271,7 @@ $('#dlImage').addEventListener('click', async () => {
     const height = Math.max(900, Math.ceil(rect.height * scale));
     const bg = getComputedStyle(body).backgroundColor;
 
+    const start = performance.now();
     const blob = await domtoimage.toBlob(area, {
       bgcolor: bg,
       cacheBust: true,
@@ -2062,6 +2284,9 @@ $('#dlImage').addEventListener('click', async () => {
         height: `${rect.height}px`
       }
     });
+    const down = estimateRate(blob.size, performance.now() - start);
+    net.down = down;
+    setNetState(navigator.onLine, net.ping || 0, net.up, net.down);
 
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
