@@ -91,7 +91,6 @@ GLOBAL_HEAD = """
     .chip { padding: 6px 12px; border-radius: 8px; background: rgba(120,120,128,0.1); font-size: 12px; font-weight: 600; cursor: pointer; transition: 0.2s; border: none; color: var(--text-primary); }
     .chip.active { background: var(--blue-apple); color: #fff; }
 
-    /* Popup Modal for Weeks */
     .modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.4); backdrop-filter: blur(4px); z-index: 2000; align-items: center; justify-content: center; }
     .modal-card { background: var(--card-bg); border: 1px solid var(--glass-border); padding: 24px; border-radius: 20px; width: 300px; box-shadow: var(--shadow-glass); }
 </style>
@@ -138,7 +137,6 @@ WORKSPACE_HTML = """
         </div>
     </div>
     
-    <!-- Week Selector Modal Popup -->
     <div class="modal-overlay" id="weekModal">
         <div class="modal-card">
             <div style="font-weight: 700; margin-bottom: 14px; font-size: 16px;">Select Weeks</div>
@@ -160,7 +158,6 @@ WORKSPACE_HTML = """
         <div class="sidebar">
             <form id="config-form">
                 
-                <!-- Master Field Manager -->
                 <div class="section-title" style="margin-top: 0;">Configure Axis Fields</div>
                 <div class="checkbox-group">
                     <label class="switch-container">
@@ -192,7 +189,7 @@ WORKSPACE_HTML = """
                 </div>
                 {% endif %}
                 
-                <div class="section-title">Timeline & Periods</div>
+                <div class="section-title">Timeline & Comparison</div>
                 <div class="chips">
                     <button type="button" class="chip" onclick="preset('yesterday', this)">Yesterday</button>
                     <button type="button" class="chip" onclick="preset('last7', this)">Last 7 Days</button>
@@ -213,8 +210,15 @@ WORKSPACE_HTML = """
                         <input type="date" name="end_date" id="end_date" class="btn-liquid" style="width:100%; box-sizing:border-box;">
                     </div>
                 </div>
+
+                <div class="checkbox-group" style="margin-bottom: 12px;">
+                    <label class="switch-container">
+                        <span style="font-size: 13px; font-weight: 600;">Enable MTD vs LMTD Comparison</span>
+                        <input type="checkbox" name="compare_mode" value="lmtd" class="ios-switch" onchange="updateDashboard()">
+                        <div class="switch"></div>
+                    </label>
+                </div>
                 
-                <!-- Popup Week Modal Trigger Button -->
                 <button type="button" class="btn-liquid" style="width: 100%; text-align: center; margin-bottom: 8px;" onclick="toggleWeekModal()">📅 Select Weeks <span id="weekBadge" style="color:var(--blue-apple); font-weight:700;"></span></button>
 
                 <div id="pivot-controls">
@@ -254,8 +258,16 @@ WORKSPACE_HTML = """
                     
                     <label style="font-size: 10px; color: var(--text-secondary); margin-bottom: 4px; display:block;">AGGREGATION</label>
                     <div class="checkbox-group">
-                        <label class="checkbox-item"><input type="checkbox" name="agg_funcs" value="sum" checked onchange="updateDashboard()"> <span>Sum Total</span></label>
-                        <label class="checkbox-item"><input type="checkbox" name="agg_funcs" value="count" onchange="updateDashboard()"> <span>Count (Qty)</span></label>
+                        <label class="switch-container">
+                            <span style="font-size: 13px; font-weight: 500;">Sum Total</span>
+                            <input type="checkbox" name="agg_funcs" value="sum" class="ios-switch" checked onchange="updateDashboard()">
+                            <div class="switch"></div>
+                        </label>
+                        <label class="switch-container">
+                            <span style="font-size: 13px; font-weight: 500;">Count (Qty)</span>
+                            <input type="checkbox" name="agg_funcs" value="count" class="ios-switch" onchange="updateDashboard()">
+                            <div class="switch"></div>
+                        </label>
                         <div style="height: 1px; background: var(--glass-border); margin: 4px 0;"></div>
                         
                         <label class="switch-container" id="total_wrapper">
@@ -290,13 +302,12 @@ WORKSPACE_HTML = """
                 <div id="table-wrapper" class="table-scroll">
                     <div style="padding: 60px; text-align: center; color: var(--text-secondary); font-size: 15px;">Configure Y-Axis and metrics to preview data.</div>
                 </div>
-                <div id="chart-wrapper" style="display:none; padding: 20px; flex: 1;"><canvas id="dataChart"></canvas></div>
+                <div id="chart-wrapper" style="display:none; padding: 20px; flex: 1; min-height: 450px;"><canvas id="dataChart"></canvas></div>
             </div>
         </div>
     </div>
 
     <script>
-        // Popup Modal for Weeks Logic
         function toggleWeekModal() {
             const modal = document.getElementById('weekModal');
             modal.style.display = modal.style.display === 'flex' ? 'none' : 'flex';
@@ -309,30 +320,19 @@ WORKSPACE_HTML = """
             updateDashboard();
         }
 
-        // Master Field Manager Synchronization for X and Y Axes
         function updateAxisVisibility() {
             const selectedFields = Array.from(document.querySelectorAll('input[name="master_fields"]:checked')).map(cb => cb.value);
             
-            // Update Rows (Y-Axis)
             document.querySelectorAll('.axis-row-item').forEach(item => {
                 const field = item.getAttribute('data-field');
-                if (selectedFields.includes(field)) {
-                    item.style.display = 'flex';
-                } else {
-                    item.style.display = 'none';
-                    item.querySelector('input').checked = false;
-                }
+                if (selectedFields.includes(field)) item.style.display = 'flex';
+                else { item.style.display = 'none'; item.querySelector('input').checked = false; }
             });
 
-            // Update Columns (X-Axis)
             document.querySelectorAll('.axis-col-item').forEach(item => {
                 const field = item.getAttribute('data-field');
-                if (selectedFields.includes(field)) {
-                    item.style.display = 'flex';
-                } else {
-                    item.style.display = 'none';
-                    item.querySelector('input').checked = false;
-                }
+                if (selectedFields.includes(field)) item.style.display = 'flex';
+                else { item.style.display = 'none'; item.querySelector('input').checked = false; }
             });
             updateDashboard();
         }
@@ -349,7 +349,6 @@ WORKSPACE_HTML = """
             else updateDashboard();
         }
 
-        // View Mode UI Switcher
         document.querySelectorAll('input[name="view_mode_toggle"]').forEach(radio => {
             radio.addEventListener('change', function() {
                 const thumb = document.querySelector('.seg-thumb');
@@ -371,26 +370,13 @@ WORKSPACE_HTML = """
             chip.classList.add('active');
             
             const t = new Date(); let s = new Date(t), e = new Date(t);
-            
-            if (key === 'yesterday') {
-                s.setDate(t.getDate() - 1); e.setDate(t.getDate() - 1);
-            } else if (key === 'last7') {
-                s.setDate(t.getDate() - 6);
-            } else if (key === 'mtd') {
-                s = new Date(t.getFullYear(), t.getMonth(), 1);
-            } else if (key === 'lmtd') {
-                s = new Date(t.getFullYear(), t.getMonth() - 1, 1);
-                e = new Date(t.getFullYear(), t.getMonth() - 1, t.getDate());
-            } else if (key === 'lwtd') {
-                let day = t.getDay() || 7; 
-                s.setDate(t.getDate() - day - 6);
-                e.setDate(t.getDate() - day);
-            } else if (key === 'ytd') {
-                s = new Date(t.getFullYear(), 0, 1);
-            } else if (key === 'lytd') {
-                s = new Date(t.getFullYear() - 1, 0, 1);
-                e = new Date(t.getFullYear() - 1, t.getMonth(), t.getDate());
-            }
+            if (key === 'yesterday') { s.setDate(t.getDate() - 1); e.setDate(t.getDate() - 1); }
+            else if (key === 'last7') { s.setDate(t.getDate() - 6); }
+            else if (key === 'mtd') { s = new Date(t.getFullYear(), t.getMonth(), 1); }
+            else if (key === 'lmtd') { s = new Date(t.getFullYear(), t.getMonth() - 1, 1); e = new Date(t.getFullYear(), t.getMonth() - 1, t.getDate()); }
+            else if (key === 'lwtd') { let day = t.getDay() || 7; s.setDate(t.getDate() - day - 6); e.setDate(t.getDate() - day); }
+            else if (key === 'ytd') { s = new Date(t.getFullYear(), 0, 1); }
+            else if (key === 'lytd') { s = new Date(t.getFullYear() - 1, 0, 1); e = new Date(t.getFullYear() - 1, t.getMonth(), t.getDate()); }
             
             document.getElementById('start_date').value = iso(s);
             document.getElementById('end_date').value = iso(e);
@@ -430,7 +416,6 @@ WORKSPACE_HTML = """
                 }
                 
                 document.getElementById('summaryBar').innerHTML = data.summary_text || "Data View";
-                
                 const kpiBanner = document.getElementById('kpi-banner');
                 kpiBanner.innerHTML = data.kpi_html || '';
                 
@@ -482,15 +467,23 @@ WORKSPACE_HTML = """
             } else {
                 const area = document.getElementById('capture-area');
                 const bgColor = document.body.classList.contains('dark-mode') ? '#151516' : '#ffffff';
-                const origOverflow = area.querySelector('.table-scroll').style.overflow;
-                area.querySelector('.table-scroll').style.overflow = 'visible';
+                const scrollEl = area.querySelector('.table-scroll');
+                const origOverflow = scrollEl.style.overflow;
+                const origHeight = scrollEl.style.height;
+                scrollEl.style.overflow = 'visible';
+                scrollEl.style.height = 'auto';
                 
-                domtoimage.toJpeg(area, { quality: 1.0, bgcolor: bgColor })
+                domtoimage.toJpeg(area, { quality: 1.0, bgcolor: bgColor, height: area.scrollHeight })
                     .then(url => {
-                        const a = document.createElement('a'); a.download = 'Table_Export.jpeg'; a.href = url; a.click();
-                        area.querySelector('.table-scroll').style.overflow = origOverflow;
+                        const a = document.createElement('a'); a.download = 'Executive_Report.jpeg'; a.href = url; a.click();
+                        scrollEl.style.overflow = origOverflow;
+                        scrollEl.style.height = origHeight;
                     })
-                    .catch(err => { console.error(err); area.querySelector('.table-scroll').style.overflow = origOverflow; });
+                    .catch(err => { 
+                        console.error(err); 
+                        scrollEl.style.overflow = origOverflow;
+                        scrollEl.style.height = origHeight;
+                    });
             }
         }
         
@@ -508,10 +501,15 @@ WORKSPACE_HTML = """
 </html>
 """
 
-def get_data():
+def get_master_data():
     if os.path.exists(DATA_FILE_PATH):
         try:
-            df = pd.read_pickle(DATA_FILE_PATH)
+            with open(DATA_FILE_PATH, 'rb') as f:
+                saved = pd.read_pickle(f)
+            if isinstance(saved, dict) and 'df' in saved:
+                df = saved['df']
+            else:
+                df = saved
             df.rename(columns=lambda x: str(x).replace('SPC Name', 'BA Name').replace('SPC', 'BA'), inplace=True)
             return df
         except Exception:
@@ -535,10 +533,11 @@ def format_indian_number(x):
 
 @app.route("/")
 def home():
-    df = get_data()
+    df = get_master_data()
     if df is not None:
         cols = df.columns.tolist()
-        grouping = df.select_dtypes(exclude=['number']).columns.tolist()
+        grouping = [c for c in df.select_dtypes(exclude=['number']).columns.tolist() if c != 'Month']
+        if 'Month' not in grouping: grouping.insert(0, 'Month')
         
         if 'Tentative DP' in df.columns:
             df['Tentative DP'] = pd.to_numeric(df['Tentative DP'].astype(str).str.replace(',', ''), errors='coerce')
@@ -561,9 +560,20 @@ def dashboard():
         return redirect(url_for('home'))
     try:
         name = f.filename.lower()
-        if name.endswith('.csv'): df = pd.read_csv(f)
-        elif name.endswith(('.xlsx', '.xls')): df = pd.read_excel(f)
-        else: return render_template_string(UPLOAD_HTML, error="Unsupported file type."), 400
+        if name.endswith('.csv'):
+            df = pd.read_csv(f)
+            df['Month'] = 'Current'
+        elif name.endswith(('.xlsx', '.xls')):
+            xls = pd.ExcelFile(f)
+            dfs = []
+            for sheet in xls.sheet_names:
+                temp_df = pd.read_excel(xls, sheet_name=sheet)
+                if not temp_df.empty:
+                    temp_df['Month'] = sheet
+                    dfs.append(temp_df)
+            df = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+        else:
+            return render_template_string(UPLOAD_HTML, error="Unsupported file type."), 400
         
         if df.empty: return render_template_string(UPLOAD_HTML, error="File contains no data."), 400
         df.to_pickle(DATA_FILE_PATH)
@@ -574,13 +584,12 @@ def dashboard():
 @app.route("/calculate", methods=["POST"])
 def calculate():
     try:
-        df = get_data()
+        df = get_master_data()
         if df is None: return jsonify({"error": "No data available. Please re-upload."}), 400
         
         mode = request.form.get('view_mode', 'dashboard')
         filter_texts = []
         
-        # 1. FINAL STATUS Filter
         status_col = next((c for c in df.columns if 'status' in c.lower() or 'remarks' in c.lower()), None)
         status_filters = request.form.getlist('status_filters')
         if status_col and status_filters:
@@ -588,7 +597,6 @@ def calculate():
             if len(status_filters) <= 3: filter_texts.append(f"Status: {', '.join(status_filters)}")
             else: filter_texts.append(f"Status: {len(status_filters)} selected")
 
-        # 2. Strict Date Filtering
         date_cols = df.columns.tolist()
         date_col_name = ""
         for c in ("Customized Sales Date", "Sale Date", "Sales Date"):
@@ -607,16 +615,32 @@ def calculate():
         start_date = request.form.get('start_date')
         end_date = request.form.get('end_date')
         weeks = request.form.getlist("week_num")
+        compare_mode = request.form.get('compare_mode')
         
         if date_col_name:
-            if start_date: 
-                df = df[df[date_col_name] >= pd.to_datetime(start_date)]
-                filter_texts.append(f"{pd.to_datetime(start_date).strftime('%d-%b-%y')}")
-            if end_date: 
-                df = df[df[date_col_name] <= pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)]
-                filter_texts.append(f"{pd.to_datetime(end_date).strftime('%d-%b-%y')}")
+            if compare_mode == 'lmtd' and start_date and end_date:
+                s_dt = pd.to_datetime(start_date)
+                e_dt = pd.to_datetime(end_date)
                 
-            if weeks:
+                ls_dt = s_dt - pd.DateOffset(months=1)
+                le_dt = e_dt - pd.DateOffset(months=1)
+                
+                df_curr = df[(df[date_col_name] >= s_dt) & (df[date_col_name] <= e_dt + pd.Timedelta(days=1) - pd.Timedelta(seconds=1))]
+                df_prev = df[(df[date_col_name] >= ls_dt) & (df[date_col_name] <= le_dt + pd.Timedelta(days=1) - pd.Timedelta(seconds=1))]
+                
+                df_curr['Period'] = 'Current'
+                df_prev['Period'] = 'Last Period (LMTD)'
+                df = pd.concat([df_curr, df_prev], ignore_index=True)
+                filter_texts.append(f"Comparison: Current ({s_dt.strftime('%d-%b-%y')} - {e_dt.strftime('%d-%b-%y')}) vs LMTD")
+            else:
+                if start_date: 
+                    df = df[df[date_col_name] >= pd.to_datetime(start_date)]
+                    filter_texts.append(f"{pd.to_datetime(start_date).strftime('%d-%b-%y')}")
+                if end_date: 
+                    df = df[df[date_col_name] <= pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)]
+                    filter_texts.append(f"{pd.to_datetime(end_date).strftime('%d-%b-%y')}")
+                    
+            if weeks and date_col_name and 'Period' not in df.columns:
                 week_masks = []
                 for w in weeks:
                     w = int(w)
@@ -632,6 +656,8 @@ def calculate():
                 filter_texts.append(f"Weeks: {', '.join([f'W{w}' for w in weeks])}")
 
         idx = request.form.getlist('index_cols')
+        if compare_mode == 'lmtd' and 'Period' not in idx: idx.insert(0, 'Period')
+        
         date_subtitle = " – ".join(filter_texts[:2]) if len(filter_texts)>=2 and "From" not in filter_texts[0] else (" · ".join(filter_texts) if filter_texts else "All Time")
         
         val_col = request.form.get('value_col')
@@ -641,6 +667,9 @@ def calculate():
             num_cols = df.select_dtypes(include='number').columns.tolist()
             val_col = num_cols[0] if num_cols else None
 
+        aggs = request.form.getlist('agg_funcs')
+        if not aggs: aggs = ['sum']
+        
         kpi_html = ""
         if not df.empty and val_col:
             active = format_indian_number(df[idx[0]].nunique()) if idx and idx[0] in df.columns else "N/A"
@@ -654,7 +683,6 @@ def calculate():
             return jsonify({"table_html": '<div style="padding:60px; text-align:center;">No data found for selected filters.</div>', "summary_text": f"<b>Date</b> {date_subtitle} · 0 groups", "kpi_html": kpi_html})
 
         cols = request.form.getlist('columns_cols')
-        aggs = request.form.getlist('agg_funcs')
         show_total = request.form.get('show_row_total') == 'true'
 
         if not idx or not aggs: return jsonify({"error": "Select rows and metrics from the sidebar."})
@@ -692,18 +720,12 @@ def calculate():
             chart_df = pivot.sort_values(by=metric_cols[0], ascending=False).head(15) if metric_cols else pivot.head(15)
             labels = chart_df[idx[0]].apply(lambda x: x.strftime('%d-%b-%y') if isinstance(x, pd.Timestamp) else str(x)).tolist() if idx else ["Total"]
             
-            # Vibrant multi-color palette for chart bars
             palette = ['#0071e3', '#34c759', '#ff9500', '#af52de', '#ff3b30', '#5ac8fa', '#ffcc00', '#5856d6']
             datasets = []
             for i, m in enumerate(metric_cols):
                 if m != "TOTAL":
                     color = palette[i % len(palette)]
-                    datasets.append({
-                        "label": m, 
-                        "data": chart_df[m].tolist(), 
-                        "backgroundColor": color, 
-                        "borderRadius": 6
-                    })
+                    datasets.append({"label": m, "data": chart_df[m].tolist(), "backgroundColor": color, "borderRadius": 6})
             chart_data = {"labels": labels, "datasets": datasets}
 
         if not pivot.empty:
@@ -720,8 +742,7 @@ def calculate():
         html = html.replace('<th>TOTAL</th>', '<th class="total-col">TOTAL</th>')
         if 'TOTAL' in metric_cols: html = re.sub(r'(<td>)([\d,-]+)(</td></tr>)', r'<td class="total-col">\2\3', html)
         
-        pivot.to_pickle(os.path.join(DATA_FILE_PATH.replace('shared_data.pkl', 'summary_data.pkl')))
-        
+        pivot.to_pickle(os.path.join(UPLOAD_DIR, "summary_data.pkl"))
         summary_text = f"<b>Date</b> {date_subtitle} · <b>Filters</b> {' + '.join(idx)} · {len(pivot)-1} groups"
         
         return jsonify({
