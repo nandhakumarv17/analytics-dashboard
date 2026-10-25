@@ -460,19 +460,22 @@ WORKSPACE_HTML = """
                 a.href = chartInstance.toBase64Image(); a.click();
             } else {
                 const table = document.querySelector('.excel-table');
-                if(!table) { alert("No table data to export"); return; }
+                if(!table || table.rows.length <= 1) { 
+                    alert("Please select rows and metrics to generate a valid report before downloading the image."); 
+                    return; 
+                }
                 
                 const rows = table.querySelectorAll('tr');
                 let canvas = document.createElement('canvas');
                 let ctx = canvas.getContext('2d');
                 
                 let rowHeight = 44;
-                let colWidth = 180;
                 let numRows = rows.length;
-                let numCols = table.querySelectorAll('th').length || 4;
+                let numCols = rows[0] ? rows[0].querySelectorAll('th, td').length : 4;
+                let colWidth = 180;
                 
                 canvas.width = numCols * colWidth;
-                canvas.height = numRows * rowHeight + 80;
+                canvas.height = numRows * rowHeight + 90;
                 
                 const isDark = document.body.classList.contains('dark-mode');
                 ctx.fillStyle = isDark ? '#151516' : '#ffffff';
@@ -480,9 +483,9 @@ WORKSPACE_HTML = """
                 
                 ctx.fillStyle = isDark ? '#f5f5f7' : '#1d1d1f';
                 ctx.font = 'bold 18px -apple-system, sans-serif';
-                ctx.fillText("Executive Sales Report", 24, 40);
+                ctx.fillText("Executive Sales Report", 24, 42);
                 
-                let y = 70;
+                let y = 75;
                 rows.forEach((row, rIndex) => {
                     let x = 24;
                     let cells = row.querySelectorAll('th, td');
@@ -492,7 +495,7 @@ WORKSPACE_HTML = """
                         
                         ctx.fillStyle = isDark ? '#f5f5f7' : '#1d1d1f';
                         ctx.font = rIndex === 0 ? 'bold 13px -apple-system' : '13px -apple-system';
-                        ctx.fillText(cell.innerText.trim().substring(0, 22), x + 12, y + 27);
+                        ctx.fillText(cell.innerText.trim().substring(0, 24), x + 12, y + 27);
                         x += colWidth;
                     });
                     y += rowHeight;
@@ -558,7 +561,6 @@ def home():
             df['Tentative DP'] = pd.to_numeric(df['Tentative DP'].astype(str).str.replace(',', ''), errors='coerce')
         num_cols = df.select_dtypes(include='number').columns.tolist()
         
-        # Prioritize FinalStatus / Final Record Status over general remarks
         status_col = next((c for c in cols if c.lower() in ['finalstatus', 'final record status']), None)
         if not status_col:
             status_col = next((c for c in cols if 'status' in c.lower()), None)
