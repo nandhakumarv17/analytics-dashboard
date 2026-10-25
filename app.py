@@ -681,7 +681,7 @@ def calculate():
             return jsonify({"table_html": '<div style="padding:60px; text-align:center;">No data found for selected filters.</div>', "summary_text": f"<b>Date</b> {date_subtitle} · 0 groups", "kpi_html": kpi_html})
 
         cols = request.form.getlist('columns_cols')
-        show_total = request.form.get('show_row_total'] == 'true'
+        show_total = request.form.get('show_row_total') == 'true'
 
         if not idx or not aggs: return jsonify({"error": "Select rows and metrics from the sidebar."})
         if not val_col: return jsonify({"error": "No numeric data found to aggregate."})
