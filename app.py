@@ -8,7 +8,7 @@ import pandas as pd
 import numpy as np
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 64 * 1024 * 1024  # 64 MB
+app.config["MAX_CONTENT_LENGTH"] = 64 * 1024 * 1024
 
 UPLOAD_DIR = "/tmp/dashboard_uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -23,12 +23,14 @@ GLOBAL_HEAD = """
         --shadow-glass: 0 10px 30px rgba(0,0,0,0.05); --blue-apple: #0071e3; --blue-hover: #0077ed;
         --header-bg: rgba(240, 240, 245, 0.95); --header-text: #1d1d1f;
         --total-bg: rgba(0, 113, 227, 0.08); --total-text: #0071e3;
+        --green: #34c759;
     }
     body.dark-mode {
         --bg-main: #000000; --glass-bg: rgba(28, 28, 30, 0.75); --glass-sidebar: rgba(20, 20, 22, 0.85);
         --glass-border: rgba(255, 255, 255, 0.15); --text-primary: #f5f5f7; --text-secondary: #a1a1a6;
         --shadow-glass: 0 10px 30px rgba(0,0,0,0.5); --header-bg: rgba(44, 44, 46, 0.95); --header-text: #f5f5f7;
         --total-bg: rgba(10, 132, 255, 0.15); --total-text: #5ac8fa;
+        --green: #30d158;
     }
     body { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", sans-serif; background: var(--bg-main); color: var(--text-primary); margin: 0; padding: 0; transition: background 0.3s, color 0.3s; }
     
@@ -49,39 +51,40 @@ GLOBAL_HEAD = """
     .checkbox-group { background: rgba(120,120,128,0.05); border: 1px solid var(--glass-border); border-radius: 12px; padding: 8px; max-height: 220px; overflow-y: auto; }
     .checkbox-item { display: flex; align-items: center; padding: 8px 10px; font-size: 13px; cursor: pointer; border-radius: 8px; font-weight: 500; }
     .checkbox-item:hover { background: rgba(120,120,128,0.1); }
-    .checkbox-item input { margin-right: 10px; accent-color: var(--blue-apple); width: 16px; height: 16px; }
+    .checkbox-item input[type="checkbox"]:not(.ios-switch) { margin-right: 10px; accent-color: var(--blue-apple); width: 16px; height: 16px; }
     .drag-handle { margin-right: 10px; cursor: grab; color: var(--text-secondary); opacity: 0.7; font-size: 16px; }
     
     .btn-segmented { display: flex; background: rgba(120,120,128,0.1); border-radius: 12px; padding: 4px; gap: 4px; }
-    .btn-segmented label { flex: 1; text-align: center; font-size: 13px; font-weight: 600; padding: 6px 16px; border-radius: 8px; cursor: pointer; color: var(--text-secondary); transition: 0.2s; }
+    .btn-segmented label { flex: 1; text-align: center; font-size: 13px; font-weight: 600; padding: 6px 16px; border-radius: 8px; cursor: pointer; color: var(--text-secondary); transition: 0.2s; z-index: 2; }
     .btn-segmented input { display: none; }
-    .btn-segmented input:checked + label { background: var(--bg-main); color: var(--text-primary); box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+    .btn-segmented input:checked + label { color: var(--text-primary); }
     
     .table-container { background: var(--glass-bg); backdrop-filter: blur(20px); border-radius: 16px; border: 1px solid var(--glass-border); flex: 1; overflow: auto; box-shadow: var(--shadow-glass); }
     
-    /* Equal Width Columns & Table UI */
     .excel-table { width: 100%; table-layout: fixed; border-collapse: collapse; font-size: 13px; }
     .excel-table th, .excel-table td { padding: 14px 16px; text-align: left; border-bottom: 1px solid var(--glass-border); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .excel-table th { background: var(--header-bg); color: var(--header-text); font-size: 11px; text-transform: uppercase; position: sticky; top: 0; z-index: 10; font-weight: 700; letter-spacing: 0.05em; }
-    
-    /* Freeze First Column */
     .excel-table th:first-child, .excel-table td:first-child { position: sticky; left: 0; z-index: 20; background: var(--bg-main); font-weight: 600; box-shadow: 1px 0 0 var(--glass-border); }
     .excel-table th:first-child { z-index: 30; background: var(--header-bg); }
-    
-    /* Row Hover */
     .excel-table tbody tr:hover td { background: rgba(120,120,128,0.05); }
     .excel-table tbody tr:hover td:first-child { background: var(--glass-sidebar); }
     
-    /* Total Highlighting */
     .total-col { font-weight: 700 !important; background: var(--total-bg) !important; color: var(--total-text) !important; box-shadow: inset 1px 0 0 rgba(0,113,227,0.2); }
     .excel-table tbody tr:last-child td { font-weight: 700; background: var(--total-bg); border-top: 2px solid var(--blue-apple); color: var(--total-text); position: sticky; bottom: 0; z-index: 15; }
     .excel-table tbody tr:last-child td:first-child { z-index: 25; }
     
-    .preset-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 20px; }
     .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 16px; }
     .kpi { padding: 16px; border-radius: 16px; background: var(--glass-bg); border: 1px solid var(--glass-border); box-shadow: var(--shadow-glass); }
     .kpi-label { font-size: 11px; font-weight: 700; color: var(--text-secondary); text-transform: uppercase; margin-bottom: 6px; }
     .kpi-val { font-size: 24px; font-weight: 700; color: var(--text-primary); }
+
+    /* iOS Toggle Switch */
+    .switch-container { display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; cursor: pointer; }
+    .switch { position: relative; width: 44px; height: 24px; background: rgba(120,120,128,0.3); border-radius: 12px; transition: 0.3s; flex-shrink: 0; }
+    .switch::after { content: ''; position: absolute; top: 2px; left: 2px; width: 20px; height: 20px; background: #fff; border-radius: 50%; box-shadow: 0 2px 4px rgba(0,0,0,0.2); transition: 0.3s; }
+    input:checked + .switch { background: var(--green); }
+    input:checked + .switch::after { transform: translateX(20px); }
+    input.ios-switch { display: none; }
 </style>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Sortable/1.15.0/Sortable.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/dom-to-image/2.6.0/dom-to-image.min.js"></script>
@@ -121,28 +124,25 @@ WORKSPACE_HTML = """
     <div class="nav">
         <div class="nav-brand">Analytics Pro</div>
         <div class="nav-controls">
-            <div class="btn-segmented">
-                <input type="radio" id="view_pivot" name="view_mode" value="pivot" checked onchange="toggleView()">
-                <label for="view_pivot">Pivot</label>
-                <input type="radio" id="view_chart" name="view_mode" value="chart" onchange="toggleView()">
-                <label for="view_chart">Chart</label>
-                <input type="radio" id="view_raw" name="view_mode" value="raw" onchange="toggleView()">
-                <label for="view_raw">Raw Data</label>
-            </div>
             <button class="btn-liquid" onclick="toggleDarkMode()" id="dm-btn">🌙 Dark</button>
             <button class="btn-liquid btn-primary" onclick="exportImage()">📸 Export</button>
+            <button class="btn-liquid" id="dlExcel">📊 Download Excel</button>
         </div>
     </div>
     
     <div class="app-layout">
         <div class="sidebar">
             <form id="config-form">
-                <div class="preset-grid">
-                    <button type="button" class="btn-liquid" onclick="applyPreset('daily_ba')">Daily Sales by BA</button>
-                    <button type="button" class="btn-liquid" onclick="applyPreset('fam_seg')">Family vs Segment</button>
+                <div class="section-title" style="margin-top: 0;">Filters</div>
+                <div class="checkbox-group" style="margin-bottom: 16px; opacity: 0.8;">
+                    <label class="switch-container" style="cursor: not-allowed;" title="Permanently locked">
+                        <span style="font-size: 13px; font-weight: 500;">Final Status: Ok</span>
+                        <input type="checkbox" class="ios-switch" checked disabled>
+                        <div class="switch"></div>
+                    </label>
                 </div>
-
-                <div class="section-title" style="margin-top: 0;">Timeline</div>
+                
+                <div class="section-title">Timeline & Periods</div>
                 <div style="display:flex; gap:8px;">
                     <div style="flex:1;">
                         <label style="font-size:10px; color:var(--text-secondary);">FROM</label>
@@ -178,21 +178,17 @@ WORKSPACE_HTML = """
                         {% endfor %}
                     </div>
 
-                    <div class="section-title">Metrics</div>
+                    <div class="section-title">Metrics & Configuration</div>
                     <div class="checkbox-group">
                         <label class="checkbox-item"><input type="checkbox" name="agg_funcs" value="sum" checked> <span>Sum Total (₹)</span></label>
                         <label class="checkbox-item"><input type="checkbox" name="agg_funcs" value="count"> <span>Count (Qty)</span></label>
-                        <div style="height: 1px; background: var(--glass-border); margin: 8px 0;"></div>
-                        <label class="checkbox-item" id="total_wrapper"><input type="checkbox" id="show_total_cb" name="show_row_total" value="true" checked> <span>Show Grand Totals</span></label>
-                    </div>
-                </div>
-
-                <div id="raw-controls" style="display:none;">
-                    <div class="section-title">Select Raw Columns</div>
-                    <div class="checkbox-group" style="max-height: 500px;">
-                        {% for col in all_cols %}
-                        <label class="checkbox-item"><input type="checkbox" name="raw_cols" value="{{ col }}" checked> <span>{{ col }}</span></label>
-                        {% endfor %}
+                        <div style="height: 1px; background: var(--glass-border); margin: 4px 0;"></div>
+                        
+                        <label class="switch-container" id="total_wrapper">
+                            <span style="font-size: 13px; font-weight: 500;">Show Grand Totals</span>
+                            <input type="checkbox" id="show_total_cb" class="ios-switch" name="show_row_total" value="true" checked>
+                            <div class="switch"></div>
+                        </label>
                     </div>
                 </div>
                 
@@ -203,9 +199,18 @@ WORKSPACE_HTML = """
         </div>
         
         <div class="main-content">
-            <div style="margin-bottom: 20px;">
-                <h1 style="margin:0; font-size: 28px; font-weight: 700; letter-spacing: -0.02em;" id="dashTitle">Executive Dashboard</h1>
-                <div style="font-size: 13px; color: var(--text-secondary); font-weight: 600; margin-top: 4px;" id="dashDate">All Time</div>
+            <div style="margin-bottom: 20px; display: flex; justify-content: space-between; align-items: flex-end;">
+                <div>
+                    <h1 style="margin:0; font-size: 28px; font-weight: 700; letter-spacing: -0.02em;" id="dashTitle">Executive Dashboard</h1>
+                    <div style="font-size: 13px; color: var(--text-secondary); font-weight: 600; margin-top: 4px;" id="dashDate">All Time</div>
+                </div>
+                <div class="btn-segmented" style="position: relative;">
+                    <div class="seg-thumb" style="position: absolute; top: 4px; bottom: 4px; left: 4px; width: calc(50% - 4px); background: var(--bg-main); border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); transition: 0.3s; z-index: 1;"></div>
+                    <input type="radio" id="view_dash" name="view_mode_toggle" value="dashboard" checked onchange="updateDashboard()">
+                    <label for="view_dash">Pivot</label>
+                    <input type="radio" id="view_chart" name="view_mode_toggle" value="chart" onchange="updateDashboard()">
+                    <label for="view_chart">Chart</label>
+                </div>
             </div>
             
             <div id="kpi-banner" class="kpis" hidden></div>
@@ -218,40 +223,20 @@ WORKSPACE_HTML = """
     </div>
 
     <script>
+        // Update segmented toggle background slider
+        document.querySelectorAll('input[name="view_mode_toggle"]').forEach(radio => {
+            radio.addEventListener('change', function() {
+                const thumb = document.querySelector('.seg-thumb');
+                thumb.style.transform = this.value === 'chart' ? 'translateX(100%)' : 'translateX(0)';
+            });
+        });
+
         function toggleDarkMode() { 
             const isDark = document.body.classList.toggle('dark-mode'); 
             document.getElementById('dm-btn').innerText = isDark ? '☀️ Light' : '🌙 Dark';
-            if(document.querySelector('input[name="view_mode"]:checked').value === 'chart') {
-                updateDashboard(); // Re-render chart colors
+            if(document.querySelector('input[name="view_mode_toggle"]:checked').value === 'chart') {
+                updateDashboard();
             }
-        }
-        
-        function toggleView() {
-            const mode = document.querySelector('input[name="view_mode"]:checked').value;
-            document.getElementById('pivot-controls').style.display = mode === 'pivot' || mode === 'chart' ? 'block' : 'none';
-            document.getElementById('raw-controls').style.display = mode === 'raw' ? 'block' : 'none';
-            updateDashboard();
-        }
-
-        function applyPreset(type) {
-            document.getElementById('config-form').reset();
-            document.getElementById('view_pivot').checked = true;
-            toggleView();
-            
-            if(type === 'daily_ba') {
-                checkValue('index_cols', 'BA Name');
-                checkValue('columns_cols', 'Customized Sales Date');
-            } else if(type === 'fam_seg') {
-                checkValue('index_cols', 'Family Name');
-                checkValue('columns_cols', 'SEG1');
-            }
-            updateDashboard();
-        }
-
-        function checkValue(name, val) {
-            document.querySelectorAll(`input[name="${name}"]`).forEach(cb => {
-                if(cb.value === val || cb.value === val.replace('BA Name', 'SPC Name')) cb.checked = true;
-            });
         }
 
         // Initialize drag and drop for hierarchy
@@ -272,7 +257,7 @@ WORKSPACE_HTML = """
         async function updateDashboard() {
             const form = document.getElementById('config-form');
             const formData = new FormData(form);
-            const mode = document.querySelector('input[name="view_mode"]:checked').value;
+            const mode = document.querySelector('input[name="view_mode_toggle"]:checked').value;
             formData.append('view_mode', mode);
 
             // Smart Totals Logic: Disable if mixing sum (₹) and count (qty)
@@ -349,7 +334,6 @@ WORKSPACE_HTML = """
             const area = document.getElementById('capture-area');
             const bgColor = document.body.classList.contains('dark-mode') ? '#1c1c1e' : '#ffffff';
             
-            // Temporarily expand scroll area for full capture
             const origOverflow = area.style.overflow;
             area.style.overflow = 'visible';
             
@@ -363,6 +347,11 @@ WORKSPACE_HTML = """
                     area.style.overflow = origOverflow;
                 });
         }
+        
+        document.getElementById('dlExcel').addEventListener('click', () => { 
+            const fd = new URLSearchParams(new FormData(document.getElementById('config-form'))); 
+            location.href = '/download?' + fd.toString(); 
+        });
     </script>
 </body>
 </html>
@@ -372,7 +361,6 @@ def get_data():
     if os.path.exists(DATA_FILE_PATH):
         try:
             df = pd.read_pickle(DATA_FILE_PATH)
-            # Globally rename SPC to BA
             df.rename(columns=lambda x: str(x).replace('SPC Name', 'BA Name').replace('SPC', 'BA'), inplace=True)
             return df
         except Exception:
@@ -400,8 +388,7 @@ def home():
     if df is not None:
         cols = df.columns.tolist()
         grouping = df.select_dtypes(exclude=['number']).columns.tolist()
-        date_col = next((c for c in ['Customized Sales Date', 'Sale Date'] if c in cols), "")
-        return render_template_string(WORKSPACE_HTML, all_cols=cols, grouping_cols=grouping, default_date_col=date_col)
+        return render_template_string(WORKSPACE_HTML, all_cols=cols, grouping_cols=grouping)
     return render_template_string(UPLOAD_HTML, error=None)
 
 @app.route("/upload", methods=["GET"])
@@ -436,8 +423,16 @@ def calculate():
     df = get_data()
     if df is None: return jsonify({"error": "No data available."}), 400
     
-    mode = request.form.get('view_mode', 'pivot')
+    mode = request.form.get('view_mode', 'dashboard')
     
+    # 1. PERMANENT STATUS FILTER: Final Status == Ok
+    status_cols = [c for c in df.columns if c.lower() in ['finalstatus', 'final record status', 'validation remarks', 'status']]
+    filter_texts = []
+    if status_cols:
+        status_col = status_cols[0]
+        df = df[df[status_col].astype(str).str.lower().str.strip() == 'ok']
+        filter_texts.append("Status: Ok")
+
     # Global Date Formatting (dd-MMM-yy) & Filtering setup
     date_cols = df.select_dtypes(include=['datetime64', 'object']).columns
     date_col_name = None
@@ -449,7 +444,6 @@ def calculate():
         except: pass
 
     # Filter by Date & Weeks
-    filter_texts = []
     start_date = request.form.get('start_date')
     end_date = request.form.get('end_date')
     weeks = request.form.getlist("week_num")
@@ -477,16 +471,14 @@ def calculate():
                 df = df[combined]
             filter_texts.append(f"Weeks: {', '.join([f'W{w}' for w in weeks])}")
 
-    # Convert datetimes to strings for final rendering
     for c in date_cols:
         try:
             if pd.api.types.is_datetime64_any_dtype(df[c]):
                 df[c] = df[c].dt.strftime('%d-%b-%y')
         except: pass
 
-    # Set up Dynamic Titles
     idx = request.form.getlist('index_cols')
-    dynamic_title = f"Sales Analysis by {' & '.join(idx)}" if idx and mode != 'raw' else ("Raw Data Export" if mode == 'raw' else "Executive Dashboard")
+    dynamic_title = f"Sales Analysis by {' & '.join(idx)}" if idx else "Executive Dashboard"
     date_subtitle = " · ".join(filter_texts) if filter_texts else "All Time"
     
     num_cols = df.select_dtypes(include='number').columns.tolist()
@@ -504,20 +496,6 @@ def calculate():
 
     if df.empty:
         return jsonify({"table_html": '<div style="padding:40px; text-align:center;">No data found for selected dates/weeks.</div>', "dyn_title": dynamic_title, "dyn_date": date_subtitle, "kpi_html": kpi_html})
-
-    # --- RAW DATA VIEW ---
-    if mode == 'raw':
-        raw_cols = request.form.getlist('raw_cols')
-        if not raw_cols: return jsonify({"error": "Select at least one column."})
-        sub = df[raw_cols].fillna('')
-        
-        for c in sub.select_dtypes(include='number').columns:
-            sub[c] = sub[c].apply(format_indian_number)
-            
-        return jsonify({
-            "table_html": sub.to_html(classes='excel-table', border=0, index=False),
-            "dyn_title": dynamic_title, "dyn_date": date_subtitle, "kpi_html": kpi_html
-        })
 
     # --- PIVOT / CHART VIEW ---
     cols = request.form.getlist('columns_cols')
@@ -552,7 +530,7 @@ def calculate():
         pivot['TOTAL'] = pivot[metric_cols].sum(axis=1)
         metric_cols.append('TOTAL')
         
-    # Prepare Chart.js Data before totals row is added
+    # Prepare Chart.js Data
     chart_data = None
     if mode == 'chart':
         chart_df = pivot.sort_values(by=metric_cols[0], ascending=False).head(15) if metric_cols else pivot.head(15)
@@ -568,17 +546,30 @@ def calculate():
     # Format numbers
     for c in metric_cols: pivot[c] = pivot[c].apply(format_indian_number)
 
-    # Render HTML and apply total-col CSS class
     html = pivot.to_html(classes='excel-table', border=0, index=False)
     html = html.replace('<th>TOTAL</th>', '<th class="total-col">TOTAL</th>')
     
     if 'TOTAL' in metric_cols:
         html = re.sub(r'(<td>)([\d,-]+)(</td></tr>)', r'<td class="total-col">\2\3', html)
     
+    # Save export version in memory
+    pivot.to_pickle(os.path.join(UPLOAD_DIR, "summary_data.pkl"))
+    
     return jsonify({
         "table_html": html, "chart_data": chart_data,
         "dyn_title": dynamic_title, "dyn_date": date_subtitle, "kpi_html": kpi_html
     })
+
+@app.route("/download", methods=["GET"])
+def download():
+    summary_path = os.path.join(UPLOAD_DIR, "summary_data.pkl")
+    if not os.path.exists(summary_path): return "No data to download", 400
+    df = pd.read_pickle(summary_path)
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, sheet_name='Dashboard_Report')
+    output.seek(0)
+    return send_file(output, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", download_name="Executive_Report.xlsx", as_attachment=True)
 
 if __name__ == '__main__':
     app.run(debug=True)
