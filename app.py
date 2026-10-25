@@ -1570,7 +1570,6 @@ tr.hl-row td{background-image:linear-gradient(var(--hl),var(--hl))!important}
 @keyframes draw{to{stroke-dashoffset:0}}
 @keyframes fade{from{opacity:0}}
 .tip{position:absolute;top:10px;z-index:5;min-width:150px;max-width:280px;padding:10px 12px;border-radius:14px;background:var(--surface);box-shadow:0 0 0 .5px var(--hairline),inset 0 1px 0 var(--spec),var(--shadow-2);-webkit-backdrop-filter:saturate(190%) blur(24px);backdrop-filter:saturate(190%) blur(24px);pointer-events:none;opacity:0;transform:translateY(4px) scale(.97);transition:opacity .15s,transform .25s var(--spring)}
-.tip.show{opacity:1;transform:none}
 .tip-title{margin-bottom:6px;font-size:12px;font-weight:700;overflow-wrap:anywhere}
 .tip-row{display:flex;align-items:center;gap:8px;font-size:12px;line-height:1.7}
 .tip-row i{width:8px;height:8px;border-radius:50%;flex:none}
@@ -1729,7 +1728,7 @@ if (gRange) {
   gRange.addEventListener('input', () => { root.style.setProperty('--glass', gRange.value); store.set('ap-glass', gRange.value); paint(); });
 }
 
-const popovers = [['#glassBtn', '#glassPop'], ['#exportBtn', '#exportMenu']].map(([b, p]) => [$(b), $(p)]).filter(([b, p]) => b && p);
+const popovers = [['#glassBtn', '#glassPop']].map(([b, p]) => [$(b), $(p)]).filter(([b, p]) => b && p);
 function closePops(except){ popovers.forEach(([b, p]) => { if (p !== except) { p.classList.remove('show'); b.setAttribute('aria-expanded', 'false'); } }); }
 popovers.forEach(([b, p]) => b.addEventListener('click', e => {
   e.stopPropagation(); const open = !p.classList.contains('show');
@@ -1737,8 +1736,7 @@ popovers.forEach(([b, p]) => b.addEventListener('click', e => {
 }));
 document.addEventListener('click', e => {
   const insideGlass = e.target.closest('#glassBtn, #glassPop');
-  const insideExport = e.target.closest('#exportBtn, #exportMenu');
-  if (!insideGlass && !insideExport) closePops();
+  if (!insideGlass) closePops();
 });
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closePops(); });
 
@@ -1796,6 +1794,7 @@ const filterMap = boot.map || [];
 const tableWrap = $('#table-wrapper'), tableCard = $('#tableCard'), chartCard = $('#chartCard');
 const bar = $('#table-bar'), kpiEl = $('#kpi-banner'), chartBody = $('#chartBody');
 const dlExcel = $('#dlExcel');
+const dlImage = $('#dlImage');
 const spcReview = $('#spcReview');
 const spcPros = $('#spcPros');
 const spcCons = $('#spcCons');
@@ -1931,6 +1930,7 @@ function render(){
   const mode = view(), d = data;
   tableCard.hidden = mode === 'chart'; chartCard.hidden = mode !== 'chart';
   dlExcel.disabled = !(d && !d.error && lastParams);
+  dlImage.disabled = !(d && !d.error);
 
   const block = html => {
     kpiEl.hidden = true; bar.hidden = true; tableWrap.innerHTML = html; chartBody.innerHTML = html; $('#legend').innerHTML = ''; $('#chartNote').textContent = ''; kpis = []; activeKpi = null; spcReview.hidden = true;
