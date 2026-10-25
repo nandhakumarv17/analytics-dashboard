@@ -485,7 +485,7 @@ def build_pivot(dff, ctx, p, base, want_export):
         return empty_payload(base, title, "No groups to show", "The chosen X columns only contain empty values."), None, 200
     res = g.index.to_frame(index=False)
     vals = g.reset_index(drop=True)
-    metas = [("idx", "")] * len(idx_cols)          # (kind, agg) per result column
+    metas = [("idx", "")] * len(idx_cols)
 
     def put(name, series, meta):
         res[name] = series
@@ -527,7 +527,6 @@ def build_pivot(dff, ctx, p, base, want_export):
     labels_all = [" · ".join(parts) for parts in zip(*[
         col_cells(res[c], fmt_first(c), esc=False) for c in idx_cols])]
 
-    # ── table
     shown = res.head(PIVOT_ROW_LIMIT)
     columns, numeric, foot_cells = [], set(), []
     for i, h in enumerate(headers):
@@ -547,7 +546,6 @@ def build_pivot(dff, ctx, p, base, want_export):
     total_idx = {i for i, m in enumerate(metas) if m[0] == "total"}
     table_html = render_table(headers, columns, "pivot", numeric, len(idx_cols), foot_cells, total_idx)
 
-    # ── KPIs (each one maps to table columns so the UI can highlight them)
     metric_idx = [i for i, m in enumerate(metas) if m[0] == "metric"]
     kpis = []
     for i in metric_idx[:6]:
@@ -561,7 +559,6 @@ def build_pivot(dff, ctx, p, base, want_export):
     kpis.append({"label": "Groups", "value": format_indian_number(n),
                  "sub": " › ".join(idx_cols)[:30], "cols": list(range(len(idx_cols)))})
 
-    # ── chart
     sel, note = list(range(n)), ""
     is_time = pd.api.types.is_datetime64_any_dtype(res[idx_cols[0]])
     if n > CHART_MAX and metric_idx:
@@ -779,10 +776,9 @@ MACROS = """
       <div class="pop-scale"><span>Clear</span><span>Frosted</span></div>
     </div>
   </div>
-  <div class="seg seg-icons" id="themeSeg" data-n="3" role="radiogroup" aria-label="Appearance">
+  <div class="seg seg-icons" id="themeSeg" data-n="2" role="radiogroup" aria-label="Appearance">
     <span class="seg-thumb"></span>
     <input type="radio" name="theme" id="th_light" value="light"><label for="th_light" title="Light" aria-label="Light"><svg class="ic"><use href="#i-sun"/></svg></label>
-    <input type="radio" name="theme" id="th_auto" value="auto"><label for="th_auto" title="Match system" aria-label="Automatic"><svg class="ic"><use href="#i-auto"/></svg></label>
     <input type="radio" name="theme" id="th_dark" value="dark"><label for="th_dark" title="Dark" aria-label="Dark"><svg class="ic"><use href="#i-moon"/></svg></label>
   </div>
   {% if layout %}
@@ -820,9 +816,7 @@ UPLOAD_HTML = """<!doctype html>
 WORKSPACE_HTML = """<!doctype html>
 <html lang="en"><head><title>Analytics Pro</title>""" + HEAD + """</head>
 <body>
-<script>(function(){var m=null;try{m=localStorage.getItem('ap-mobile')}catch(e){}
-var mob=m===null?innerWidth<=768:m==='1';document.body.classList.add(mob?'mobile-mode':'desktop-mode');
-if(mob)document.body.classList.add('sidebar-collapsed');})();</script>
+<script>(function(){var w=window.innerWidth,mode=w<=768?'mobile':w<=1024?'tablet':'desktop';document.body.classList.add(mode+'-mode');})();</script>
 """ + MACROS + """
 {{ sprite|safe }}
 
@@ -1065,10 +1059,8 @@ button{cursor:pointer;-webkit-tap-highlight-color:transparent}
 .ic{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex:none}
 .ic-lg{width:44px;height:44px;stroke-width:1.4}
 .muted{margin:0;font-size:13px;color:var(--label-3)}
-/* Liquid Glass material: blur + saturation + specular top edge */
 .glass{-webkit-backdrop-filter:saturate(190%) blur(26px);backdrop-filter:saturate(190%) blur(26px)}
 
-/* ═══════ nav ═══════ */
 .nav{position:fixed;inset:0 0 auto 0;height:var(--nav-h);z-index:1000;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:0 18px;background:var(--nav-bg);box-shadow:0 .5px 0 var(--hairline),inset 0 -1px 0 var(--spec)}
 .nav-left,.nav-right{display:flex;align-items:center;gap:10px}
 .brand{display:flex;align-items:center;gap:10px;font-size:15px;font-weight:600;letter-spacing:-.02em;white-space:nowrap}
@@ -1083,7 +1075,7 @@ body.loading #loadbar{opacity:1}
 body.loading #loadbar::after{animation:slide 1.1s var(--ease) infinite}
 @keyframes slide{from{transform:translateX(-100%)}to{transform:translateX(250%)}}
 
-/* popover (glass slider) */
+/* popover */
 .menu-wrap{position:relative}
 .popover{position:absolute;right:0;top:calc(100% + 10px);z-index:60;width:240px;padding:14px 16px 12px;border-radius:var(--r-md);background:var(--surface);box-shadow:0 0 0 .5px var(--hairline),inset 0 1px 0 var(--spec),var(--shadow-2);-webkit-backdrop-filter:saturate(190%) blur(30px);backdrop-filter:saturate(190%) blur(30px);transform-origin:top right;opacity:0;visibility:hidden;pointer-events:none;transform:scale(.88) translateY(-8px);transition:opacity .2s,transform .4s var(--spring),visibility 0s .4s}
 .popover.show{opacity:1;visibility:visible;pointer-events:auto;transform:none;transition-delay:0s}
@@ -1097,7 +1089,7 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:26px;heigh
 input[type=range]::-moz-range-thumb{width:26px;height:26px;border:0;border-radius:50%;background:#fff;box-shadow:0 2px 6px rgba(0,0,0,.3)}
 input[type=range]:active::-webkit-slider-thumb{transform:scale(1.12)}
 
-/* ═══════ segmented control ═══════ */
+/* segmented */
 .seg{--n:2;--i:0;position:relative;display:inline-grid;grid-auto-flow:column;grid-auto-columns:1fr;padding:2px;border-radius:12px;background:var(--fill);isolation:isolate}
 .seg[data-n="3"]{--n:3}
 .seg:has(input:nth-of-type(2):checked){--i:1}
@@ -1113,7 +1105,7 @@ input[type=range]:active::-webkit-slider-thumb{transform:scale(1.12)}
 .seg input:checked+label{color:var(--label)}
 .seg input:focus-visible+label{outline:3px solid color-mix(in srgb,var(--blue) 50%,transparent)}
 
-/* iOS switch */
+/* switch */
 .ios-switch{display:flex;align-items:center;gap:8px;cursor:pointer;font-size:12px;font-weight:500;color:var(--label-2);user-select:none}
 .ios-switch input,.row.switch input{position:absolute;opacity:0;pointer-events:none}
 .track{position:relative;flex:none;width:51px;height:31px;border-radius:16px;background:var(--fill);transition:background .3s var(--ease)}
@@ -1127,11 +1119,13 @@ input[type=range]:active::-webkit-slider-thumb{transform:scale(1.12)}
 .nav .ios-switch input:checked+.track .knob{transform:translateX(18px)}
 .nav .ios-switch:active .knob{width:28px}.nav .ios-switch:active input:checked+.track .knob{transform:translateX(12px)}
 
-/* ═══════ layout ═══════ */
+/* layouts */
 body.desktop-mode{overflow:hidden}
 .desktop-mode .app{display:flex;height:100vh;padding-top:var(--nav-h)}
+.tablet-mode .app{display:flex;height:100vh;padding-top:var(--nav-h)}
 .mobile-mode .app{display:block;padding-top:var(--nav-h);max-width:520px;margin:0 auto}
 .sidebar{display:flex;flex-direction:column;flex:none;width:var(--sidebar-w,350px);min-width:270px;margin:12px 0 12px 12px;height:calc(100vh - var(--nav-h) - 24px);border-radius:var(--r-xl);background:var(--surface);box-shadow:0 0 0 .5px var(--hairline),inset 0 1px 0 var(--spec),var(--shadow-1);overflow:hidden}
+.tablet-mode .sidebar{width:320px;min-width:300px}
 .sidebar-head{padding:20px 20px 10px}
 .head-row{display:flex;align-items:center;justify-content:space-between}
 .sidebar-head h2{margin:0;font-size:26px;font-weight:700;letter-spacing:-.03em;line-height:1.1}
@@ -1145,7 +1139,7 @@ body.desktop-mode{overflow:hidden}
 .main{flex:1;min-width:0;height:calc(100vh - var(--nav-h));overflow-y:auto;padding:16px 28px 40px 6px}
 .page-head{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:18px}
 
-/* ═══════ accordion ═══════ */
+/* accordion */
 .acc{margin-bottom:8px;border-radius:var(--r-md);background:var(--surface-solid);box-shadow:0 0 0 .5px var(--hairline);overflow:hidden;transition:opacity .3s,filter .3s}
 .acc.is-disabled{opacity:.4;filter:saturate(.3);pointer-events:none}
 .acc-head{display:flex;align-items:center;gap:8px;width:100%;padding:13px 14px;border:0;background:none;text-align:left;font-size:14px;font-weight:600;transition:background .2s}
@@ -1161,7 +1155,7 @@ body.desktop-mode{overflow:hidden}
 .badge{min-width:22px;height:22px;padding:0 7px;display:grid;place-items:center;border-radius:11px;background:var(--blue);color:#fff;font-size:12px;font-weight:600;animation:pop .4s var(--spring)}
 @keyframes pop{from{transform:scale(.4);opacity:0}to{transform:none;opacity:1}}
 
-/* lists */
+/* list controls */
 .tools{display:flex;align-items:center;gap:8px;margin:0 0 10px}
 .tools.end{justify-content:flex-end}
 .tool-btns{display:flex;gap:6px}
@@ -1223,7 +1217,7 @@ body.desktop-mode{overflow:hidden}
 .wk input:checked+.wk-chip small{color:rgba(255,255,255,.8)}
 .wk input:focus-visible+.wk-chip{outline:3px solid color-mix(in srgb,var(--blue) 50%,transparent);outline-offset:1px}
 
-/* ═══════ buttons ═══════ */
+/* buttons */
 .btn-primary{display:inline-flex;align-items:center;justify-content:center;gap:8px;height:40px;padding:0 22px;border:0;border-radius:980px;background:var(--blue);color:#fff;font-size:14px;font-weight:500;box-shadow:inset 0 1px 0 rgba(255,255,255,.3),0 4px 14px color-mix(in srgb,var(--blue) 30%,transparent);transition:background .2s,transform .35s var(--spring),box-shadow .2s}
 .btn-primary:hover{background:var(--blue-h)} .btn-primary:active{background:var(--blue-a);transform:scale(.95)}
 .btn-primary:disabled{opacity:.35;cursor:not-allowed;box-shadow:none;transform:none}
@@ -1241,7 +1235,7 @@ body.desktop-mode{overflow:hidden}
 .menu-item:hover{background:var(--blue);color:#fff}
 .menu-item:disabled{opacity:.4;pointer-events:none}
 
-/* ═══════ report ═══════ */
+/* report */
 #report-area{max-width:1500px}
 .report-head{margin-bottom:16px}
 .report-title{margin:0 0 10px;font-size:30px;font-weight:700;letter-spacing:-.032em;line-height:1.12;text-wrap:balance}
@@ -1266,19 +1260,17 @@ body.desktop-mode{overflow:hidden}
 .table-card{display:flex;flex-direction:column}
 .table-bar{display:flex;justify-content:space-between;gap:16px;padding:11px 18px;font-size:12px;font-weight:500;color:var(--label-2);background:var(--th-bg);border-bottom:.5px solid var(--hairline)}
 .table-bar span:last-child{color:var(--label-3);font-weight:400}
-.table-scroll{max-height:calc(100vh - 330px);min-height:140px;overflow:auto;-webkit-overflow-scrolling:touch;transition:opacity .25s}
+.table-scroll{max-height:calc(100vh - 330px);min-height:180px;height:clamp(220px,58vh,760px);overflow:auto;-webkit-overflow-scrolling:touch;transition:opacity .25s}
 .table-card.updating .table-scroll,.chart-card.updating .chart-body{opacity:.5}
-.excel-table{width:max-content;min-width:100%;border-collapse:separate;border-spacing:0;font-size:13.5px;font-variant-numeric:tabular-nums}
+.excel-table{width:max-content;min-width:100%;border-collapse:separate;border-spacing:0;font-size:13.5px;font-variant-numeric:tabular-nums;table-layout:auto}
 .excel-table th,.excel-table td{padding:12px 18px;border-bottom:.5px solid var(--hairline);text-align:left;white-space:nowrap}
 .excel-table td{background-color:var(--table-bg)}
 .excel-table .num{text-align:right}
-/* header: frosted material, small caps */
 .excel-table thead th{position:sticky;top:0;z-index:3;padding:13px 18px;background:var(--th-bg);-webkit-backdrop-filter:saturate(180%) blur(18px);backdrop-filter:saturate(180%) blur(18px);border-bottom:1px solid var(--hairline-strong);font-size:11px;font-weight:700;letter-spacing:.055em;text-transform:uppercase;color:var(--label-2);cursor:pointer;user-select:none;transition:color .2s,background .2s}
 .excel-table thead th:hover{color:var(--blue)}
 .excel-table th[data-dir]{color:var(--blue)}
 .excel-table th[data-dir=asc]::after{content:" ▲";font-size:8px}
 .excel-table th[data-dir=desc]::after{content:" ▼";font-size:8px}
-/* footer: tinted accent material, pinned */
 .excel-table tfoot td{position:sticky;bottom:0;z-index:3;padding:14px 18px;background:var(--foot-bg);border-top:1.5px solid var(--blue);border-bottom:0;font-weight:700;color:var(--label);-webkit-backdrop-filter:blur(18px);backdrop-filter:blur(18px)}
 .excel-table tfoot td:first-child{font-size:11px;letter-spacing:.055em;text-transform:uppercase;color:var(--blue)}
 .excel-table td:first-child,.excel-table th:first-child{position:sticky;left:0}
@@ -1290,18 +1282,27 @@ body.desktop-mode{overflow:hidden}
 .excel-table tbody tr:last-child td{border-bottom:0}
 .excel-table th.total-col{color:var(--blue)}
 .excel-table td.total-col{font-weight:600;border-left:.5px solid var(--hairline);background-image:linear-gradient(var(--blue-tint),var(--blue-tint))}
+.excel-table thead th.highlight,
+.excel-table tfoot td.highlight,
+.excel-table td.total-col.highlight{
+  background-image:linear-gradient(var(--hl),var(--hl));
+  color:var(--blue);
+}
+.excel-table thead th.highlight{color:var(--blue)}
+.excel-table tfoot td.highlight{color:var(--blue)}
 .pct-positive{color:var(--pos);font-weight:600}.pct-negative{color:var(--neg);font-weight:600}.pct-neutral{color:var(--label-3)}
 .resizer{position:absolute;top:0;right:0;bottom:0;width:10px;cursor:col-resize;touch-action:none}
 .resizer::after{content:"";position:absolute;right:4px;top:28%;bottom:28%;width:1px;background:var(--hairline-strong);transition:background .2s,width .2s}
 .resizer:hover::after{background:var(--blue);width:2px}
 tr.hl-row td{background-image:linear-gradient(var(--hl),var(--hl))!important}
-.empty{display:grid;justify-items:center;gap:6px;padding:80px 24px;text-align:center;color:var(--label-3)}
+.empty{display:grid;justify-items:center;gap:8px;padding:72px 24px;text-align:center;border-radius:20px;background:var(--fill-2);border:1px dashed var(--hairline-strong);color:var(--label-3)}
 .empty .ic{width:46px;height:46px;stroke-width:1.3;opacity:.65}
-.empty h3{margin:10px 0 0;font-size:20px;font-weight:600;letter-spacing:-.02em;color:var(--label)}
-.empty p{max-width:360px;margin:0;font-size:14px}
+.empty h3{margin:8px 0 0;font-size:20px;font-weight:600;letter-spacing:-.02em;color:var(--label)}
+.empty p{max-width:420px;margin:0;font-size:14px;line-height:1.6}
+.empty.err{border-color:color-mix(in srgb,var(--neg) 35%,transparent);background:color-mix(in srgb,var(--neg) 8%,transparent)}
 .empty.err h3{color:var(--neg)}
 
-/* ═══════ chart ═══════ */
+/* chart */
 .chart-bar{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;padding:14px 18px 6px}
 .legend{display:flex;flex-wrap:wrap;gap:6px}
 .lg{display:inline-flex;align-items:center;gap:7px;height:28px;padding:0 12px;border:0;border-radius:14px;background:var(--fill-2);box-shadow:inset 0 0 0 .5px var(--hairline);font-size:12px;font-weight:500;transition:opacity .25s,background .2s,transform .3s var(--spring)}
@@ -1309,9 +1310,9 @@ tr.hl-row td{background-image:linear-gradient(var(--hl),var(--hl))!important}
 .lg:active{transform:scale(.94)}
 .lg.off{opacity:.45}.lg.off i{background:var(--label-3)!important}
 .chart-ctl{display:flex;gap:8px;flex-wrap:wrap}
-.chart-body{position:relative;display:flex;padding:6px 14px 6px 8px;transition:opacity .25s}
+.chart-body{position:relative;display:flex;min-height:420px;height:clamp(420px,52vh,760px);padding:6px 14px 6px 8px;transition:opacity .25s}
 .yaxis{flex:none}
-.plot-scroll{flex:1;min-width:0;overflow-x:auto;overflow-y:hidden}
+.plot-scroll{flex:1;min-width:0;overflow:auto;overflow-y:hidden;width:100%}
 .plot,.yaxis{display:block;overflow:visible}
 .plot text,.yaxis text{font-family:var(--font);font-size:11px;fill:var(--label-3)}
 .plot .xtick{fill:var(--label-2)}
@@ -1344,7 +1345,7 @@ tr.hl-row td{background-image:linear-gradient(var(--hl),var(--hl))!important}
 .chart-note{padding:0 18px 14px;font-size:12px;color:var(--label-3);min-height:14px}
 .chart-note:empty{padding:0}
 
-/* ═══════ upload page ═══════ */
+/* upload page */
 .upload-wrap{max-width:540px;margin:0 auto;padding:calc(var(--nav-h) + 72px) 20px 48px;animation:rise .7s var(--ease) both}
 .hero-title{margin:0 0 10px;text-align:center;font-size:clamp(38px,8vw,60px);font-weight:700;letter-spacing:-.04em;line-height:1.04}
 .hero-sub{margin:0 0 34px;text-align:center;font-size:18px;color:var(--label-3)}
@@ -1367,7 +1368,7 @@ tr.hl-row td{background-image:linear-gradient(var(--hl),var(--hl))!important}
 .preview-modal .btn-primary{background:#fff;color:#1d1d1f}
 @keyframes fadeIn{from{opacity:0}to{opacity:1}}
 
-/* ═══════ mobile layout ═══════ */
+/* mobile */
 .mobile-mode .sidebar{width:auto;min-width:0;height:auto;max-height:5000px;margin:10px 12px 0;transition:max-height .6s var(--ease),opacity .3s,margin .5s var(--ease),visibility 0s}
 .mobile-mode.sidebar-collapsed .sidebar{max-height:0;opacity:0;visibility:hidden;margin-top:0;box-shadow:none;transition:max-height .5s var(--ease),opacity .3s,margin .5s var(--ease),visibility 0s .5s}
 .mobile-mode .sidebar-scroll{overflow:visible}
@@ -1384,13 +1385,14 @@ tr.hl-row td{background-image:linear-gradient(var(--hl),var(--hl))!important}
 .mobile-mode .kpis{grid-auto-columns:minmax(150px,46%)}
 .mobile-mode .kpi-val{font-size:23px}
 .mobile-mode .nav .sw-text{display:none}
+.tablet-mode .nav .sw-text{display:none}
 @media (max-width:560px){.nav .sw-text,#glassWrap{display:none}.nav{padding:0 12px}.brand{font-size:14px}}
 
 ::-webkit-scrollbar{width:8px;height:8px}
 ::-webkit-scrollbar-track{background:transparent}
 ::-webkit-scrollbar-thumb{background:var(--hairline-strong);border-radius:8px;border:2px solid transparent;background-clip:content-box}
 
-/* ═══════ export mode: flat, solid, in the current theme/layout ═══════ */
+/* export mode */
 body.exporting{--surface:var(--surface-solid)}
 body.exporting::before{display:none}
 body.exporting *{-webkit-backdrop-filter:none!important;backdrop-filter:none!important;animation:none!important;transition:none!important}
@@ -1417,6 +1419,7 @@ const store = {
   get(k){ try { return localStorage.getItem(k); } catch (e) { return null; } },
   set(k, v){ try { localStorage.setItem(k, v); } catch (e) {} }
 };
+
 function toast(msg){
   const t = document.createElement('div');
   t.className = 'toast'; t.textContent = msg; body.appendChild(t);
@@ -1424,22 +1427,39 @@ function toast(msg){
   setTimeout(() => { t.classList.remove('in'); setTimeout(() => t.remove(), 400); }, 3200);
 }
 
-/* ═══════ appearance: theme + Liquid Glass transparency ═══════ */
-const themeNow = store.get('ap-theme') || 'auto';
+function applyViewportMode(){
+  const w = window.innerWidth;
+  const mode = w <= 768 ? 'mobile' : w <= 1024 ? 'tablet' : 'desktop';
+  body.classList.remove('mobile-mode','tablet-mode','desktop-mode');
+  body.classList.add(mode + '-mode');
+
+  if (window.matchMedia('(pointer: coarse)').matches) {
+    body.classList.add('touch-device');
+  } else {
+    body.classList.remove('touch-device');
+  }
+}
+window.addEventListener('resize', applyViewportMode);
+applyViewportMode();
+
+/* theme */
+const themeNow = store.get('ap-theme') || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
 $$('#themeSeg input').forEach(i => {
   i.checked = i.value === themeNow;
   i.addEventListener('change', () => {
     if (!i.checked) return;
-    if (i.value === 'auto') delete root.dataset.theme; else root.dataset.theme = i.value;
+    root.dataset.theme = i.value;
     store.set('ap-theme', i.value);
   });
 });
+
 const gRange = $('#glassRange');
 if (gRange) {
   const paint = () => gRange.style.setProperty('--p', ((gRange.value - gRange.min) / (gRange.max - gRange.min) * 100) + '%');
   gRange.value = parseInt(store.get('ap-glass') || '72', 10) || 72; paint();
   gRange.addEventListener('input', () => { root.style.setProperty('--glass', gRange.value); store.set('ap-glass', gRange.value); paint(); });
 }
+
 const popovers = [['#glassBtn', '#glassPop'], ['#exportBtn', '#exportMenu']].map(([b, p]) => [$(b), $(p)]).filter(([b, p]) => b && p);
 function closePops(except){
   popovers.forEach(([b, p]) => {
@@ -1456,13 +1476,11 @@ popovers.forEach(([b, p]) => b.addEventListener('click', e => {
 document.addEventListener('click', e => {
   const insideGlass = e.target.closest('#glassBtn, #glassPop');
   const insideExport = e.target.closest('#exportBtn, #exportMenu');
-  if (!insideGlass && !insideExport) {
-    closePops();
-  }
+  if (!insideGlass && !insideExport) closePops();
 });
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closePops(); });
 
-/* ═══════ upload page ═══════ */
+/* upload */
 const dz = $('#dropzone');
 if (dz) {
   const input = $('#file'), title = $('#dzTitle'), sub = $('#dzSub'), btn = $('#launchBtn');
@@ -1484,7 +1502,7 @@ if (dz) {
 const form = $('#config-form');
 if (!form) return;
 
-/* ═══════ layout switch (desktop / mobile) ═══════ */
+/* mobile switch */
 const sw = $('#mobileSwitch');
 const sidebarToggle = $('#sidebarToggle');
 
@@ -1502,6 +1520,7 @@ if (sw) {
     const on = sw.checked;
     body.classList.toggle('mobile-mode', on);
     body.classList.toggle('desktop-mode', !on);
+    body.classList.toggle('tablet-mode', !on && window.innerWidth <= 1024);
     body.classList.toggle('sidebar-collapsed', on);
     store.set('ap-mobile', on ? '1' : '0');
     syncMobileState();
@@ -1520,21 +1539,21 @@ if (sidebarToggle) {
   });
 }
 
-/* sidebar resizer */
 const rz = $('#sidebarResizer');
 const savedW = store.get('ap-sidebar-w');
 if (savedW) root.style.setProperty('--sidebar-w', savedW + 'px');
-rz.addEventListener('pointerdown', e => { rz.setPointerCapture(e.pointerId); rz.classList.add('resizing'); body.style.cursor = 'col-resize'; body.style.userSelect = 'none'; });
-rz.addEventListener('pointermove', e => { if (rz.hasPointerCapture(e.pointerId)) root.style.setProperty('--sidebar-w', Math.min(560, Math.max(270, e.clientX - 12)) + 'px'); });
-const endResize = () => {
-  rz.classList.remove('resizing'); body.style.cursor = ''; body.style.userSelect = '';
-  const w = parseInt(getComputedStyle(root).getPropertyValue('--sidebar-w'), 10); if (w) store.set('ap-sidebar-w', w);
-  redrawSoon();
-};
-rz.addEventListener('pointerup', endResize); rz.addEventListener('pointercancel', endResize);
-rz.addEventListener('dblclick', () => { root.style.removeProperty('--sidebar-w'); store.set('ap-sidebar-w', ''); redrawSoon(); });
+if (rz) {
+  rz.addEventListener('pointerdown', e => { rz.setPointerCapture(e.pointerId); rz.classList.add('resizing'); body.style.cursor = 'col-resize'; body.style.userSelect = 'none'; });
+  rz.addEventListener('pointermove', e => { if (rz.hasPointerCapture(e.pointerId)) root.style.setProperty('--sidebar-w', Math.min(560, Math.max(270, e.clientX - 12)) + 'px'); });
+  const endResize = () => {
+    rz.classList.remove('resizing'); body.style.cursor = ''; body.style.userSelect = '';
+    const w = parseInt(getComputedStyle(root).getPropertyValue('--sidebar-w'), 10); if (w) store.set('ap-sidebar-w', w);
+    redrawSoon();
+  };
+  rz.addEventListener('pointerup', endResize); rz.addEventListener('pointercancel', endResize);
+  rz.addEventListener('dblclick', () => { root.style.removeProperty('--sidebar-w'); store.set('ap-sidebar-w', ''); redrawSoon(); });
+}
 
-/* ═══════ state ═══════ */
 const boot = JSON.parse($('#boot').textContent || '{}');
 const filterMap = boot.map || [];
 const tableWrap = $('#table-wrapper'), tableCard = $('#tableCard'), chartCard = $('#chartCard');
@@ -1544,6 +1563,7 @@ const view = () => $('input[name="view_mode_toggle"]:checked').value;
 const order = { index_cols: [], value_cols: [] };
 let data = null, dataMode = null, lastParams = null, ctrl = null, timer = null;
 let periodLabel = '', activePreset = null, activeKpi = null, kpis = [];
+
 const emptyBlock = (t, m, err) => `
   <div class="empty${err ? ' err' : ''}">
     <svg class="ic"><use href="#i-chart"/></svg>
@@ -1576,7 +1596,7 @@ function updateBadges(){
   });
 }
 
-/* ═══════ period presets ═══════ */
+/* presets */
 const parseISO = s => { const [y, m, d] = s.split('-').map(Number); return new Date(y, m - 1, d); };
 const iso = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 const addD = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x; };
@@ -1617,7 +1637,6 @@ function applyPreset(key){
   $('#start_date').value = iso(s); $('#end_date').value = iso(e);
 }
 
-/* ═══════ requests ═══════ */
 function buildParams(server){
   const fd = new FormData(form);
   ['index_cols', 'value_cols'].forEach(n => { fd.delete(n); order[n].forEach(v => fd.append(n, v)); });
@@ -1652,20 +1671,18 @@ async function update(){
   }
 }
 
-/* ═══════ rendering ═══════ */
 function setHead(title, period, filters){
   $('#reportTitle').textContent = title; document.title = title + ' · Analytics Pro';
   $('#periodText').textContent = period || ''; $('#periodPill').hidden = !period;
   $('#filterPills').innerHTML = (filters || []).map(([k, v]) => `<span class="pill"><b>${esc(k)}</b> ${esc(v)}</span>`).join('');
 }
+
 function render(){
   const mode = view(), d = data;
   tableCard.hidden = mode === 'chart';
   chartCard.hidden = mode !== 'chart';
 
-  $('#exportCap').textContent =
-    `Exports the ${mode === 'raw' ? 'raw data' : mode === 'chart' ? 'chart' : 'pivot'} · ${body.classList.contains('mobile-mode') ? 'mobile' : 'desktop'} layout`;
-
+  $('#exportCap').textContent = `Exports the ${mode === 'raw' ? 'raw data' : mode === 'chart' ? 'chart' : 'pivot'} · ${body.classList.contains('mobile-mode') ? 'mobile' : body.classList.contains('tablet-mode') ? 'tablet' : 'desktop'} layout`;
   dlExcel.disabled = !(d && !d.error && lastParams);
 
   if (mode === 'chart') {
@@ -1697,7 +1714,8 @@ function render(){
   setHead(d.title, d.period, d.filters);
 
   const prevLabel = kpis[activeKpi] && kpis[activeKpi].label;
-  kpis = d.kpis || []; activeKpi = Math.max(-1, kpis.findIndex(k => k.label === prevLabel)); if (activeKpi < 0) activeKpi = null;
+  kpis = d.kpis || [];
+  activeKpi = Math.max(-1, kpis.findIndex(k => k.label === prevLabel)); if (activeKpi < 0) activeKpi = null;
   kpiEl.hidden = !kpis.length;
   kpiEl.innerHTML = kpis.map((k, i) => `<button type="button" class="kpi${k.cols && k.cols.length ? '' : ' static'}" data-i="${i}"><span class="kpi-label">${esc(k.label)}</span><span class="kpi-val" title="${esc(k.value)}">${esc(k.value)}</span><span class="kpi-sub">${esc(k.sub || '')}</span></button>`).join('');
 
@@ -1711,7 +1729,6 @@ function render(){
   applyHighlight();
 }
 
-/* KPI buttons highlight the matching columns (table) and series (chart) */
 const hlStyle = document.head.appendChild(document.createElement('style'));
 kpiEl.addEventListener('click', e => {
   const b = e.target.closest('.kpi'); if (!b) return;
@@ -1723,18 +1740,35 @@ function applyHighlight(){
   $$('.kpi', kpiEl).forEach((b, i) => b.classList.toggle('active', i === activeKpi));
   const tbl = $('.excel-table', tableWrap);
   let css = '';
+
   if (tbl) {
     tbl.classList.toggle('hl', !!k);
+
+    $$('.excel-table thead th', tableWrap).forEach(th => th.classList.remove('highlight'));
+    $$('.excel-table tfoot td', tableWrap).forEach(td => td.classList.remove('highlight'));
+
     if (k) {
       const nidx = Math.max(+tbl.dataset.nidx || 0, 1);
       const sel = k.cols.map(c => `:nth-child(${c + 1})`).join(',');
-      css = `.excel-table.hl :is(td,th):not(:nth-child(-n+${nidx})){color:var(--label-3)!important}` +
-            `.excel-table.hl td:not(:nth-child(-n+${nidx})) span{opacity:.5}` +
-            `.excel-table.hl :is(td,th):is(${sel}){color:var(--label)!important;background-image:linear-gradient(var(--hl),var(--hl))}` +
-            `.excel-table.hl th:is(${sel}){color:var(--blue)!important}` +
-            `.excel-table.hl td:is(${sel}) span{opacity:1}`;
+
+      css = `
+        .excel-table.hl :is(td,th):not(:nth-child(-n+${nidx})){color:var(--label-3)!important}
+        .excel-table.hl td:not(:nth-child(-n+${nidx})) span{opacity:.5}
+        .excel-table.hl :is(td,th):is(${sel}){color:var(--label)!important;background-image:linear-gradient(var(--hl),var(--hl))}
+        .excel-table.hl th:is(${sel}){color:var(--blue)!important}
+        .excel-table.hl td:is(${sel}) span{opacity:1}
+      `;
+
+      $$('.excel-table thead th', tableWrap).forEach((th, idx) => {
+        if (k.cols.includes(idx)) th.classList.add('highlight');
+      });
+
+      $$('.excel-table tfoot td', tableWrap).forEach((td, idx) => {
+        if (k.cols.includes(idx)) td.classList.add('highlight');
+      });
     }
   }
+
   hlStyle.textContent = css;
   const set = k ? new Set(k.cols) : null;
   const match = !!(set && chartData && chartData.series.some(s => set.has(s.col)));
@@ -1746,7 +1780,6 @@ function applyHighlight(){
   }
 }
 
-/* ═══════ interactions ═══════ */
 form.addEventListener('submit', e => e.preventDefault());
 form.addEventListener('change', e => {
   const t = e.target, n = t.name;
@@ -1810,7 +1843,6 @@ $('#resetBtn').addEventListener('click', () => {
   $('#view_pivot').checked = true; schedule(0);
 });
 
-/* table: sortable headers, resizable columns */
 function addResizers(){
   $$('.excel-table th', tableWrap).forEach(th => { if (!th.querySelector('.resizer')) th.appendChild(Object.assign(document.createElement('div'), { className: 'resizer' })); });
 }
@@ -1845,7 +1877,7 @@ tableWrap.addEventListener('pointerdown', e => {
   e.preventDefault(); e.stopPropagation();
 });
 
-/* ═══════ chart (interactive SVG) ═══════ */
+/* chart */
 let ctype = 'bar', csort = 'natural', hidden = new Set(), chartData = null, chartSig = '', chartX = '', redrawT = null, uid = 0;
 const fmtFull = v => v == null ? '–' : (Math.abs(v) < 100 && v % 1 !== 0 ? v.toLocaleString('en-IN', { maximumFractionDigits: 2 }) : Math.round(v).toLocaleString('en-IN'));
 const trim1 = n => String(Math.round(n * 10) / 10);
@@ -1887,7 +1919,12 @@ window.addEventListener('resize', redrawSoon);
 
 function drawChart(animate){
   const d = data && data.chart;
-  if (!d || !d.series.length || !d.labels.length) { chartData = null; chartBody.innerHTML = emptyBlock('Nothing to chart', 'Choose at least one X column and a measure.'); $('#chartNote').textContent = ''; return; }
+  if (!d || !d.series.length || !d.labels.length) {
+    chartData = null;
+    chartBody.innerHTML = emptyBlock('Nothing to chart', 'Choose at least one X column and a measure.', false);
+    $('#chartNote').textContent = '';
+    return;
+  }
   const sig = d.series.map(s => s.name).join('|');
   if (sig !== chartSig) {
     chartSig = sig; hidden = new Set(); const a = d.series[0].agg;
@@ -1972,51 +2009,84 @@ function drawChart(animate){
   });
   hit.addEventListener('pointerleave', hide);
   scroller.scrollLeft = 0;
+
+  if ('ResizeObserver' in window) {
+    const ro = new ResizeObserver(() => {
+      if (!chartCard.hidden && chartData) {
+        drawChart(false);
+        applyHighlight();
+      }
+    });
+    try { ro.observe(chartBody); } catch (e) {}
+  }
 }
 function drawLegendFor(d){ chartData = d; drawLegend(); }
 
-/* ═══════ export (current view · current theme · current layout) ═══════ */
+/* export image */
 dlExcel.addEventListener('click', () => { closePops(); if (lastParams) location.href = '/download?' + lastParams; });
+
 let d2i = null;
 const loadD2I = () => d2i || (d2i = new Promise((ok, fail) => {
   const s = document.createElement('script');
   s.src = 'https://cdnjs.cloudflare.com/ajax/libs/dom-to-image/2.6.0/dom-to-image.min.js';
   s.onload = ok; s.onerror = () => { d2i = null; fail(new Error('load')); }; document.head.appendChild(s);
 }));
+
 $('#dlImage').addEventListener('click', async () => {
   closePops();
   const area = $('#report-area'), mode = view();
+  const titleText = ($('#reportTitle').textContent || 'Report').replace(/[^A-Za-z0-9]+/g, '_').replace(/^_|_$/g, '').slice(0, 70) || 'Report';
+  const fileName = `${titleText}_${mode}.png`;
+
   try {
     await loadD2I();
-    body.classList.add('exporting'); area.style.width = '';
+    body.classList.add('exporting');
     if (mode === 'chart') { drawChart(false); applyHighlight(); }
-    await sleep(380);
-    let need = area.offsetWidth;
-    if (mode === 'chart') {
-      const ya = $('.yaxis', chartBody), pl = $('.plot', chartBody);
-      if (ya && pl) need = Math.max(need, ya.getBoundingClientRect().width + pl.getBoundingClientRect().width + (area.getBoundingClientRect().width - chartBody.getBoundingClientRect().width) + 24);
-    } else {
-      const t = $('.excel-table', tableWrap);
-      if (t) need = Math.max(need, t.getBoundingClientRect().width + (area.getBoundingClientRect().width - tableWrap.getBoundingClientRect().width) + 2);
-    }
-    area.style.width = Math.ceil(need) + 'px'; await sleep(120);
-    const w = area.offsetWidth, h = area.offsetHeight, sc = (w * h * 4 > 22e6) ? 1 : 2;
+    await sleep(260);
+
+    const rect = area.getBoundingClientRect();
+    const scale = Math.max(1.5, Math.min(2.5, 1800 / Math.max(rect.width, 1)));
+    const width = Math.max(1200, Math.ceil(rect.width * scale));
+    const height = Math.max(900, Math.ceil(rect.height * scale));
     const bg = getComputedStyle(body).backgroundColor;
-    const url = await domtoimage.toPng(area, { bgcolor: bg, cacheBust: true, width: w * sc, height: h * sc, style: { transform: `scale(${sc})`, transformOrigin: 'top left', width: w + 'px', height: h + 'px' } });
-    const name = ($('#reportTitle').textContent.replace(/[^A-Za-z0-9]+/g, '_').replace(/^_|_$/g, '').slice(0, 70) || 'Report') + `_${mode}.png`;
-    if (/Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)) {
-      const m = document.createElement('div'); m.className = 'preview-modal';
-      m.innerHTML = '<button class="btn-primary" type="button">Close preview</button><p>Press and hold the image to save it to Photos.</p><img alt="Report">';
-      m.querySelector('img').src = url; m.querySelector('button').onclick = () => m.remove(); body.appendChild(m);
-    } else { const a = document.createElement('a'); a.download = name; a.href = url; a.click(); }
-  } catch (err) { console.error(err); toast('Could not export the image. Please try again.'); }
-  finally { area.style.width = ''; body.classList.remove('exporting'); if (mode === 'chart') { drawChart(false); applyHighlight(); } }
+
+    const blob = await domtoimage.toBlob(area, {
+      bgcolor: bg,
+      cacheBust: true,
+      width,
+      height,
+      style: {
+        transform: `scale(${scale})`,
+        transformOrigin: 'top left',
+        width: `${rect.width}px`,
+        height: `${rect.height}px`
+      }
+    });
+
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fileName;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+
+    toast('Image saved');
+  } catch (err) {
+    console.error(err);
+    toast('Could not export the image. Please try again.');
+  } finally {
+    area.style.width = '';
+    body.classList.remove('exporting');
+    if (mode === 'chart') { drawChart(false); applyHighlight(); }
+  }
 });
 
-/* ═══════ go ═══════ */
 if (body.classList.contains('mobile-mode')) {
   body.classList.add('sidebar-collapsed');
 }
+
 syncMobileState();
 syncOrder('index_cols'); syncOrder('value_cols'); updateBadges(); update();
 })();
