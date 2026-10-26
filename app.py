@@ -17,7 +17,7 @@ from datetime import datetime
 import pandas as pd
 import requests
 from flask import (Flask, Response, jsonify, redirect, render_template_string,
-                   request, send_file, url_for)
+                   request, send_file, send_from_directory, url_for)
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 64 * 1024 * 1024  # 64 MB uploads
@@ -765,6 +765,12 @@ def save_to_drive():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route('/favicon.ico')
+def favicon():
+    return send_from_directory(os.path.join(app.root_path, 'static'),
+                               'favicon.ico', mimetype='image/vnd.microsoft.icon')
+
+
 @app.get("/")
 def home():
     st = get_state()
@@ -867,6 +873,7 @@ SPRITE = """
 HEAD = """<meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="light dark">
+<link rel="icon" href="{{ url_for('favicon') }}" type="image/x-icon">
 <script>(function(){try{var d=document.documentElement,t=localStorage.getItem('ap-theme'),g=localStorage.getItem('ap-glass');
 if(t==='light'||t==='dark')d.dataset.theme=t;if(g)d.style.setProperty('--glass',g);}catch(e){}})();</script>
 <link rel="stylesheet" href="/assets/app.css?v={{ asset_v }}">
