@@ -2271,7 +2271,7 @@ const loadD2I = () => d2i || (d2i = new Promise((ok, fail) => {
   s.onload = ok; s.onerror = () => { d2i = null; fail(new Error('load')); }; document.head.appendChild(s);
 }));
 
-$('#dlImage').addEventListener('click', async () => {
+dlImage.addEventListener('click', async () => {
   const area = $('#report-area'), mode = view();
   const titleText = ($('#reportTitle').textContent || 'Report').replace(/[^A-Za-z0-9]+/g, '_').replace(/^_|_$/g, '').slice(0, 70) || 'Report';
   const fileName = `${titleText}_${mode}.png`;
