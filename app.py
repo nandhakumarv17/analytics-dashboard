@@ -1,43 +1,32 @@
 """
-Analytics Pro - upload a sheet, slice it, pivot it, chart it, export it.
+Sales dashboard - upload a sales sheet; overview, targets, charts and the EOD report.
 
 Single-file Flask app.   python app.py
-Needs: flask, pandas, openpyxl, requests
+Needs: flask, pandas, openpyxl
 """
+import difflib
 import hashlib
-import html
+import hmac
 import io
 import json
 import os
 import re
+import secrets
 import threading
-import warnings
-from datetime import datetime
+import time
+from collections import Counter
+from datetime import datetime, timedelta
 
 import pandas as pd
-import requests
-from flask import (Flask, Response, jsonify, redirect, render_template_string,
-                   request, send_file, send_from_directory, url_for)
+from flask import Flask, Response, jsonify, make_response, redirect, render_template_string, request, session, url_for
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 64 * 1024 * 1024  # 64 MB uploads
+app.config["MAX_CONTENT_LENGTH"] = 128 * 1024 * 1024  # 128 MB uploads: room for the full sheet saved back as CSV
 
 UPLOAD_DIR = os.environ.get("DASHBOARD_UPLOAD_DIR", "/tmp/dashboard_uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 DATA_FILE_PATH = os.path.join(UPLOAD_DIR, "shared_data.pkl")
 META_FILE_PATH = os.path.join(UPLOAD_DIR, "metadata.json")
-
-# Your deployed Google Apps Script Web App URL
-APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbw-sAJDOKYuIcknXVcMYhuXe1BXW-EgHnjpaIO0J5yneQutV7bIeNkTuY0I1eUoxIa4lg/exec"
-
-RAW_ROW_LIMIT = 3000
-PIVOT_ROW_LIMIT = 5000
-CHART_MAX = 120
-AGG_NAME = {"sum": "Sum", "count": "Count", "mean": "Avg"}
-AGG_WORD = {"sum": "Sum", "count": "Count", "mean": "Average"}
-DERIVED_FMT = {"Week of": "%d %b %y", "Month": "%b %Y"}
-NON_ADDITIVE = re.compile(
-    r"(^|[\s_\-])(id|no|num|number|code|sku|pin|pincode|phone|mobile|year|month|week|day|qtr|quarter)($|[\s_\-])", re.I)
 
 _lock = threading.Lock()
 _state = {"mtime": None, "df": None, "ctx": None}
@@ -79,11 +68,46 @@ def detect_columns(df):
     }
 
 
+def to_dates(s):
+    """A date column as real dates: also handles numbers like 20261002 (yyyymmdd) and 46297 (Excel day number).
+    A column that does not really hold dates is returned unchanged."""
+    if pd.api.types.is_datetime64_any_dtype(s):
+        return s
+    if pd.api.types.is_numeric_dtype(s):
+        v = pd.to_numeric(s, errors="coerce")
+        nn = v.dropna()
+        if nn.empty:
+            return s
+        if nn.between(19000101, 21001231).all():
+            return pd.to_datetime(v.astype("Int64").astype(str), format="%Y%m%d", errors="coerce")
+        if nn.between(20000, 80000).all():
+            return pd.to_datetime(v, unit="D", origin="1899-12-30", errors="coerce")
+        return s
+    txt = s.astype(str).str.strip()
+    present = s.notna() & (txt != "") & (txt.str.lower() != "nan")
+    if not present.any():
+        return pd.to_datetime(s, errors="coerce")
+    if txt[present].str.fullmatch(r"\d{8}").all():
+        return pd.to_datetime(txt.where(present), format="%Y%m%d", errors="coerce")
+    if txt[present].str.fullmatch(r"\d{4}-\d{1,2}-\d{1,2}(?:[ T][\d:.]+)?").mean() >= 0.8:   # ISO, e.g. a CSV saved from here
+        parsed = pd.to_datetime(txt.where(present), format="ISO8601", errors="coerce")
+        if parsed[present].notna().mean() >= 0.8:
+            return parsed
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        parsed = pd.to_datetime(s.where(present), errors="coerce", dayfirst=True)
+    return parsed if parsed[present].notna().mean() >= 0.8 else s
+
+
+_DATE_NAME = re.compile(r"(^|[^a-z])date([^a-z]|$)")
+
+
 def prepare_df(df):
     df.columns = [str(c).strip() for c in df.columns]
-    d = pick_date_col(list(df.columns))
-    if d and not pd.api.types.is_numeric_dtype(df[d]):
-        df[d] = pd.to_datetime(df[d], errors="coerce", dayfirst=True)
+    for col in df.columns:
+        if _DATE_NAME.search(col.lower()):
+            df[col] = to_dates(df[col])
 
     c = detect_columns(df)
     for key in ("spc", "seg", "seg2", "fam"):
@@ -108,6 +132,27 @@ def opts(names, hint="", checked=()):
     return [{"name": str(n), "hint": hint, "checked": n in checked} for n in names]
 
 
+_WO_TA = re.compile(r"\s*\(?\b(?:w/?o|without)\s*T\.?A\.?(?=\W|$)\)?", re.I)
+
+
+def clean_family(name):
+    """Fold sheet variants of one model together: 'A17 5G w/o TA' -> 'A17 5G', 'TAB S12 + 5G' -> 'TAB S12+ 5G'."""
+    t = _WO_TA.sub("", str(name))
+    t = re.sub(r"\s+\+", "+", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def family_map(series):
+    """Original family value -> one display name per model, using the commonest spelling among its variants."""
+    counts = series.dropna().astype(str).value_counts()
+    best = {}
+    for raw in counts.index:
+        c = clean_family(raw)
+        if c and c.lower() not in best:
+            best[c.lower()] = c
+    return {raw: best.get(clean_family(raw).lower(), clean_family(raw)) for raw in counts.index}
+
+
 def build_context(df):
     c = detect_columns(df)
     cols = list(df.columns)
@@ -124,6 +169,10 @@ def build_context(df):
 
     dmin = dmax = None
     weeks, months = [], []
+    family_names = []
+    if c["fam"] and c["fam"] in df.columns:
+        family_names = sorted(set(family_map(df[c["fam"]]).values()) - {""}, key=str.lower)
+
     if c["date"]:
         s = df[c["date"]].dropna()
         if len(s):
@@ -155,11 +204,14 @@ def build_context(df):
     def label(d):
         return f"{d.day:02d} {d:%b %Y}" if d is not None else "N/A"
 
+    eod_day = (dmax + timedelta(days=1)) if dmax is not None else pd.Timestamp(datetime.now())
+
     boot = {
         "map": mapping,
         "dmin": dmin.strftime("%Y-%m-%d") if dmin is not None else "",
         "dmax": dmax.strftime("%Y-%m-%d") if dmax is not None else "",
         "all": f"All time · {label(dmin)} – {label(dmax)}" if dmin is not None else "All records",
+        "family_names": family_names,
     }
 
     return {
@@ -176,31 +228,493 @@ def build_context(df):
         "y_opts": opts(num, "number", {default_y}),
         "boot_json": json.dumps(boot).replace("<", "\\u003c"),
         "range_label": f"{label(dmin)} – {label(dmax)}" if dmin is not None else "",
+        "latest_label": dmax.strftime("%d/%b/%Y").upper() if dmax is not None else "N/A",
+        "eod_date": eod_day.strftime("%d/%b/%Y").upper(),
+        "eod_day": eod_day.strftime("%A"),
     }
+
+
+# Sharing: UPLOAD_PIN stops viewers from replacing the data; DATA_SOURCE_URL (e.g. a Google Sheets
+# "export?format=xlsx" link) refills the data automatically when the server starts empty.
+UPLOAD_PIN = os.environ.get("UPLOAD_PIN", "").strip()
+DATA_SOURCE_URL = os.environ.get("DATA_SOURCE_URL", "").strip()
+_source = {"last_try": 0.0, "error": ""}
+
+
+def read_table(raw, name_hint=""):
+    """Bytes of an .xlsx/.xls/.csv file -> DataFrame (tries Excel first unless the name says csv)."""
+    buf = io.BytesIO(raw)
+    if not name_hint.lower().endswith(".csv"):
+        try:
+            return pd.read_excel(buf)
+        except Exception:
+            buf.seek(0)
+    return pd.read_csv(buf)
+
+
+def load_from_source():
+    """Fetch DATA_SOURCE_URL into the shared data file; retried at most every 5 minutes after a failure."""
+    import time
+    import urllib.request
+    if not DATA_SOURCE_URL or time.time() - _source["last_try"] < 300:
+        return False
+    _source["last_try"] = time.time()
+    try:
+        req = urllib.request.Request(DATA_SOURCE_URL, headers={"User-Agent": "SalesDashboard/1.0"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            raw = r.read()
+        df = read_table(raw, DATA_SOURCE_URL.split("?")[0])
+        if df.empty:
+            raise ValueError("the sheet has no rows")
+        save_data(df)
+        _source["error"] = ""
+        return True
+    except Exception as exc:
+        _source["error"] = str(exc)
+        return False
+
+
+def keep_ok_rows(df):
+    """Only rows whose FinalStatus is OK count anywhere in the app; returns (rows kept, rows left out)."""
+    col = next((c for c in df.columns if re.sub(r"[\s_]+", "", str(c)).lower() == "finalstatus"), None)
+    if not col:
+        return df, 0
+    ok = df[col].astype(str).str.strip().str.lower().eq("ok")
+    return df[ok].copy(), int((~ok).sum())
+
+
+def updated_note():
+    """'Updated …' line shown on every page (the FinalStatus OK filter works silently in the background)."""
+    return get_upload_time()
 
 
 def get_state():
     try:
         mtime = os.path.getmtime(DATA_FILE_PATH)
     except OSError:
-        return None
+        if not load_from_source():
+            return None
+        mtime = os.path.getmtime(DATA_FILE_PATH)
     with _lock:
         if _state["mtime"] != mtime:
             try:
                 df = pd.read_pickle(DATA_FILE_PATH)
             except Exception:
                 return None
-            _state.update(mtime=mtime, df=df, ctx=build_context(df))
+            raw = df
+            df, excluded = keep_ok_rows(df)
+            fam = detect_columns(df)["fam"]
+            if fam:  # one name per model in every view (charts, EOD, overview), e.g. 'A17 5G w/o TA' -> 'A17 5G'
+                df[fam] = df[fam].map(family_map(df[fam]))
+            df = fill_segments(df, fam)  # no 'Other' segment for models the sheet can place
+            _state.update(mtime=mtime, df=df, raw=raw, ctx=build_context(df), excluded=excluded)
         return dict(_state)
+
+
+PREV_DATA_PATH = os.path.join(UPLOAD_DIR, "shared_data.prev.pkl")
+PREV_META_PATH = os.path.join(UPLOAD_DIR, "metadata.prev.json")
 
 
 def save_data(df):
     df = prepare_df(df)
     tmp = DATA_FILE_PATH + ".tmp"
     df.to_pickle(tmp)
+    # the sheet being replaced stays as a backup until the next upload, so one upload can never lose the data
+    if os.path.exists(DATA_FILE_PATH):
+        os.replace(DATA_FILE_PATH, PREV_DATA_PATH)
+        if os.path.exists(META_FILE_PATH):
+            os.replace(META_FILE_PATH, PREV_META_PATH)
     os.replace(tmp, DATA_FILE_PATH)
     with open(META_FILE_PATH, "w") as fh:
         json.dump({"upload_time": datetime.now().strftime("%d %b %Y, %I:%M %p")}, fh)
+
+
+def check_new_sheet(df):
+    """Reasons a new sheet can't replace the current data (empty list = fine). Nothing is saved when there are any."""
+    probe = prepare_df(df.copy())
+    cols = list(probe.columns)
+    problems = []
+    if not detect_columns(probe)["date"]:
+        problems.append("no usable date column (e.g. Sale Date or Customized Sales Date)")
+    if not find_col(cols, ("tentative", "dp"), exact=("tentative dp",)):
+        problems.append("no Tentative DP (value) column")
+    return problems
+
+
+def current_data_info():
+    """What is loaded now, for the upload page's warning; None when nothing is loaded."""
+    st = get_state()
+    if st is None:
+        return None
+    raw = st.get("raw")
+    info = {"rows": int(len(raw)) if raw is not None else 0, "updated": get_upload_time(), "range": "",
+            "backup": os.path.exists(PREV_DATA_PATH)}
+    try:
+        m = meta_data(st)
+        if m.get("from"):
+            info["range"] = f"{m['from'].lstrip('0')} – {m['to'].lstrip('0')}"
+    except Exception:  # noqa: BLE001 - the warning still shows without the dates
+        pass
+    return info
+
+
+# ---------- secured data access ----------
+# Replacing, restoring or downloading the sales data needs the admin passcode; viewing the dashboard never does.
+# The passcode is kept only as a salted PBKDF2 hash, can first be set only on the computer running the server, and
+# unlocks one browser for UNLOCK_MIN minutes. Wrong passcodes lock the form for a while, every action needs the
+# unlocked session's own token (CSRF), a new sheet is checked and shown before it can replace anything, and every
+# unlock, upload, restore and download is written to a log.
+ADMIN_FILE = os.path.join(UPLOAD_DIR, "admin.json")
+AUDIT_FILE = os.path.join(UPLOAD_DIR, "upload_log.jsonl")
+SECRET_FILE = os.path.join(UPLOAD_DIR, ".session_key")
+STAGE_DIR = os.path.join(UPLOAD_DIR, "staged")
+os.makedirs(STAGE_DIR, exist_ok=True)
+UNLOCK_MIN, STAGE_MIN = 15, 30
+MAX_TRIES, GLOBAL_TRIES, LOCK_MIN = 5, 20, 15
+PASS_MIN_LEN, PASS_ITER = 6, 240_000
+_tries = {}   # who -> [wrong tries, first wrong try, locked until]; "*" counts every device together
+_tries_lock = threading.Lock()
+_save_lock = threading.Lock()
+
+
+def _session_key():
+    try:
+        with open(SECRET_FILE, "rb") as fh:
+            k = fh.read()
+        if len(k) >= 32:
+            return k
+    except OSError:
+        pass
+    k = secrets.token_bytes(32)
+    tmp = SECRET_FILE + ".tmp"
+    with open(tmp, "wb") as fh:
+        fh.write(k)
+    os.replace(tmp, SECRET_FILE)
+    return k
+
+
+app.secret_key = _session_key()
+app.config.update(SESSION_COOKIE_NAME="ap_admin", SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Strict")
+
+
+def admin_info():
+    """The stored passcode record; the old UPLOAD_PIN setting stands in until a passcode is set here."""
+    try:
+        with open(ADMIN_FILE) as fh:
+            a = json.load(fh)
+        if a.get("hash") and a.get("salt") and a.get("ver"):
+            return a
+    except (OSError, ValueError):
+        pass
+    if UPLOAD_PIN:
+        return {"env": True, "ver": "env-" + hashlib.sha256(UPLOAD_PIN.encode()).hexdigest()[:12]}
+    return None
+
+
+def _pass_hash(code, salt, n=PASS_ITER):
+    return hashlib.pbkdf2_hmac("sha256", code.encode("utf-8"), bytes.fromhex(salt), n).hex()
+
+
+def set_passcode(code):
+    salt = secrets.token_hex(16)
+    a = {"salt": salt, "iter": PASS_ITER, "hash": _pass_hash(code, salt), "ver": secrets.token_hex(8),
+         "set": datetime.now().strftime("%d %b %Y, %I:%M %p")}
+    tmp = ADMIN_FILE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(a, fh)
+    os.replace(tmp, ADMIN_FILE)
+    return a
+
+
+def passcode_ok(code):
+    a = admin_info()
+    if not a or not code:
+        return False
+    if a.get("env"):
+        return hmac.compare_digest(code.encode("utf-8"), UPLOAD_PIN.encode("utf-8"))
+    return hmac.compare_digest(_pass_hash(code, a["salt"], a.get("iter", PASS_ITER)), a["hash"])
+
+
+def passcode_problem(code, again):
+    if len(code) < PASS_MIN_LEN:
+        return f"Use at least {PASS_MIN_LEN} characters."
+    if len(set(code)) < 3 or code in ("123456", "1234567", "12345678", "654321", "password", "qwerty"):
+        return "That passcode is too easy to guess. Mix in more different characters."
+    if code != again:
+        return "The two passcodes don't match."
+    return ""
+
+
+def is_local_request():
+    """The computer running the server, with no proxy or tunnel in between (they would all look local)."""
+    fwd = any(request.headers.get(h) for h in ("X-Forwarded-For", "Forwarded", "X-Real-IP", "CF-Connecting-IP", "True-Client-IP"))
+    return request.remote_addr in ("127.0.0.1", "::1") and not fwd
+
+
+def same_origin():
+    """A form posted from this app's own pages (not from another website the browser has open)."""
+    origin = request.headers.get("Origin") or ""
+    if origin:
+        return origin.rstrip("/") == request.host_url.rstrip("/")
+    ref = request.headers.get("Referer") or ""
+    return not ref or ref.startswith(request.host_url)
+
+
+def _who():
+    return request.remote_addr or "?"
+
+
+def lock_seconds():
+    """Time left on a lockout after too many wrong passcodes (from this device, or from all devices together)."""
+    now = time.time()
+    with _tries_lock:
+        return int(max([t[2] - now for k in (_who(), "*") if (t := _tries.get(k)) and t[2] > now] or [0]))
+
+
+def note_try(ok):
+    """Counts wrong passcodes; returns how many tries this device has left before the lockout."""
+    now = time.time()
+    left = MAX_TRIES
+    with _tries_lock:
+        for key, cap in ((_who(), MAX_TRIES), ("*", GLOBAL_TRIES)):
+            if ok:
+                if key != "*":
+                    _tries.pop(key, None)
+                continue
+            t = _tries.get(key)
+            if not t or now - t[1] > LOCK_MIN * 60:
+                t = [0, now, 0]
+            t[0] += 1
+            if t[0] >= cap:
+                t = [0, now, now + LOCK_MIN * 60]
+            _tries[key] = t
+            if key != "*":
+                left = cap - t[0] if not t[2] else 0
+    return left
+
+
+def is_unlocked(extend=False):
+    a = admin_info()
+    if not a or session.get("ver") != a["ver"] or session.get("until", 0) < time.time():
+        return False
+    if extend:   # actions keep it open; just looking at the page does not
+        session["until"] = time.time() + UNLOCK_MIN * 60
+    return True
+
+
+def unlock_session():
+    stage = session.get("stage")
+    session.clear()
+    session.update(ver=admin_info()["ver"], until=time.time() + UNLOCK_MIN * 60, csrf=secrets.token_urlsafe(24))
+    if stage:
+        session["stage"] = stage
+
+
+def csrf_ok():
+    t = request.form.get("csrf", "")
+    return bool(t) and hmac.compare_digest(t, session.get("csrf", ""))
+
+
+def admin_api(fn):
+    """JSON saves of shared data (targets): an unlocked browser that sends its own token in X-Admin-Token."""
+    def wrapped(*a, **kw):
+        if not admin_info():
+            return jsonify({"error": "Not saved: set an admin passcode first (Gear → Data & upload, on the computer "
+                                     "running the dashboard).", "locked": True, "reason": "no_passcode"}), 401
+        tok = request.headers.get("X-Admin-Token", "")
+        if not is_unlocked(extend=True) or not tok or not hmac.compare_digest(tok, session.get("csrf", "")):
+            return jsonify({"error": "Not saved: changing targets needs the admin passcode.", "locked": True}), 401
+        return fn(*a, **kw)
+    wrapped.__name__ = fn.__name__
+    return wrapped
+
+
+def audit(action, detail=""):
+    rec = {"t": datetime.now().strftime("%d %b %Y, %I:%M %p"), "ip": _who(), "action": action, "detail": str(detail)[:240]}
+    try:
+        if os.path.exists(AUDIT_FILE) and os.path.getsize(AUDIT_FILE) > 1_000_000:   # keep the newest 2,000 entries
+            with open(AUDIT_FILE, encoding="utf-8") as fh:
+                keep = fh.readlines()[-2000:]
+            with open(AUDIT_FILE, "w", encoding="utf-8") as fh:
+                fh.writelines(keep)
+        with open(AUDIT_FILE, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec) + "\n")
+    except OSError:
+        pass
+
+
+def audit_recent(n=12):
+    try:
+        with open(AUDIT_FILE, encoding="utf-8") as fh:
+            lines = fh.readlines()[-n:]
+    except OSError:
+        return []
+    out = []
+    for line in reversed(lines):
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            pass
+    return out
+
+
+# ---------- a new sheet is checked and staged first; nothing changes until it is confirmed ----------
+def read_upload(raw, name):
+    """Bytes of an uploaded file -> DataFrame, refusing files that are not what their name says."""
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    if ext not in ("xlsx", "xls", "csv"):
+        raise ValueError("only .xlsx, .xls or .csv files are accepted")
+    head = raw[:8]
+    if ext == "xlsx" and not head.startswith(b"PK\x03\x04"):
+        raise ValueError("this .xlsx file is not a real Excel workbook")
+    if ext == "xls" and not head.startswith((b"\xd0\xcf\x11\xe0", b"PK\x03\x04")):
+        raise ValueError("this .xls file is not a real Excel workbook")
+    if ext == "csv" and b"\x00" in raw[:65536]:
+        raise ValueError("this .csv file is not plain text")
+    buf = io.BytesIO(raw)
+    return pd.read_csv(buf) if ext == "csv" else pd.read_excel(buf)
+
+
+def stage_path(token, ext="pkl"):
+    if not re.fullmatch(r"[A-Za-z0-9_-]{20,64}", str(token or "")):
+        return None
+    return os.path.join(STAGE_DIR, f"{token}.{ext}")
+
+
+def clean_stage():
+    now = time.time()
+    for fn in os.listdir(STAGE_DIR):
+        fp = os.path.join(STAGE_DIR, fn)
+        try:
+            if now - os.path.getmtime(fp) > STAGE_MIN * 60:
+                os.remove(fp)
+        except OSError:
+            pass
+
+
+def drop_stage(token):
+    for ext in ("pkl", "json"):
+        fp = stage_path(token, ext)
+        if fp and os.path.exists(fp):
+            os.remove(fp)
+
+
+def sheet_summary(raw):
+    """What a sheet holds, counted the way the dashboard counts it (FinalStatus OK rows only)."""
+    df = prepare_df(raw.copy())
+    ok, excluded = keep_ok_rows(df)
+    cols = list(ok.columns)
+    date = detect_columns(ok)["date"]
+    days = pd.DatetimeIndex(ok[date].dropna().dt.normalize().unique()).sort_values() if date else pd.DatetimeIndex([])
+    dp = find_col(cols, ("tentative", "dp"), exact=("tentative dp",))
+    ch = find_col(cols, ("channel", "name"), ("channel",))
+    return {"rows": int(len(raw)), "ok_rows": int(len(ok)), "excluded": int(excluded), "days": days,
+            "value": float(pd.to_numeric(ok[dp], errors="coerce").sum()) if dp else 0.0,
+            "stores": sorted({x for x in ok[ch].fillna("").astype(str).str.strip() if x}) if ch else []}
+
+
+_cur_summary = {"mtime": None, "sum": None}
+
+
+def current_summary():
+    try:
+        mtime = os.path.getmtime(DATA_FILE_PATH)
+    except OSError:
+        return None
+    if _cur_summary["mtime"] != mtime:
+        _cur_summary.update(mtime=mtime, sum=sheet_summary(pd.read_pickle(DATA_FILE_PATH)))
+    return _cur_summary["sum"]
+
+
+def _day_runs(days):
+    runs = []
+    for d in days:
+        if runs and (d - runs[-1][1]).days == 1:
+            runs[-1][1] = d
+        else:
+            runs.append([d, d])
+    return runs
+
+
+def _runs_text(days, n=4):
+    runs = _day_runs(days)
+    txt = ", ".join(fmt_range(a, b) for a, b in runs[:n])
+    return txt + (f" and {len(runs) - n} more" if len(runs) > n else "")
+
+
+def compare_sheets(new, cur):
+    """Side-by-side figures and plain warnings about what replacing the current data would lose."""
+    def view(x):
+        d = x["days"]
+        return {"range": fmt_range(d[0], d[-1]) if len(d) else "–", "days": f"{len(d):,}", "rows": f"{x['rows']:,}",
+                "ok_rows": f"{x['ok_rows']:,}", "stores": f"{len(x['stores']):,}", "value": inr_short(x["value"])}
+    out = {"new": view(new), "cur": view(cur) if cur else None, "warn": [], "note": []}
+    if cur:
+        lost, added = cur["days"].difference(new["days"]), new["days"].difference(cur["days"])
+        gone = [x for x in cur["stores"] if x not in set(new["stores"])]
+        if len(lost):
+            out["warn"].append(f"{len(lost):,} sales day{'s' if len(lost) != 1 else ''} in the current data "
+                               f"{'are' if len(lost) != 1 else 'is'} not in this sheet ({_runs_text(lost)}). "
+                               "They would disappear from every page.")
+        if gone:
+            out["warn"].append(f"{len(gone)} store{'s' if len(gone) != 1 else ''} in the current data "
+                               f"{'are' if len(gone) != 1 else 'is'} not in this sheet: {', '.join(gone[:5])}"
+                               + (f" and {len(gone) - 5} more" if len(gone) > 5 else "") + ".")
+        if cur["ok_rows"] and new["ok_rows"] < 0.9 * cur["ok_rows"]:
+            out["warn"].append(f"This sheet has {cur['ok_rows'] - new['ok_rows']:,} fewer counted sales rows than the current data.")
+        if len(added):
+            out["note"].append(f"Adds {len(added):,} new sales day{'s' if len(added) != 1 else ''}: {_runs_text(added, 3)}.")
+        if not len(lost) and not gone and not len(added):
+            out["note"].append("Covers the same days and stores as the current data.")
+    if new["excluded"]:
+        out["note"].append(f"{new['excluded']:,} rows are not FinalStatus OK; as always, they are left out of every figure.")
+    return out
+
+
+def restore_previous():
+    """Swaps the current sheet and the previous upload, so a restore can itself be undone."""
+    if not os.path.exists(PREV_DATA_PATH):
+        raise ValueError("there is no previous upload to restore")
+    with _save_lock:
+        for cur, prev in ((DATA_FILE_PATH, PREV_DATA_PATH), (META_FILE_PATH, PREV_META_PATH)):
+            have_cur, have_prev = os.path.exists(cur), os.path.exists(prev)
+            if have_cur:
+                os.replace(cur, cur + ".swap")
+            if have_prev:
+                os.replace(prev, cur)
+            if have_cur:
+                os.replace(cur + ".swap", prev)
+        os.utime(DATA_FILE_PATH)   # a fresh time, so every page reloads the restored sheet
+
+
+def upload_page_html(error=None, status=200, notice=None):
+    """The one page for data access; what it shows depends on whether this browser is unlocked."""
+    clean_stage()
+    a = admin_info()
+    ctx = {"error": error, "notice": notice, "unlock_min": UNLOCK_MIN, "min_len": PASS_MIN_LEN, "lock_left": 0,
+           "local": is_local_request(), "has_data": os.path.exists(DATA_FILE_PATH), "current": None, "csrf": "",
+           "log": [], "review": None, "stage": None, "env_pin": bool(a and a.get("env")), "pass_set": (a or {}).get("set", "")}
+    if not a:
+        view = "setup" if ctx["local"] else "setup_remote"
+    elif not is_unlocked():
+        view = "unlock"
+        ctx["lock_left"] = -(-lock_seconds() // 60)
+    else:
+        view = "manage"
+        ctx.update(current=current_data_info(), csrf=session.get("csrf", ""), log=audit_recent(),
+                   minutes_left=max(1, -int(-(session["until"] - time.time()) // 60)))
+        stg = session.get("stage") or {}
+        meta = stage_path(stg.get("token"), "json")
+        if meta and os.path.exists(meta) and os.path.exists(stage_path(stg["token"])):
+            with open(meta, encoding="utf-8") as fh:
+                ctx["review"] = json.load(fh)
+            ctx["stage"] = stg
+            view = "review"
+        elif stg:
+            session.pop("stage", None)
+    ctx["view"] = view
+    resp = make_response(render_template_string(UPLOAD_HTML, **ctx), status)
+    return resp
 
 
 def get_upload_time():
@@ -212,148 +726,6 @@ def get_upload_time():
 
 
 # formatting
-_GROUP = re.compile(r"(\d)(?=(\d\d)+$)")
-
-
-def format_indian_number(x, dec=0):
-    if x is None or (isinstance(x, str) and x == ""):
-        return ""
-    try:
-        if pd.isna(x):
-            return ""
-        v = round(float(x), dec)
-    except (ValueError, TypeError, OverflowError):
-        return html.escape(str(x))
-    neg = v < 0
-    v = abs(v)
-    s = str(int(v))
-    if len(s) > 3:
-        s = _GROUP.sub(r"\1,", s[:-3]) + "," + s[-3:]
-    if dec:
-        s += "." + f"{v:.{dec}f}".split(".")[1]
-    return f"-{s}" if neg and v else s
-
-
-def format_avg(x):
-    try:
-        return format_indian_number(x, 2 if abs(float(x)) < 100 else 0)
-    except (TypeError, ValueError):
-        return ""
-
-
-def format_plain(v):
-    if v is None or pd.isna(v):
-        return ""
-    try:
-        f = float(v)
-        return str(int(f)) if f.is_integer() else str(v)
-    except (TypeError, ValueError):
-        return html.escape(str(v))
-
-
-def format_pct(v):
-    try:
-        x = float(v)
-    except (TypeError, ValueError):
-        return ""
-    if x != x:
-        return ""
-    if round(x, 1) > 0:
-        return f'<span class="pct-positive">↑ {x:.1f}%</span>'
-    if round(x, 1) < 0:
-        return f'<span class="pct-negative">↓ {abs(x):.1f}%</span>'
-    return '<span class="pct-neutral">–</span>'
-
-
-def format_pct_share(v):
-    try:
-        x = float(v)
-    except (TypeError, ValueError):
-        return ""
-    if x != x:
-        return ""
-    x = max(0.0, min(100.0, x))
-    if x >= 50:
-        color = "#1f8a3c"
-        bg = "rgba(31,138,60,0.12)"
-    elif x >= 25:
-        color = "#0071e3"
-        bg = "rgba(0,113,227,0.12)"
-    elif x >= 10:
-        color = "#5f6f8f"
-        bg = "rgba(95,111,143,0.10)"
-    else:
-        color = "#7d8594"
-        bg = "rgba(125,133,148,0.08)"
-    return (
-        f'<span class="pct-share" '
-        f'style="color:{color};background:{bg};font-weight:700;">{x:.1f}%</span>'
-    )
-
-
-def col_cells(s, fmt=None, esc=True):
-    if pd.api.types.is_datetime64_any_dtype(s):
-        return s.dt.strftime(fmt or "%d-%b-%y").fillna("").tolist()
-    if pd.api.types.is_numeric_dtype(s):
-        return [format_plain(v) for v in s]
-    out = ["" if pd.isna(v) else str(v) for v in s]
-    return [html.escape(v) for v in out] if esc else out
-
-
-def num_cells(s, additive=True):
-    if not additive:
-        return [format_plain(v) for v in s]
-    dec = 2 if (pd.api.types.is_float_dtype(s) and s.dropna().mod(1).ne(0).any()) else 0
-    return [format_indian_number(v, dec) for v in s]
-
-
-def render_table(headers, columns, css, numeric, nidx, foot=None, total_cols=()):
-    def cls(i, base=""):
-        out = [base] if base else []
-        if i in numeric:
-            out.append("num")
-        if i in total_cols:
-            out.append("total-col")
-        return f' class="{" ".join(out)}"' if out else ""
-
-    head = "".join(f"<th{cls(i)}>{html.escape(h)}</th>" for i, h in enumerate(headers))
-    body = "".join("<tr>" + "".join(f"<td{cls(i)}>{v}</td>" for i, v in enumerate(row)) + "</tr>"
-                   for row in zip(*columns))
-    tfoot = ""
-    if foot:
-        tfoot = "<tfoot><tr>" + "".join(f"<td{cls(i)}>{v}</td>" for i, v in enumerate(foot)) + "</tr></tfoot>"
-    return (f'<table class="excel-table {css}" data-nidx="{nidx}"><thead><tr>{head}</tr></thead>'
-            f"<tbody>{body}</tbody>{tfoot}</table>")
-
-
-def empty_block(title, msg=""):
-    return (f'<div class="empty"><svg class="ic"><use href="#i-chart"/></svg>'
-            f"<h3>{html.escape(title)}</h3><p>{html.escape(msg)}</p></div>")
-
-
-def nice_join(items):
-    items = list(items)
-    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " & " + items[-1]
-
-
-def pivot_title(ys, aggs, xs):
-    y = nice_join(ys[:3]) + (f" +{len(ys) - 3}" if len(ys) > 3 else "")
-    x = " › ".join(xs[:3]) + (f" +{len(xs) - 3}" if len(xs) > 3 else "")
-    return f"{y} by {x}"
-
-
-def slug(text):
-    return re.sub(r"[^A-Za-z0-9]+", "_", text).strip("_")[:80] or "Report"
-
-
-def num_or_none(v):
-    try:
-        f = float(v)
-    except (TypeError, ValueError):
-        return None
-    return None if f != f or f in (float("inf"), float("-inf")) else round(f, 2)
-
-
 def parse_date(s):
     if not s:
         return None
@@ -361,481 +733,3717 @@ def parse_date(s):
     return None if pd.isna(t) else t
 
 
-def clean_list(p, key, allowed):
-    seen, out = set(), []
-    for v in p.getlist(key):
-        if v in allowed and v not in seen:
-            seen.add(v)
-            out.append(v)
-    return out
+# EOD: month-to-date rollup of the raw sheet, recomputed per page load because it depends on today
+EOD_TZ = timedelta(minutes=int(os.environ.get("EOD_TZ_OFFSET_MIN", "330")))  # IST by default
+EOD_CATS = ("sp", "tab", "pc", "wear", "acc", "care")
+EOD_FAMS = ("s26", "f8u", "f8", "fl8")
 
 
-def apply_filters(df, ctx, p):
-    mask = None
-
-    def add(m):
-        nonlocal mask
-        mask = m if mask is None else (mask & m)
-
-    dc = ctx["date"]
-    if dc:
-        d = df[dc]
-        start, end = parse_date(p.get("start_date")), parse_date(p.get("end_date"))
-        if start is not None:
-            add(d >= start)
-        if end is not None:
-            add(d < end + pd.Timedelta(days=1))
-        weeks = pd.to_datetime(p.getlist("weeks"), errors="coerce")
-        if len(weeks):
-            add(week_start(d).isin(weeks.dropna()))
-        months = [int(m.replace("-", "")) for m in p.getlist("months") if re.fullmatch(r"\d{4}-\d{2}", m)]
-        if months:
-            add((d.dt.year * 100 + d.dt.month).isin(months))
-
-    for key, field in (("spc", "spc_filters"), ("seg", "seg1_filters"), ("seg2", "seg2_filters")):
-        col, vals = ctx[key], p.getlist(field)
-        if col and vals:
-            add(df[col].isin(vals))
-    return df if mask is None else df[mask]
+def eod_today():
+    return pd.Timestamp(datetime.utcnow() + EOD_TZ).normalize()
 
 
-def filter_pills(ctx, p):
-    out = []
-    for key, field, label in (("spc", "spc_filters", "SPC"), ("seg", "seg1_filters", "Segment 1"), ("seg2", "seg2_filters", "Segment 2")):
-        vals = p.getlist(field)
-        if ctx[key] and vals:
-            out.append([label, ", ".join(vals[:4]) + (f" +{len(vals) - 4}" if len(vals) > 4 else "")])
-    return out
+def find_col(cols, *groups, exact=()):
+    low = {c: c.lower().strip() for c in cols}
+    for e in exact:
+        hit = next((c for c in cols if low[c] == e), None)
+        if hit:
+            return hit
+    for g in groups:
+        hit = next((c for c in cols if all(k in low[c] for k in g)), None)
+        if hit:
+            return hit
+    return ""
 
 
-def fmt_d(t):
-    return f"{t.day:02d} {t:%b %Y}"
+def fill_segments(df, fam_col):
+    """Rows with a blank segment take one from the rest of the sheet: first the segment the same model is sold
+    under elsewhere, then any other segment-like column (Category, SEG2...) whose values map to exactly one
+    segment in the rows that have both. A row stays blank ('Other' in the views) only when nothing fits."""
+    cols = list(df.columns)
+    seg_col = find_col(cols, ("segment", "1"), ("seg1",), ("segment",), ("category",), exact=("segment",))
+    if not seg_col:
+        return df
+    seg = df[seg_col].fillna("").astype(str).str.strip()
+    known = seg != ""
+    if known.all() or not known.any():
+        return df
+    norm = lambda s: s.fillna("").astype(str).str.strip().str.lower().str.replace(r"[\s_\-]+", "_", regex=True)
+    helpers = ([fam_col] if fam_col else []) + [c for c in cols if c not in (seg_col, fam_col)
+                                                and re.search(r"seg|categ", str(c), re.I) and not pd.api.types.is_numeric_dtype(df[c])]
+    filled = seg.copy()
+    for c in helpers:
+        todo = filled == ""
+        if not todo.any():
+            break
+        key = norm(df[c])
+        both = known & (key != "")
+        if not both.any():
+            continue
+        counts = pd.crosstab(key[both], seg[both])
+        purity = counts.max(axis=1) / counts.sum(axis=1)
+        mapping = counts.idxmax(axis=1)[purity >= 0.98].to_dict()   # only values that always mean one segment
+        hit = todo & key.map(mapping).notna()
+        filled[hit] = key[hit].map(mapping)
+    df[seg_col] = filled.where(filled != "", df[seg_col])
+    return df
 
 
-def period_text(ctx, p):
-    if not ctx["date"]:
-        return "All records"
-    label = re.sub(r"\s+", " ", (p.get("period_label") or "")).strip()[:40]
-    weeks = sorted(t for t in pd.to_datetime(p.getlist("weeks"), errors="coerce") if pd.notna(t))
-    if weeks:
-        names = [f"W{w.isocalendar()[1]:02d}" for w in weeks]
-        shown = ", ".join(names[:6]) + (f" +{len(names) - 6} more" if len(names) > 6 else "")
-        return (f"{'Week' if len(names) == 1 else 'Weeks'} {shown} · "
-                f"{fmt_d(weeks[0])} – {fmt_d(weeks[-1] + pd.Timedelta(days=6))}")
-    months = sorted(m for m in p.getlist("months") if re.fullmatch(r"\d{4}-\d{2}", m))
-    if months:
-        names = [pd.Timestamp(f"{m}-01").strftime("%b %Y") for m in months]
-        return "Months " + ", ".join(names[:5]) + (f" +{len(names) - 5} more" if len(names) > 5 else "")
-    start, end = parse_date(p.get("start_date")), parse_date(p.get("end_date"))
-    lo = start if start is not None else ctx["dmin"]
-    hi = end if end is not None else ctx["dmax"]
-    if lo is None or hi is None:
-        return label or "All time"
-    rng = fmt_d(lo) if lo == hi else f"{fmt_d(lo)} – {fmt_d(hi)}"
-    if start is None and end is None:
-        return f"All time · {rng}"
-    return f"{label} · {rng}" if label else rng
+def segment_bucket(v):
+    s = str(v).strip().lower()
+    if not s or s == "nan":
+        return ""
+    if "care" in s:
+        return "care"
+    if "acc" in s:
+        return "acc"
+    if re.search(r"wear|watch|buds|ring", s):
+        return "wear"
+    if "tab" in s:
+        return "tab"
+    if re.search(r"\bpc\b|note ?pc|laptop|notebook|book|computer", s):
+        return "pc"
+    if re.search(r"smart|phone|mobile|hhp|^sp$", s):
+        return "sp"
+    return ""
 
 
-def spc_review_data(dff, ctx, value_col):
-    if not ctx.get("spc") or not value_col or value_col not in dff.columns:
-        return {"pros": [], "cons": []}
-    s = dff[[ctx["spc"], value_col]].dropna()
-    if s.empty:
-        return {"pros": [], "cons": []}
-    total = s[value_col].sum()
-    if total == 0:
-        return {"pros": [], "cons": []}
-    g = s.groupby(ctx["spc"], observed=True)[value_col].sum().reset_index()
-    g.columns = ["spc", "value"]
-    g["share"] = (g["value"] / total) * 100
-    g = g.sort_values(["value", "share"], ascending=False).reset_index(drop=True)
+def family_bucket(v):
+    s = re.sub(r"[\s_\-]+", "", str(v).lower())
+    if re.search(r"fold8(ultra|u)", s):
+        return "f8u"
+    if "fold8" in s:
+        return "f8"
+    if "flip8" in s:
+        return "fl8"
+    if "s26" in s:
+        return "s26"
+    return ""
 
+
+def eod_segment_col(df):
+    """Pick the segment-like column whose values best map to EOD categories (e.g. SEG2 'SP' over SEG1 'BB'/'WB')."""
+    best, best_rows = "", 0
+    for c in df.columns:
+        low = c.lower()
+        if not ("seg" in low or "category" in low):
+            continue
+        counts = df[c].dropna().astype(str).value_counts()
+        rows = int(sum(n for v, n in counts.items() if segment_bucket(v)))
+        if rows > best_rows:
+            best, best_rows = c, rows
+    return best
+
+
+def eod_sheet_data(df, ctx, today):
+    cols = list(df.columns)
+    seg_col = eod_segment_col(df)
+    ch_col = find_col(cols, ("channel", "name"), ("channel",))
+    dp_col = find_col(cols, ("tentative", "dp"), exact=("tentative dp",))
+    fam_col = ctx["fam"]
+    qty_col = ctx["qty"] if ctx["qty"] and pd.api.types.is_numeric_dtype(df[ctx["qty"]]) else ""
+    date_col = ctx["date"]
+
+    start = today.replace(day=1)
+    sub = df
+    if date_col:
+        d = df[date_col]
+        sub = df[(d >= start) & (d < today)]  # rows dated today are left to the manual FTD entry
+
+    def bucket(col, fn):
+        if not col:
+            return pd.Series("", index=sub.index)
+        vals = sub[col].astype(str)
+        return vals.map({u: fn(u) for u in vals.unique()})
+
+    frame = pd.DataFrame({
+        "ch": sub[ch_col].fillna("").astype(str).str.strip() if ch_col else pd.Series("", index=sub.index),
+        "cat": bucket(seg_col, segment_bucket),
+        "fam": bucket(fam_col, family_bucket),
+        "q": pd.to_numeric(sub[qty_col], errors="coerce").fillna(0) if qty_col else pd.Series(1.0, index=sub.index),
+        "v": pd.to_numeric(sub[dp_col], errors="coerce").fillna(0) if dp_col else pd.Series(0.0, index=sub.index),
+    }, index=sub.index)
+
+    def roll(g):
+        out = {"cats": {k: {"q": 0, "v": 0} for k in EOD_CATS}, "fams": {k: {"q": 0, "v": 0} for k in EOD_FAMS}}
+        for key, col in (("cats", "cat"), ("fams", "fam")):
+            agg = g[g[col] != ""].groupby(col)[["q", "v"]].sum()
+            for k, r in agg.iterrows():
+                out[key][k] = {"q": int(round(r["q"])), "v": int(round(r["v"]))}
+        return out
+
+    data = {"__all__": roll(frame)}
+    channels, default_channel = [], ""
+    if ch_col:
+        channels = sorted(x for x in df[ch_col].dropna().astype(str).str.strip().unique() if x)
+        for ch, g in frame[frame["ch"] != ""].groupby("ch"):
+            data[ch] = roll(g)
+        counts = frame.loc[frame["ch"] != "", "ch"].value_counts()
+        default_channel = counts.index[0] if len(counts) else (channels[0] if channels else "")
+
+    seg_map = {}
+    if seg_col:
+        seg_map = {str(u): segment_bucket(u) for u in df[seg_col].dropna().astype(str).unique()[:60]}
+
+    missing = [name for name, col in (("Date", date_col), ("Segment", seg_col), ("Family Name", fam_col),
+                                      ("Channel Name", ch_col), ("Tentative DP", dp_col)) if not col]
+    last = today - pd.Timedelta(days=1)
+    window = (f"{start:%d %b} – {last:%d %b %Y}" if last >= start else "no sheet days yet this month")
     return {
-        "pros": [{"label": r["spc"], "value": format_indian_number(r["value"]), "share": f"{r['share']:.1f}%"} for _, r in g.head(5).iterrows()],
-        "cons": [{"label": r["spc"], "value": format_indian_number(r["value"]), "share": f"{r['share']:.1f}%"} for _, r in g.tail(5).sort_values(["value", "share"], ascending=True).iterrows()],
+        "date_label": today.strftime("%d/%b/%Y").upper(),
+        "day": today.strftime("%A"),
+        "window": window,
+        "rows": int(len(frame)),
+        "qty_col": qty_col or "row count",
+        "channels": channels,
+        "default_channel": default_channel,
+        "seg_map": seg_map,
+        "missing": missing,
+        "data": data,
     }
 
 
-def build_view(state, p, want_export=False):
-    df, ctx = state["df"], state["ctx"]
-    mode = "raw" if p.get("view_mode") == "raw" else "pivot"
-    dff = apply_filters(df, ctx, p)
-    default_value = "Tentative DP" if "Tentative DP" in dff.columns else (ctx.get("qty") if ctx.get("qty") in dff.columns else dff.select_dtypes(include="number").columns.tolist()[0] if len(dff.select_dtypes(include="number").columns) else "")
-    chosen_value = p.get("value_cols") or [default_value]
-    value_col = chosen_value[0] if chosen_value and chosen_value[0] else default_value
-    base = {
-        "period": period_text(ctx, p),
-        "filters": filter_pills(ctx, p),
-        "spc_review": spc_review_data(dff, ctx, value_col),
-    }
-    if mode == "raw":
-        return build_raw(dff, ctx, base, want_export)
-    return build_pivot(dff, ctx, p, base, want_export)
+_FF = re.compile(r"\b(?:fold|flip)\s*(\d+)", re.I)
+_SSER = re.compile(r"^(?:galaxy\s+)?s(\d{1,2})(?!\d)", re.I)   # S23, S25+, S26 Ultra; not 'Tab S10'
 
 
-def empty_payload(base, title, head, msg):
-    return {
-        **base,
-        "title": title,
-        "table_html": empty_block(head, msg),
-        "status": "0 results",
-        "kpis": [],
-        "chart": None,
-        "spc_review": {"pros": [], "cons": []},
-    }
+def series_name(n):
+    """The series a model rolls up into: Fold / Flip of one number -> FF<N>; an S phone -> S<N>F (S26, S26+, S26 Ultra, S26 FE -> S26F)."""
+    m = _FF.search(n)
+    if m:
+        return "FF" + m.group(1)
+    m = _SSER.search(n.strip())
+    return f"S{m.group(1)}F" if m else None
 
 
-def build_raw(dff, ctx, base, want_export):
-    n = len(dff)
-    title = f"Raw data · {format_indian_number(n)} record{'s' if n != 1 else ''}"
-    if n == 0:
-        return empty_payload(base, title, "No matching data", "Try widening the period or clearing a filter."), None, 200
-
-    shown = dff.head(RAW_ROW_LIMIT)
-    cols = list(shown.columns)
-    columns, numeric, additive = [], set(), {}
-    for i, c in enumerate(cols):
-        s = shown[c]
-        if pd.api.types.is_datetime64_any_dtype(s):
-            columns.append(col_cells(s))
-        elif pd.api.types.is_numeric_dtype(s):
-            add = not NON_ADDITIVE.search(str(c)) and not pd.api.types.is_bool_dtype(s)
-            additive[i] = add
-            numeric.add(i)
-            columns.append(num_cells(s, add))
-        else:
-            columns.append(col_cells(s))
-
-    foot = []
-    for i, c in enumerate(cols):
-        if i == 0:
-            foot.append(f"Total · {format_indian_number(n)} rows")
-        elif additive.get(i):
-            sm = dff[c].sum()
-            dec = 2 if (pd.api.types.is_float_dtype(dff[c]) and dff[c].dropna().mod(1).ne(0).any()) else 0
-            foot.append(format_indian_number(sm, dec))
-        else:
-            foot.append("")
-
-    kpis = [{"label": "Records", "value": format_indian_number(n), "sub": "in this view", "cols": []}]
-    for i, c in enumerate(cols):
-        if additive.get(i) and len(kpis) < 5:
-            kpis.append({"label": str(c), "value": format_indian_number(dff[c].sum()), "sub": "Total", "cols": [i]})
-
-    status = (f"{format_indian_number(n)} rows" if n <= RAW_ROW_LIMIT else
-              f"Showing first {format_indian_number(RAW_ROW_LIMIT)} of {format_indian_number(n)} rows · Excel has all")
-    payload = {**base, "title": title, "status": status, "kpis": kpis, "chart": None,
-               "table_html": render_table([str(c) for c in cols], columns, "raw", numeric, 1, foot)}
-    export = {"df": dff, "nidx": 1, "fmts": {}, "footer": False} if want_export else None
-    return payload, export, 200
+def seg_only(frame, args):
+    """One segment only, when a section's segment chips ask for it (?seg=Flagship); applied after the roll-ups, so 'SP' works too."""
+    seg = (args.get("seg") or "").strip() if args is not None else ""
+    return frame[frame["seg"] == seg] if seg and frame is not None else frame
 
 
-def metric_display_name(y, a):
-    if a == "sum":
-        return y
-    return f"{y} {AGG_NAME[a]}" if AGG_NAME[a] != "Sum" else y
-
-
-def build_pivot(dff, ctx, p, base, want_export):
-    cols_set = set(dff.columns)
-    dc = ctx["date"]
-    derived_ok = set(derived_names(cols_set, dc))
-    idx_cols = clean_list(p, "index_cols", cols_set | derived_ok)
-    ycols = [c for c in clean_list(p, "value_cols", set(ctx["num_cols"])) if c not in idx_cols]
-    aggs = [a for a in ("sum", "count", "mean") if a in p.getlist("agg_funcs")]
-
-    if not idx_cols or not ycols or not aggs:
-        return {"error": "Pick at least one X column, one Y column and one measure."}, None, 200
-
-    share, growth = p.get("share") == "1", p.get("growth") == "1"
-    row_total = p.get("row_total") == "1"
-    title = pivot_title(ycols, aggs, idx_cols)
-    if dff.empty:
-        return empty_payload(base, title, "No matching data", "Try widening the period or clearing a filter."), None, 200
-
-    derived = {}
-    if dc:
-        d = dff[dc]
-        if "Week of" in idx_cols and "Week of" in derived_ok:
-            derived["Week of"] = week_start(d)
-        if "Month" in idx_cols and "Month" in derived_ok:
-            derived["Month"] = d.dt.normalize() - pd.to_timedelta(d.dt.day - 1, unit="D")
-
-    need = [c for c in dict.fromkeys(idx_cols + ycols) if c not in derived]
-    sub = dff[need].assign(**derived)
-
-    g = sub.groupby(idx_cols, observed=True, sort=True)[ycols].agg(aggs)
-    if g.empty:
-        return empty_payload(base, title, "No groups to show", "The chosen X columns only contain empty values."), None, 200
-
-    res = g.index.to_frame(index=False)
-    vals = g.reset_index(drop=True)
-    metas = [("idx", "")] * len(idx_cols)
-
-    def put(name, series, meta):
-        res[name] = series
-        metas.append(meta)
-
-    for y in ycols:
-        for a in aggs:
-            name = metric_display_name(y, a)
-            col = vals[(y, a)].astype(float)
-            put(name, col.to_numpy(), ("metric", a))
-            if share and a != "mean":
-                tot = col.sum()
-                put(f"{name} Share", (col / tot * 100).to_numpy() if tot else 0.0, ("pct", a))
-            if growth:
-                prev = col.shift()
-                put(f"{name} Growth", ((col - prev) / prev.where(prev != 0) * 100).to_numpy(), ("pct", a))
-
-    total_cols = {}
-    if row_total and len(ycols) > 1:
-        for a in ("sum", "count"):
-            if a in aggs:
-                parts = [metric_display_name(y, a) for y in ycols]
-                name = f"Total {AGG_NAME[a]}"
-                put(name, res[parts].sum(axis=1).to_numpy(), ("total", a))
-                total_cols[name] = parts
-
-    valid = sub.dropna(subset=idx_cols)
-    foot = {}
-    for y in ycols:
-        for a in aggs:
-            s = valid[y]
-            foot[metric_display_name(y, a)] = {"sum": s.sum, "count": s.count, "mean": s.mean}[a]()
-    for name, parts in total_cols.items():
-        foot[name] = sum(foot[x] for x in parts)
-
-    headers = list(res.columns)
-    n = len(res)
-    fmt_first = lambda c: DERIVED_FMT.get(c)
-    labels_all = [" · ".join(parts) for parts in zip(*[
-        col_cells(res[c], fmt_first(c), esc=False) for c in idx_cols])]
-
-    shown = res.head(PIVOT_ROW_LIMIT)
-    columns, numeric, foot_cells = [], set(), []
-    for i, h in enumerate(headers):
-        s, (kind, a) = shown[h], metas[i]
-        if kind == "idx":
-            columns.append(col_cells(s, fmt_first(h)))
-            foot_cells.append("Grand total" if i == 0 else "")
-        elif kind == "pct":
-            if h.endswith("Share"):
-                columns.append([format_pct_share(v) for v in s])
-            else:
-                columns.append([format_pct(v) for v in s])
-            foot_cells.append("100%" if h.endswith("Share") else "")
-            numeric.add(i)
-        else:
-            f = format_avg if a == "mean" else format_indian_number
-            columns.append([f(v) for v in s])
-            foot_cells.append(f(foot[h]))
-            numeric.add(i)
-
-    total_idx = {i for i, m in enumerate(metas) if m[0] == "total"}
-    table_html = render_table(headers, columns, "pivot", numeric, len(idx_cols), foot_cells, total_idx)
-
-    metric_idx = [i for i, m in enumerate(metas) if m[0] == "metric"]
-    kpis = []
-    for i in metric_idx[:6]:
-        h, a = headers[i], metas[i][1]
-        f = format_avg if a == "mean" else format_indian_number
-        top = int(res.iloc[:, i].to_numpy().argmax()) if n else 0
-        group = [i] + [j for j, m in enumerate(metas) if m[0] == "pct" and headers[j].startswith(h + " ")]
-        kpis.append({
-            "label": h,
-            "value": f(foot[h]),
-            "sub": "Top · " + (labels_all[top][:26] + ("…" if len(labels_all[top]) > 26 else "")),
-            "cols": group,
-        })
-    kpis.append({"label": "Groups", "value": format_indian_number(n),
-                 "sub": " › ".join(idx_cols)[:30], "cols": list(range(len(idx_cols)))})
-
-    sel, note = list(range(n)), ""
-    is_time = pd.api.types.is_datetime64_any_dtype(res[idx_cols[0]])
-    if n > CHART_MAX and metric_idx:
-        if is_time:
-            sel, note = list(range(n - CHART_MAX, n)), f"Showing the latest {CHART_MAX} of {format_indian_number(n)} groups"
-        else:
-            sel = sorted(res.iloc[:, metric_idx[0]].nlargest(CHART_MAX).index.tolist())
-            note = f"Showing the top {CHART_MAX} of {format_indian_number(n)} groups"
-
-    chart = {
-        "labels": [labels_all[i] for i in sel],
-        "series": [{"name": headers[i], "agg": metas[i][1], "col": i,
-                    "values": [num_or_none(v) for v in res.iloc[sel, i]]} for i in metric_idx],
-        "x_title": " › ".join(idx_cols), "is_time": bool(is_time), "note": note,
-    }
-
-    status = (f"{format_indian_number(n)} groups" if n <= PIVOT_ROW_LIMIT else
-              f"Showing first {format_indian_number(PIVOT_ROW_LIMIT)} of {format_indian_number(n)} groups · Excel has all")
-    payload = {**base, "title": title, "status": status, "table_html": table_html, "kpis": kpis, "chart": chart}
-
-    export = None
-    if want_export:
-        exp = res.copy()
-        for c in idx_cols:
-            if pd.api.types.is_datetime64_any_dtype(exp[c]):
-                exp[c] = exp[c].dt.strftime(fmt_first(c) or "%d-%b-%y")
-        row = {h: None for h in headers}
-        row[headers[0]] = "GRAND TOTAL"
-        for h, v in foot.items():
-            row[h] = v
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            exp = pd.concat([exp, pd.DataFrame([row], columns=headers)], ignore_index=True)
-        fmts = {}
-        for i, (kind, a) in enumerate(metas):
-            if kind == "pct":
-                fmts[i] = '0.0"%"'
-            elif kind in ("metric", "total"):
-                fmts[i] = "#,##0.00" if a == "mean" else "#,##0"
-        export = {"df": exp, "nidx": len(idx_cols), "fmts": fmts, "footer": True}
-    return payload, export, 200
-
-
-def write_excel(payload, export):
-    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-    from openpyxl.utils import get_column_letter
-
-    df, hdr = export["df"], 5
-    out = io.BytesIO()
-    with pd.ExcelWriter(out, engine="openpyxl", datetime_format="DD-MMM-YY") as xw:
-        df.to_excel(xw, index=False, sheet_name="Report", startrow=hdr - 1)
-        ws = xw.sheets["Report"]
-        ws.sheet_view.showGridLines = False
-        ws["A1"], ws["A2"] = payload["title"], f"Period: {payload['period']}"
-        pills = "  |  ".join(f"{k}: {v}" for k, v in payload.get("filters", []))
-        ws["A3"] = f"Filters: {pills}" if pills else "Filters: none"
-        ws["A1"].font = Font(size=16, bold=True, color="1D1D1F")
-        ws["A2"].font = Font(size=11, bold=True, color="0071E3")
-        ws["A3"].font = Font(size=10, color="86868B")
-        ncols, nrows = len(df.columns), len(df)
-        nidx = export["nidx"]
-        blue, line = PatternFill("solid", fgColor="0071E3"), Side(style="thin", color="0071E3")
-        for c in range(1, ncols + 1):
-            cell = ws.cell(row=hdr, column=c)
-            cell.font = Font(bold=True, color="FFFFFF")
-            cell.fill = blue
-            cell.alignment = Alignment(horizontal="left" if c <= nidx else "right", vertical="center", wrap_text=True)
-        ws.row_dimensions[hdr].height = 26
-        for c, fmt in export["fmts"].items():
-            for r in range(hdr + 1, hdr + 1 + nrows):
-                cell = ws.cell(row=r, column=c + 1)
-                cell.number_format = fmt
-                cell.alignment = Alignment(horizontal="right")
-        if export["footer"] and nrows:
-            fill = PatternFill("solid", fgColor="E8F1FD")
-            for c in range(1, ncols + 1):
-                cell = ws.cell(row=hdr + nrows, column=c)
-                cell.font = Font(bold=True, color="1D1D1F")
-                cell.fill = fill
-                cell.border = Border(top=line)
-        for c in range(ncols):
-            sample = [len(str(v)) for v in df.iloc[:200, c].tolist()]
-            ws.column_dimensions[get_column_letter(c + 1)].width = min(
-                44, max(len(str(df.columns[c])) * 0.95, max(sample, default=0)) + 3)
-        ws.freeze_panes = ws.cell(row=hdr + 1, column=max(nidx, 1) + 1)
-    out.seek(0)
-    return out
-
-
-@app.route("/save-to-drive", methods=["POST"])
-def save_to_drive():
-    import base64
+def group_pref(key, default):
+    """A Quick settings choice ('sp', 'ff', 'ss'), saved by the page as a cookie, for requests that don't pass it."""
     try:
-        st = get_state()
-        if st is None:
-            return jsonify({"error": "No data available."}), 400
-        payload, export, _ = build_view(st, request.form, want_export=True)
-        if export is None:
-            return jsonify({"error": "Nothing to export"}), 400
-        out = write_excel(payload, export)
-        
-        encoded_file = base64.b64encode(out.read()).decode('utf-8')
-        payload_data = {
-            "fileName": f"{slug(payload['title'])}.xlsx",
-            "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            "fileData": encoded_file
+        v = request.cookies.get("ap-" + key)
+    except RuntimeError:   # outside a request
+        v = None
+    return default if v not in ("0", "1") else v == "1"
+
+
+def regroup(frame, sp=False, ff=True, ss=None):
+    """Optional roll-ups, each switched in Quick settings: Flagship + Innovative -> SP (sp);
+    Fold / Flip N -> FFN (ff, 'Foldables grouped'); S N, S N+, S N Ultra, S N FE -> SNF (ss, 'S series grouped')."""
+    ss = group_pref("ss", True) if ss is None else ss
+    if not (sp or ff or ss) or frame is None or frame.empty:
+        return frame
+    frame = frame.copy()
+    if sp:
+        frame["seg"] = frame["seg"].replace({"Flagship": "SP", "Innovative": "SP"})
+    if ff or ss:
+        def roll(n):
+            g = series_name(n)
+            if not g:
+                return None
+            return g if (ff if g.startswith("FF") else ss) else None
+        m = {n: roll(n) for n in frame["fam"].unique() if roll(n)}
+        if m:
+            frame["fam"] = frame["fam"].replace(m)
+    return frame
+
+
+def eod_boot_json(st):
+    try:
+        today = eod_today()
+        info = eod_sheet_data(st["df"], st["ctx"], today)
+        month = today.strftime("%Y-%m")
+        t = load_targets()
+        stores = info.get("channels", [])
+        targets = {}
+        for sc in stores + [""]:
+            tgt, _ = month_target(t, sc, month, stores)
+            if not tgt or (tgt.get("v") is None and tgt.get("q") is None):
+                per = spc_targets(t, sc, month, stores)
+                tgt = sum_targets(per.values()) if per else None
+            if tgt:
+                targets[sc or "__all__"] = tgt
+        info.update(targets=targets, month=month, month_label=f"{today:%B %Y}", excluded=st.get("excluded") or 0,
+                    days_total=int(today.days_in_month), today_day=int(today.day),
+                    long_date=f"{today:%A}, {today.day} {today:%B %Y}",
+                    families=json.loads(st["ctx"]["boot_json"]).get("family_names", []))
+    except Exception as exc:
+        t = eod_today()
+        info = {"date_label": t.strftime("%d/%b/%Y").upper(), "day": t.strftime("%A"), "error": str(exc),
+                "channels": [], "data": {}}
+    return json.dumps(info).replace("<", "\\u003c")
+
+
+# Overview (Screen Time-style): daily rollup cached per upload, sliced per request
+OV_MODES = ("day", "week", "month", "quarter", "year")
+OV_DIMS = (("spc", "SPC"), ("fam", "Products"), ("seg", "Segments"), ("store", "Stores"))
+OV_DIM_LIMIT = 60
+DAY = pd.Timedelta(days=1)
+
+
+# display names for segment codes in the overview (SEG1 uses BB / WB for phones)
+SEG_ALIASES = {"bb": "Flagship", "wb": "Innovative", "note pc": "NPC", "notepc": "NPC", "wearable": "Wearables"}
+
+
+SP_SEGS = {"flagship", "innovative", "sp", "smartphone", "smartphones", "hhp"}
+
+
+def category_of(df, seg):
+    """Each row's product category (sp / tab / pc / wear / acc / care) from the best segment column;
+    phones whose sheet only says BB / WB (Flagship / Innovative) count as SP."""
+    col = eod_segment_col(df)
+    if col:
+        vals = df[col].fillna("").astype(str).str.strip()
+        cat = vals.map({u: segment_bucket(u) for u in vals.unique()})
+    else:
+        cat = pd.Series("", index=df.index)
+    phone = seg.astype(str).str.lower().isin(SP_SEGS)
+    return cat.where(cat != "", phone.map({True: "sp", False: ""}))
+
+
+def sp_rows(frame):
+    """Smartphones only: target vs achievement is strictly SP."""
+    return frame[frame["cat"] == "sp"] if "cat" in frame else frame
+
+
+# ---------- store scope: none = all stores, one store, or several stores picked together ----------
+def pick_scope(args, stores):
+    raw = args.getlist("store") if hasattr(args, "getlist") else ([args.get("store")] if args.get("store") else [])
+    out = []
+    for s in raw:
+        for part in str(s).split("\x1f"):
+            if part in stores and part not in out:
+                out.append(part)
+    return out
+
+
+def scope_rows(frame, sel):
+    return frame[frame["store"].isin(sel)] if sel else frame
+
+
+def scope_label(sel):
+    if not sel:
+        return "All Stores"
+    return sel[0] if len(sel) == 1 else f"{len(sel)} stores"
+
+
+def scope_target(t, sel, month, stores):
+    """(target, source) for a store scope: a store's own target or its SPC targets added up;
+    several stores add up store by store; All Stores uses its own entry or the stores' targets."""
+    def one(store):
+        own, summed = month_target(t, store, month, stores)
+        if own and (own.get("v") is not None or own.get("q") is not None):
+            return own, ("stores" if summed else "set")
+        per = spc_targets(t, store, month, stores)
+        return (sum_targets(per.values()), "spc") if per else (None, None)
+    if len(sel) <= 1:
+        return one(sel[0] if sel else "")
+    parts = [one(s)[0] for s in sel]
+    parts = [p for p in parts if p]
+    return (sum_targets(parts), "stores") if parts else (None, None)
+
+
+def scope_spc_targets(t, sel, month, stores):
+    if len(sel) <= 1:
+        return spc_targets(t, sel[0] if sel else "", month, stores)
+    out = {}
+    for s in sel:
+        for name, val in spc_targets(t, s, month, stores).items():
+            cur = out.setdefault(name, {"v": None, "q": None})
+            for f in ("v", "q"):
+                if val.get(f) is not None:
+                    cur[f] = (cur[f] or 0) + val[f]
+    return out
+
+
+def seg_targets(t, store, month):
+    prefix = f"{store or '*'}|{month}|seg|"
+    return {k[len(prefix):]: v for k, v in t.items() if k.startswith(prefix)}
+
+
+def scope_seg_targets(t, sel, month, stores):
+    scopes = sel if sel else [""]
+    out = {}
+    for s in scopes:
+        for name, val in seg_targets(t, s, month).items():
+            cur = out.setdefault(name, {"v": None, "q": None})
+            for f in ("v", "q"):
+                if val.get(f) is not None:
+                    cur[f] = (cur[f] or 0) + val[f]
+    if not sel and not out:  # All Stores without its own segment targets: add up the stores'
+        for s in stores:
+            for name, val in seg_targets(t, s, month).items():
+                cur = out.setdefault(name, {"v": None, "q": None})
+                for f in ("v", "q"):
+                    if val.get(f) is not None:
+                        cur[f] = (cur[f] or 0) + val[f]
+    return out
+
+
+def fam_segments(frame):
+    """Product -> the segment it is mostly sold under (to group products by segment)."""
+    if frame is None or frame.empty:
+        return {}
+    g = frame.groupby(["fam", "seg"], observed=True)["q"].sum().reset_index().sort_values("q", ascending=False)
+    return dict(g.drop_duplicates("fam")[["fam", "seg"]].values.tolist())
+
+
+def daily_frame(st):
+    with _lock:
+        if _state.get("daily_mtime") == st["mtime"]:
+            return _state["daily"]
+    df, ctx = st["df"], st["ctx"]
+    cols = list(df.columns)
+    if not ctx["date"]:
+        out = None
+    else:
+        seg_col = find_col(cols, ("segment", "1"), ("seg1",), ("segment",), ("category",), exact=("segment",))
+        ch_col = find_col(cols, ("channel", "name"), ("channel",))
+        dp_col = find_col(cols, ("tentative", "dp"), exact=("tentative dp",))
+        qty_col = ctx["qty"] if ctx["qty"] and pd.api.types.is_numeric_dtype(df[ctx["qty"]]) else ""
+
+        def text(col, blank):
+            if not col:
+                return pd.Series(blank, index=df.index)
+            s = df[col].fillna("").astype(str).str.strip()
+            return s.where(s != "", blank)
+
+        f = pd.DataFrame({
+            "day": df[ctx["date"]].dt.normalize(),
+            "store": text(ch_col, ""),
+            "seg": text(seg_col, "Other").map(lambda s: SEG_ALIASES.get(s.lower(), s)),
+            "fam": text(ctx["fam"], "Unknown").map(lambda s, m=family_map(df[ctx["fam"]]) if ctx["fam"] else {}: m.get(s, clean_family(s)) or "Unknown"),
+            "spc": text(ctx["spc"], "").str.strip(),
+            "q": pd.to_numeric(df[qty_col], errors="coerce").fillna(0) if qty_col else 1.0,
+            "v": pd.to_numeric(df[dp_col], errors="coerce").fillna(0) if dp_col else 0.0,
+        })
+        f["cat"] = category_of(df, f["seg"])
+        f = f.dropna(subset=["day"])
+        out = f.groupby(["day", "store", "seg", "fam", "spc", "cat"], observed=True, sort=False)[["q", "v"]].sum().reset_index()
+    with _lock:
+        _state.update(daily=out, daily_mtime=st["mtime"])
+    return out
+
+
+def week_start_sun(d):
+    return d - pd.Timedelta(days=(d.weekday() + 1) % 7)
+
+
+LY_DAYS = 364  # day/week compare with last year's same weekday
+
+
+def ly_shift(mode, t):
+    return t - LY_DAYS * DAY if mode in ("day", "week") else t - pd.DateOffset(years=1)
+
+
+# comparison baselines per page: (key, code while the period is running, code once it is complete)
+OV_CUR_CODES = {"day": ("Day", "Day"), "week": ("WTD", "Week"), "month": ("MTD", "Month"), "quarter": ("QTD", "Quarter"),
+                "year": ("YTD", "Year")}
+OV_BASES = {
+    "day": (("prev", "Prev Day", "Prev Day"), ("lm", "LMSD", "LMSD"), ("ly", "LYSD", "LYSD")),
+    "week": (("prev", "LWTD", "LW"), ("lm", "LMWTD", "LMW"), ("ly", "LYSWTD", "LYW")),
+    "month": (("prev", "LMTD", "LM"), ("pp", "LLMTD", "LLM"), ("ly", "LYSMTD", "LYM")),
+    "quarter": (("prev", "LQTD", "LQ"), ("ly", "LYSQTD", "LYQ")),
+    "year": (("prev", "LYTD", "LY"),),
+}
+
+
+def quarter_start(d):
+    return pd.Timestamp(d.year, 3 * ((d.month - 1) // 3) + 1, 1)
+
+
+def month_back(s, n, span):
+    """Same days `n` months before the month starting at `s`, clipped to that month."""
+    a = (s - pd.DateOffset(months=n)).normalize()
+    return a, min(a + span * DAY, a + pd.offsets.MonthEnd(0))
+
+
+def ov_window(mode, date, dmax):
+    """Current period [s, e] cut at the data's last day, plus each comparison window over the same days."""
+    if mode == "day":
+        s = e = date
+    elif mode == "week":
+        s = week_start_sun(date)
+        e = s + 6 * DAY
+    elif mode == "month":
+        s = date.replace(day=1)
+        e = s + pd.offsets.MonthEnd(0)
+    elif mode == "quarter":
+        s = quarter_start(date)
+        e = s + pd.DateOffset(months=3) - DAY
+    else:
+        s, e = pd.Timestamp(date.year, 1, 1), pd.Timestamp(date.year, 12, 31)
+    eff = min(e, dmax)
+    span = max(0, (eff - s).days)
+    b = {}
+    if mode == "day":
+        b["prev"] = (s - DAY, s - DAY)
+        lm = (s - pd.DateOffset(months=1)).normalize()
+        b["lm"] = (lm, lm)
+        b["ly"] = (ly_shift(mode, s), ly_shift(mode, s))
+    elif mode == "week":
+        b["prev"] = (s - 7 * DAY, eff - 7 * DAY)
+        b["lm"] = (s - 28 * DAY, eff - 28 * DAY)   # LMWTD: the same week-to-date days 4 weeks back, so weekdays line up
+        b["ly"] = (ly_shift(mode, s), ly_shift(mode, eff))
+    elif mode == "month":
+        b["prev"] = month_back(s, 1, span)
+        b["pp"] = month_back(s, 2, span)
+        b["ly"] = (ly_shift(mode, s), ly_shift(mode, eff))
+    elif mode == "quarter":
+        ps = s - pd.DateOffset(months=3)
+        b["prev"] = (ps, min(ps + span * DAY, s - DAY))
+        b["ly"] = (ly_shift(mode, s), ly_shift(mode, eff))
+    else:
+        ps = pd.Timestamp(date.year - 1, 1, 1)
+        b["prev"] = (ps, min(ps + span * DAY, pd.Timestamp(date.year - 1, 12, 31)))
+    return {"s": s, "e": e, "eff": eff, "partial": bool(eff < e), "bases": b}
+
+
+def ov_full_windows(mode, w):
+    """The whole of each comparison period (not just the same days): what a period still under way has to beat."""
+    s, e = w["s"], w["e"]
+    if mode == "week":
+        return {"prev": (s - 7 * DAY, e - 7 * DAY), "lm": (s - 28 * DAY, e - 28 * DAY), "ly": (ly_shift(mode, s), ly_shift(mode, e))}
+    if mode == "month":
+        def back(n):
+            a = (s - pd.DateOffset(months=n)).normalize()
+            return a, a + pd.offsets.MonthEnd(0)
+        return {"prev": back(1), "pp": back(2), "ly": (ly_shift(mode, s), ly_shift(mode, s) + pd.offsets.MonthEnd(0))}
+    if mode == "quarter":
+        ps = s - pd.DateOffset(months=3)
+        return {"prev": (ps, s - DAY), "ly": (ly_shift(mode, s), ly_shift(mode, e))}
+    if mode == "year":
+        return {"prev": (pd.Timestamp(s.year - 1, 1, 1), pd.Timestamp(s.year - 1, 12, 31))}
+    return {}
+
+
+def beat_window(a, b, compare):
+    """For a range that is a month, quarter or year still under way: (start, end, code, days left) of the whole
+    matching past period to beat — last month / quarter / year, or the same one last year. None otherwise."""
+    ly = compare == "ly"
+    if a.day == 1 and a.month == b.month and a.year == b.year:
+        end = a + pd.offsets.MonthEnd(0)
+        fa = a - (pd.DateOffset(years=1) if ly else pd.DateOffset(months=1))
+        return (fa, fa + pd.offsets.MonthEnd(0), "LYM" if ly else "LM", (end - b).days) if b < end else None
+    if a == quarter_start(a) and quarter_start(b) == a:
+        end = a + pd.DateOffset(months=3) - DAY
+        fa = a - (pd.DateOffset(years=1) if ly else pd.DateOffset(months=3))
+        return (fa, fa + pd.DateOffset(months=3) - DAY, "LYQ" if ly else "LQ", (end - b).days) if b < end else None
+    if a.month == 1 and a.day == 1 and b.year == a.year:
+        end = pd.Timestamp(a.year, 12, 31)
+        return (pd.Timestamp(a.year - 1, 1, 1), pd.Timestamp(a.year - 1, 12, 31), "LY", (end - b).days) if b < end else None
+    return None
+
+
+def fmt_range(a, b):
+    if a == b:
+        return f"{a.day} {a:%b %Y}"
+    if a.year == b.year and a.month == b.month:
+        return f"{a.day}–{b.day} {b:%b %Y}"
+    if a.year == b.year:
+        return f"{a.day} {a:%b} – {b.day} {b:%b %Y}"
+    return f"{a.day} {a:%b %Y} – {b.day} {b:%b %Y}"
+
+
+def ov_labels(mode, w):
+    s, e = w["s"], w["e"]
+    if mode == "day":
+        title = f"{s:%A}, {s.day} {s:%B %Y}"
+    elif mode == "week":
+        title = fmt_range(s, e)
+    elif mode == "month":
+        title = f"{s:%B %Y}"
+    elif mode == "quarter":
+        title = f"Q{(s.month - 1) // 3 + 1} {s.year} · {s:%b}–{e:%b}"
+    else:
+        title = str(s.year)
+    i = 0 if w["partial"] else 1
+    bases = [{"key": k, "code": codes[i], "range": fmt_range(*w["bases"][k])} for k, *codes in OV_BASES[mode]]
+    return {"label": title, "sub": fmt_range(s, w["eff"]) + (" · to date" if w["partial"] else ""),
+            "codes": {"cur": OV_CUR_CODES[mode][i]}, "ranges": {"cur": fmt_range(s, w["eff"])}, "bases": bases}
+
+
+def ov_slice(d, a, b):
+    return d[(d["day"] >= a) & (d["day"] <= b)]
+
+
+def ov_stats(f):
+    nz = lambda col: int(f.loc[f[col] != "", col].nunique()) if len(f) else 0
+    return {"v": round(float(f["v"].sum())), "q": round(float(f["q"].sum())), "spc": nz("spc"), "fam": nz("fam"),
+            "store": nz("store"), "days": int(f["day"].nunique()) if len(f) else 0}
+
+
+def ov_cols(d, buckets, dmax, mode):
+    """Chart columns with value/qty per segment, plus last year's total for the same bucket (for the pop-up)."""
+    g = d.groupby(["day", "seg"], observed=True)[["v", "q"]].sum().reset_index()
+    tot = d.groupby("day")[["v", "q"]].sum()
+    out = []
+    for a, b, label, key, title in buckets:
+        part = g[(g["day"] >= a) & (g["day"] <= b)].groupby("seg")[["v", "q"]].sum()
+        la, lb = ly_shift(mode, a), ly_shift(mode, min(b, dmax))
+        ly = tot[(tot.index >= la) & (tot.index <= lb)].sum()
+        out.append({"label": label, "key": key, "title": title, "future": bool(a > dmax),
+                    "ly": [round(float(ly["v"])), round(float(ly["q"]))],
+                    "segs": {str(k): [round(float(r["v"])), round(float(r["q"]))] for k, r in part.iterrows()}})
+    return out
+
+
+def ov_chart_for(mode, d, w, dmax, date):
+    if mode == "quarter":
+        buckets, ws = [], week_start_sun(w["s"])
+        while ws <= w["e"]:
+            a, b = max(ws, w["s"]), min(ws + 6 * DAY, w["e"])
+            label = f"{b:%b}" if b.month != a.month else (f"{a:%b}" if a.day == 1 or a == w["s"] else "")
+            buckets.append((a, b, label, a.strftime("%Y-%m-%d"), fmt_range(a, b)))
+            ws += 7 * DAY
+        return ov_cols(d, buckets, dmax, "day")
+    if mode == "year":
+        months = [pd.Timestamp(w["s"].year, m, 1) for m in range(1, 13)]
+        return ov_cols(d, [(m, m + pd.offsets.MonthEnd(0), f"{m:%b}"[0], m.strftime("%Y-%m"), f"{m:%B %Y}") for m in months], dmax, "year")
+    if mode == "month":
+        days = [w["s"] + i * DAY for i in range(w["e"].day)]
+        return ov_cols(d, [(x, x, str(x.day), x.strftime("%Y-%m-%d"), f"{x:%a}, {x.day} {x:%b %Y}") for x in days], dmax, "day")
+    ws = week_start_sun(date)
+    days = [ws + i * DAY for i in range(7)]
+    return ov_cols(d, [(x, x, "SMTWTFS"[(x.weekday() + 1) % 7], x.strftime("%Y-%m-%d"), f"{x:%a}, {x.day} {x:%b %Y}") for x in days], dmax, "day")
+
+
+def ov_dim(cur, base_frames, col, limit=OV_DIM_LIMIT):
+    j = cur.groupby(col, observed=True)[["v", "q"]].sum()
+    for k, f in base_frames.items():
+        j = j.join(f.groupby(col, observed=True)[["v", "q"]].sum().rename(columns={"v": "v_" + k, "q": "q_" + k}), how="outer")
+    j = j.fillna(0)
+    j = j[j.index != ""]
+    if j.empty:
+        return []
+    keep = set(j["v"].nlargest(limit).index) | set(j["q"].nlargest(limit).index)
+    if "v_prev" in j:
+        keep |= set(j["v_prev"].nlargest(limit // 3).index)
+    j = j.loc[sorted(keep, key=lambda k: -j.at[k, "v"])]
+    return [{"name": str(k), "v": round(float(r["v"])), "q": round(float(r["q"])),
+             "b": {b: [round(float(r["v_" + b])), round(float(r["q_" + b]))] for b in base_frames}} for k, r in j.iterrows()]
+
+
+def ov_period(mode, d, date, dmax):
+    w = ov_window(mode, date, dmax)
+    cur = ov_slice(d, w["s"], w["eff"])
+    return w, cur, {k: ov_slice(d, a, b) for k, (a, b) in w["bases"].items()}
+
+
+TARGETS_PATH = os.path.join(UPLOAD_DIR, "targets.json")
+
+
+def load_targets():
+    try:
+        with open(TARGETS_PATH) as fh:
+            t = json.load(fh)
+        return t if isinstance(t, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_target(store, month, v, q):
+    with _lock:
+        t = load_targets()
+        key = f"{store or '*'}|{month}"
+        if v is None and q is None:
+            t.pop(key, None)
+        else:
+            t[key] = {"v": v, "q": q}
+        tmp = TARGETS_PATH + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(t, fh)
+        os.replace(tmp, TARGETS_PATH)
+
+
+def month_target(t, store, month, stores):
+    """A store's own target; for All Stores, its own entry or else the sum of the stores' targets."""
+    own = t.get(f"{store or '*'}|{month}")
+    if own or store:
+        return own, False
+    parts = [t[k] for k in (f"{s}|{month}" for s in stores) if k in t]
+    if not parts:
+        return None, False
+    add = lambda f: sum(p[f] for p in parts if p.get(f) is not None) if any(p.get(f) is not None for p in parts) else None
+    return {"v": add("v"), "q": add("q")}, True
+
+
+def ov_plan(mode, w, sel, stores, dmin, cur=None):
+    """Run rate, month-end (or period-end) projection and target for month / quarter / year pages.
+    Targets are smartphone (SP) targets, so achievement is worked out on SP sales only."""
+    if mode not in ("month", "quarter", "year"):
+        return None
+    spf = sp_rows(cur) if cur is not None else None
+    sp = {"v": round(float(spf["v"].sum())), "q": round(float(spf["q"].sum()))} if spf is not None else None
+    s, e, eff = w["s"], w["e"], w["eff"]
+    total = (e - s).days + 1
+    elapsed = max(0, (eff - s).days + 1)
+    covered = max(0, (eff - max(s, dmin)).days + 1)  # days the sheet actually covers, for the run rate
+    t, months, tv, tq, have, summed = load_targets(), [], 0.0, 0.0, 0, False
+    m = s
+    while m <= e:
+        months.append(m.strftime("%Y-%m"))
+        m = m + pd.DateOffset(months=1)
+    has_v = has_q = False
+    extra = {}
+    if len(sel) != 1 and not any(f"*|{mk}" in t for mk in months):
+        # several stores: targets and sales of the same stores only — the ones with a target for every month here
+        pool = sel or stores
+        per = {x: [scope_target(t, [x], mk, stores)[0] for mk in months] for x in pool}
+        have = sum(1 for i in range(len(months)) if any(per[x][i] for x in pool))
+        full = sorted(x for x in pool if all(per[x]))
+        for x in full:
+            for tg in per[x]:
+                if tg.get("v") is not None:
+                    tv += tg["v"]; has_v = True
+                if tg.get("q") is not None:
+                    tq += tg["q"]; has_q = True
+        summed = bool(full)
+        if not full:
+            have = min(have, len(months) - 1) if len(months) > 1 else 0   # no store covers the whole period: no achievement
+        tsp = sp_rows(cur[cur["store"].isin(full)]) if cur is not None and full else None
+        extra = {"target_stores": len(full), "scope_stores": len(pool),
+                 "sp_target": {"v": round(float(tsp["v"].sum())), "q": round(float(tsp["q"].sum()))} if tsp is not None else {"v": 0, "q": 0}}
+    else:
+        for mk in months:
+            tgt, src = scope_target(t, sel, mk, stores)
+            was_sum = src == "stores"
+            summed = summed or was_sum
+            if tgt:
+                have += 1
+                if tgt.get("v") is not None:
+                    tv += tgt["v"]; has_v = True
+                if tgt.get("q") is not None:
+                    tq += tgt["q"]; has_q = True
+    return {"days_total": total, "days_elapsed": elapsed, "days_left": total - elapsed, "days_data": covered,
+            "data_from": max(s, dmin).strftime("%Y-%m-%d"),
+            "target": {"v": tv if has_v else None, "q": tq if has_q else None},
+            "months_set": have, "months": len(months), "summed": summed, "sp": sp,
+            "editable": mode == "month" and len(sel) == 1, "month": s.strftime("%Y-%m"), **extra}
+
+
+def spc_target_key(store, month, spc):
+    return f"{store or '*'}|{month}|spc|{spc}"
+
+
+def spc_targets(t, store, month, stores):
+    """SPC targets for a store/month; for All Stores, every store's SPC targets added up by SPC name."""
+    scopes = [store] if store else [""] + list(stores)
+    out = {}
+    for sc in scopes:
+        prefix = f"{sc or '*'}|{month}|spc|"
+        for k, val in t.items():
+            if k.startswith(prefix):
+                name = k[len(prefix):]
+                cur = out.setdefault(name, {"v": None, "q": None})
+                for f in ("v", "q"):
+                    if val.get(f) is not None:
+                        cur[f] = (cur[f] or 0) + val[f]
+    return out
+
+
+def save_month_targets(store, month, store_t, spc_map, seg_map=None):
+    """Each part is replaced only when given (None leaves it as it is)."""
+    with _lock:
+        t = load_targets()
+        key = f"{store or '*'}|{month}"
+        if store_t is not None:
+            if store_t.get("v") is not None or store_t.get("q") is not None:
+                t[key] = store_t
+            else:
+                t.pop(key, None)
+        for kind, mp in (("spc", spc_map), ("seg", seg_map)):
+            if mp is None:
+                continue
+            prefix = f"{store or '*'}|{month}|{kind}|"
+            for k in [k for k in t if k.startswith(prefix)]:
+                del t[k]
+            for name, val in mp.items():
+                if val.get("v") is not None or val.get("q") is not None:
+                    t[prefix + name] = val
+        tmp = TARGETS_PATH + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(t, fh)
+        os.replace(tmp, TARGETS_PATH)
+
+
+def sum_targets(vals):
+    out = {"v": None, "q": None}
+    for val in vals:
+        for f in ("v", "q"):
+            if val and val.get(f) is not None:
+                out[f] = (out[f] or 0) + val[f]
+    return out
+
+
+def ach_pack(cur, lm, days):
+    """Detail behind the insights for one scope: segments and products [v, q, lmtd v, lmtd q], daily v/q, LMTD totals."""
+    r = lambda x: round(float(x))
+    seg = cur.groupby("seg")[["v", "q"]].sum().join(lm.groupby("seg")[["v", "q"]].sum(), rsuffix="_l", how="outer").fillna(0)
+    fam = cur.groupby("fam")[["v", "q"]].sum().join(lm.groupby("fam")[["v", "q"]].sum(), rsuffix="_l", how="outer").fillna(0)
+    fam = fam[(fam["v"] + fam["q"] + fam["v_l"] + fam["q_l"]) > 0].sort_values(["v", "v_l"], ascending=False).head(60)
+    per_day = cur.groupby("day")[["v", "q"]].sum()
+    return {
+        "segs": {str(k): [r(x["v"]), r(x["q"]), r(x["v_l"]), r(x["q_l"])] for k, x in seg.sort_values("v", ascending=False).iterrows()},
+        "fams": [[str(k), r(x["v"]), r(x["q"]), r(x["v_l"]), r(x["q_l"])] for k, x in fam.iterrows()],
+        "dv": [r(per_day.at[d, "v"]) if d in per_day.index else 0 for d in days],
+        "dq": [r(per_day.at[d, "q"]) if d in per_day.index else 0 for d in days],
+        "lm": {"v": r(lm["v"].sum()), "q": r(lm["q"].sum())},
+    }
+
+
+def ach_deep(d, s, eff):
+    if eff < s:
+        return None
+    la, lb = month_back(s, 1, (eff - s).days)
+    cur, lm = ov_slice(d, s, eff), ov_slice(d, la, lb)
+    days = list(pd.date_range(s, eff, freq="D"))
+    names = sorted(set(cur.loc[cur["spc"] != "", "spc"]) | set(lm.loc[lm["spc"] != "", "spc"]))
+    return {
+        "labels": [f"{x.day} {x:%b}" for x in days], "lm_range": fmt_range(la, lb),
+        "store": ach_pack(cur, lm, days),
+        "spc": {n: ach_pack(cur[cur["spc"] == n], lm[lm["spc"] == n], days) for n in names},
+        "untagged": {"v": round(float(cur.loc[cur["spc"] == "", "v"].sum())), "q": round(float(cur.loc[cur["spc"] == "", "q"].sum()))},
+    }
+
+
+def default_target_store(daily, stores):
+    """The store Target vs Achievement opens on when none (or several) is picked."""
+    latest = {}
+    for k in load_targets():
+        parts = k.split("|")
+        if len(parts) == 2 and parts[0] in stores:
+            latest[parts[0]] = max(latest.get(parts[0], ""), parts[1])
+    if latest:
+        return max(latest, key=lambda x: (latest[x], x))
+    sp = sp_rows(daily)
+    tot = sp[sp["store"] != ""].groupby("store")["v"].sum()
+    return str(tot.idxmax()) if len(tot) else stores[0]
+
+
+def targets_data(st, month_s, sel_args, seg_pick=""):
+    daily = daily_frame(st)
+    if daily is None or daily.empty:
+        return {"error": "This sheet has no usable date column, so targets can't be tracked."}
+    stores = sorted(s for s in daily["store"].unique() if s)
+    if not stores:
+        return {"error": "This sheet has no store (Channel Name) column, so targets can't be set."}
+    sel = pick_scope(sel_args, stores)
+    if len(sel) != 1:   # one store at a time: the first one picked, else the latest store with a target, else the top seller
+        sel = [sel[0]] if sel else [default_target_store(daily, stores)]
+    d_all = scope_rows(daily, sel)
+    d = sp_rows(d_all)                                   # strictly smartphones
+    dmin, dmax = daily["day"].min(), daily["day"].max()
+    first, last = dmin.replace(day=1), (dmax.replace(day=1) + pd.DateOffset(months=2))
+    months = []
+    m = first
+    while m <= last:
+        months.append(m.strftime("%Y-%m"))
+        m += pd.DateOffset(months=1)
+    month = month_s if month_s in months else dmax.strftime("%Y-%m")
+    s = pd.Timestamp(month + "-01")
+    e = s + pd.offsets.MonthEnd(0)
+    eff = min(e, dmax)
+    total = (e - s).days + 1
+    elapsed = max(0, (eff - s).days + 1)
+    covered = max(0, (eff - max(s, dmin)).days + 1)
+    recent = ov_slice(d, s - pd.DateOffset(months=2), e)
+    sp_segs = [x for x in recent.groupby("seg")["v"].sum().sort_values(ascending=False).index if x]
+    seg = seg_pick if seg_pick in sp_segs else ""
+    dseg = d[d["seg"] == seg] if seg else d
+    cur = ov_slice(dseg, s, eff) if eff >= s else dseg.iloc[0:0]
+
+    t = load_targets()
+    store_key = sel[0] if len(sel) == 1 else ""
+    store_t, source = scope_target(t, sel, month, stores)
+    own, summed = month_target(t, store_key, month, stores) if len(sel) <= 1 else (None, False)
+    spc_t = scope_spc_targets(t, sel, month, stores)
+    seg_t = scope_seg_targets(t, sel, month, stores)
+
+    # with a segment picked: its own target; SPC targets follow the segment's share of the store target
+    ratio = {"v": None, "q": None}
+    main_t = store_t
+    if seg:
+        main_t = seg_t.get(seg)
+        for f in ("v", "q"):
+            if main_t and main_t.get(f) is not None and store_t and store_t.get(f):
+                ratio[f] = main_t[f] / store_t[f]
+
+    def spc_target(n):
+        tt = spc_t.get(n)
+        if not seg or not tt:
+            return tt
+        out = {f: (tt[f] * ratio[f] if tt.get(f) is not None and ratio[f] is not None else None) for f in ("v", "q")}
+        return out if out["v"] is not None or out["q"] is not None else None
+
+    act = cur[cur["spc"] != ""].groupby("spc")[["v", "q"]].sum()
+    names = set(recent.loc[recent["spc"] != "", "spc"].unique()) | set(spc_t) | set(act.index)
+    spcs = []
+    for n in sorted(names, key=lambda x: (-(act.at[x, "v"] if x in act.index else 0), x.lower())):
+        a = act.loc[n] if n in act.index else None
+        spcs.append({"name": n, "t": spc_target(n), "own_t": spc_t.get(n),
+                     "a": {"v": round(float(a["v"])) if a is not None else 0, "q": round(float(a["q"])) if a is not None else 0}})
+
+    store_rows = []
+    scope_stores = sel if len(sel) > 1 else (stores if not sel and len(stores) > 1 else [])
+    if scope_stores:
+        sa = cur.groupby("store")[["v", "q"]].sum()
+        for sn in scope_stores:
+            st_t, _ = scope_target(t, [sn], month, stores)
+            if seg:
+                st_t = seg_targets(t, sn, month).get(seg)
+            a = sa.loc[sn] if sn in sa.index else None
+            store_rows.append({"name": sn, "t": st_t, "a": {"v": round(float(a["v"])) if a is not None else 0,
+                                                             "q": round(float(a["q"])) if a is not None else 0}})
+
+    # every SP segment side by side (always the full SP picture, whichever segment is picked)
+    la, lb = month_back(s, 1, max(0, (eff - s).days))
+    seg_cur = ov_slice(d, s, eff).groupby("seg")[["v", "q"]].sum() if eff >= s else None
+    seg_lm = ov_slice(d, la, lb).groupby("seg")[["v", "q"]].sum()
+    seg_rows = []
+    for sg in sp_segs:
+        a = seg_cur.loc[sg] if seg_cur is not None and sg in seg_cur.index else None
+        lmr = seg_lm.loc[sg] if sg in seg_lm.index else None
+        seg_rows.append({"name": sg, "t": seg_t.get(sg),
+                         "a": {"v": round(float(a["v"])) if a is not None else 0, "q": round(float(a["q"])) if a is not None else 0},
+                         "lm": {"v": round(float(lmr["v"])) if lmr is not None else 0, "q": round(float(lmr["q"])) if lmr is not None else 0}})
+
+    lm = (s - pd.DateOffset(months=1)).strftime("%Y-%m")
+    lm_own, _ = month_target(t, store_key, lm, stores)
+    fseg = fam_segments(d)
+    deep = ach_deep(dseg, s, eff)
+    if deep:
+        deep["fam_seg"] = fseg
+    return {
+        "month": month, "label": f"{s:%B %Y}", "months": months, "stores": stores, "scope": sel,
+        "store": store_key, "store_label": scope_label(sel),
+        "editable": True, "seg": seg, "sp_segs": sp_segs,
+        "has_spc": bool((daily["spc"] != "").any()),
+        "days_total": total, "days_elapsed": elapsed, "days_left": total - elapsed, "days_data": covered,
+        "future": bool(s > dmax), "dmax": dmax.strftime("%Y-%m-%d"),
+        "store_target": main_t, "store_target_source": source if not seg else ("seg" if main_t else None),
+        "store_total_target": store_t,
+        "store_target_own": own if own and not summed else None,
+        "seg_targets": seg_t, "seg_ratio": ratio,
+        "actual": {"v": round(float(cur["v"].sum())), "q": round(float(cur["q"].sum()))},
+        "spcs": spcs, "store_rows": store_rows, "seg_rows": seg_rows,
+        "last_month": {"month": lm, "store_target": lm_own, "spc": spc_targets(t, store_key, lm, stores),
+                       "seg": seg_targets(t, store_key, lm)},
+        "deep": deep,
+        "updated": updated_note(),
+    }
+
+
+CH_BUILTIN = (("seg", "Segment"), ("fam", "Model"), ("spc", "SPC"), ("store", "Store"))
+CH_TIME = (("day", "Day"), ("week", "Week"), ("month", "Month"), ("weekday", "Weekday"))
+CH_SKIP = re.compile(r"date|code|imei|remark|upload|validat|status|by$|emi|gap|^sale|^act|serial|mobile|phone", re.I)
+CH_SPLIT_MAX = 6
+WEEKDAYS = ("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat")
+
+
+def chart_frame(st):
+    """Row-level frame for the Charts page: the overview dimensions plus the sheet's other short text columns."""
+    with _lock:
+        if _state.get("cframe_mtime") == st["mtime"]:
+            return _state["cframe"], _state["cdims"]
+    df, ctx = st["df"], st["ctx"]
+    if not ctx["date"]:
+        return None, []
+    cols = list(df.columns)
+    seg_col = find_col(cols, ("segment", "1"), ("seg1",), ("segment",), ("category",), exact=("segment",))
+    ch_col = find_col(cols, ("channel", "name"), ("channel",))
+    dp_col = find_col(cols, ("tentative", "dp"), exact=("tentative dp",))
+    qty_col = ctx["qty"] if ctx["qty"] and pd.api.types.is_numeric_dtype(df[ctx["qty"]]) else ""
+    used = {ctx["date"], seg_col, ch_col, dp_col, qty_col, ctx["fam"], ctx["spc"]}
+
+    def text(col, blank):
+        if not col:
+            return pd.Series(blank, index=df.index)
+        s = df[col].fillna("").astype(str).str.strip()
+        return s.where(s != "", blank)
+
+    f = pd.DataFrame({
+        "day": df[ctx["date"]].dt.normalize(),
+        "store": text(ch_col, ""),
+        "seg": text(seg_col, "Other").map(lambda s: SEG_ALIASES.get(s.lower(), s)),
+        "fam": text(ctx["fam"], "Unknown").map(lambda s, m=family_map(df[ctx["fam"]]) if ctx["fam"] else {}: m.get(s, clean_family(s)) or "Unknown"),
+        "spc": text(ctx["spc"], "").str.strip(),
+        "q": pd.to_numeric(df[qty_col], errors="coerce").fillna(0) if qty_col else 1.0,
+        "v": pd.to_numeric(df[dp_col], errors="coerce").fillna(0) if dp_col else 0.0,
+    })
+    f["cat"] = category_of(df, f["seg"])
+    extras = []
+    for c in cols:
+        if c in used or CH_SKIP.search(c) or pd.api.types.is_numeric_dtype(df[c]) or pd.api.types.is_datetime64_any_dtype(df[c]):
+            continue
+        n = df[c].nunique(dropna=True)
+        if 2 <= n <= 150:
+            key = "x%d" % len(extras)
+            f[key] = text(c, "(blank)")
+            extras.append({"key": key, "label": c})
+    f = f.dropna(subset=["day"])
+    dims = [{"key": k, "label": lab} for k, lab in CH_BUILTIN if (f[k] != "").any()] + extras
+    with _lock:
+        _state.update(cframe=f, cdims=dims, cframe_mtime=st["mtime"])
+    return f, dims
+
+
+def ch_bucket(day, x):
+    if x == "day":
+        return day
+    if x == "week":
+        return day - pd.to_timedelta((day.dt.weekday + 1) % 7, unit="D")
+    if x == "month":
+        return day - pd.to_timedelta(day.dt.day - 1, unit="D")
+    return (day.dt.weekday + 1) % 7  # weekday, Sunday first
+
+
+def ch_time_keys(x, a, b):
+    if x == "weekday":
+        return list(range(7))
+    if x == "day":
+        return list(pd.date_range(a, b, freq="D"))
+    if x == "week":
+        s = a - pd.Timedelta(days=(a.weekday() + 1) % 7)
+        return list(pd.date_range(s, b, freq="7D"))
+    return list(pd.date_range(a.replace(day=1), b, freq="MS"))
+
+
+def ch_label(x, k):
+    if x == "weekday":
+        return WEEKDAYS[int(k)]
+    if x == "day":
+        return f"{k.day} {k:%b}"
+    if x == "week":
+        return f"{k.day} {k:%b}"
+    return f"{k:%b %y}"
+
+
+def chart_data(st, args):
+    f, dims = chart_frame(st)
+    if f is None or f.empty:
+        return {"error": "This sheet has no usable date column, so charts can't be built."}
+    stores = sorted(s for s in f["store"].unique() if s)
+    sel = pick_scope(args, stores)
+    dmin, dmax = f["day"].min(), f["day"].max()
+    a, b = parse_date(args.get("start")), parse_date(args.get("end"))
+    a = dmax.replace(day=1) if a is None else a.normalize()
+    b = dmax if b is None else b.normalize()
+    if a > b:
+        a, b = b, a
+    dim_keys = {d["key"]: d["label"] for d in dims}
+    x = args.get("x", "day")
+    x = x if x in dict(CH_TIME) or x in dim_keys else "day"
+    split = args.get("split", "")
+    split = split if split in dim_keys and split != x else ""
+    metric = args.get("metric", "v")
+    rank_col = "q" if metric == "q" else "v"
+    try:
+        top = max(0, min(100, int(args.get("top", 10))))
+    except ValueError:
+        top = 10
+    compare = args.get("compare", "")
+
+    grouped = regroup(scope_rows(f, sel), args.get("sp") == "1", args.get("ff", "1") == "1")
+    in_range = grouped[(grouped["day"] >= a) & (grouped["day"] <= b)]
+    seg_list = [k for k, v in in_range.groupby("seg")["v"].sum().sort_values(ascending=False).items() if k and v > 0]
+    base = seg_only(grouped, args)
+    cur = base[(base["day"] >= a) & (base["day"] <= b)]
+    is_time = x in dict(CH_TIME)
+
+    # x buckets
+    if is_time:
+        keys = ch_time_keys(x, a, b)
+        cur_x = ch_bucket(cur["day"], x)
+        other_x = None
+    else:
+        tot = cur.groupby(x)[["v", "q"]].sum().sort_values(rank_col, ascending=False)
+        keys = list(tot.index)
+        if top and len(keys) > top:
+            keys, other_x = keys[:top], "Other"
+        else:
+            other_x = None
+        cur_x = cur[x].where(cur[x].isin(keys), "Other") if other_x else cur[x]
+        if other_x:
+            keys = keys + ["Other"]
+
+    # split series
+    if split:
+        stot = cur.groupby(split)[["v", "q"]].sum().sort_values(rank_col, ascending=False)
+        names = list(stot.index)
+        if len(names) > CH_SPLIT_MAX:
+            names = names[:CH_SPLIT_MAX - 1] + ["Other"]
+        series_key = cur[split].where(cur[split].isin(names), "Other")
+    else:
+        names = ["Total"]
+        series_key = pd.Series("Total", index=cur.index)
+
+    g = pd.DataFrame({"x": cur_x, "s": series_key, "v": cur["v"], "q": cur["q"]}).groupby(["x", "s"])[["v", "q"]].sum()
+    series = []
+    for n in names:
+        vs, qs = [], []
+        for k in keys:
+            if (k, n) in g.index:
+                r = g.loc[(k, n)]
+                vs.append(round(float(r["v"]))); qs.append(round(float(r["q"])))
+            else:
+                vs.append(0); qs.append(0)
+        series.append({"name": str(n), "v": vs, "q": qs})
+
+    # comparison: the same buckets over the previous span or last year
+    comp = None
+    if compare in ("prev", "ly"):
+        if compare == "ly":
+            shift = pd.Timedelta(days=364) if x in ("day", "week", "weekday") else pd.DateOffset(years=1)
+            clabel = "Last year"
+        elif x == "month":
+            shift = pd.DateOffset(months=len(keys))
+            clabel = "Previous period"
+        else:
+            shift = pd.Timedelta(days=(b - a).days + 1)
+            clabel = "Previous period"
+        ca, cb = a - shift, b - shift
+        cf = base[(base["day"] >= ca) & (base["day"] <= cb)]
+        if is_time:
+            ck = ch_bucket(cf["day"] + shift, x) if x != "weekday" else ch_bucket(cf["day"], x)
+        else:
+            ck = cf[x].where(cf[x].isin(keys), "Other") if other_x else cf[x]
+        cg = pd.DataFrame({"x": ck, "v": cf["v"], "q": cf["q"]}).groupby("x")[["v", "q"]].sum()
+        comp = {"label": clabel, "range": fmt_range(ca, cb),
+                "v": [round(float(cg.at[k, "v"])) if k in cg.index else 0 for k in keys],
+                "q": [round(float(cg.at[k, "q"])) if k in cg.index else 0 for k in keys]}
+
+    return {
+        "x": [{"key": (k.strftime("%Y-%m-%d") if isinstance(k, pd.Timestamp) else str(k)),
+               "label": ch_label(x, k) if is_time else str(k),
+               "future": bool(isinstance(k, pd.Timestamp) and k > dmax)} for k in keys],
+        "x_kind": "time" if is_time else "cat", "x_dim": x, "split": split,
+        "series": series, "compare": comp,
+        "total": {"v": round(float(cur["v"].sum())), "q": round(float(cur["q"].sum()))},
+        "range": fmt_range(a, b), "start": a.strftime("%Y-%m-%d"), "end": b.strftime("%Y-%m-%d"),
+        "dmin": dmin.strftime("%Y-%m-%d"), "dmax": dmax.strftime("%Y-%m-%d"),
+        "dims": dims, "time_dims": [{"key": k, "label": lab} for k, lab in CH_TIME], "segments": seg_list,
+        "stores": stores, "scope": sel, "store": sel[0] if len(sel) == 1 else "", "store_label": scope_label(sel),
+        "updated": updated_note(),
+    }
+
+
+def spc_base_window(a, b, compare):
+    """Comparison window over the same days: month-to-date style ranges compare with the same dates last month."""
+    if compare == "ly":
+        return a - pd.DateOffset(years=1), b - pd.DateOffset(years=1), "LY"
+    if a.day == 1 and a.month == b.month and a.year == b.year:
+        pa, pb = month_back(a, 1, (b - a).days)
+        return pa, pb, "LM"
+    span = (b - a).days + 1
+    return a - pd.Timedelta(days=span), b - pd.Timedelta(days=span), "Prev"
+
+
+def spc_data(st, args):
+    f, _ = chart_frame(st)
+    if f is None or f.empty:
+        return {"error": "This sheet has no usable date column."}
+    if not (f["spc"] != "").any():
+        return {"error": "This sheet has no SPC Name column, so SPC contribution can't be worked out."}
+    stores = sorted(s for s in f["store"].unique() if s)
+    sel = pick_scope(args, stores)
+    if not sel and len(stores) == 1:
+        sel = list(stores)
+    dmin, dmax = f["day"].min(), f["day"].max()
+    a, b = parse_date(args.get("start")), parse_date(args.get("end"))
+    a = dmax.replace(day=1) if a is None else a.normalize()
+    b = dmax if b is None else min(b.normalize(), dmax)
+    if a > b:
+        a, b = b, a
+    compare = "ly" if args.get("compare") == "ly" else "prev"
+    pa, pb, code = spc_base_window(a, b, compare)
+
+    base = seg_only(regroup(scope_rows(f, sel), args.get("sp") == "1", args.get("ff", "1") == "1"), args)
+    cur = base[(base["day"] >= a) & (base["day"] <= b)]
+    prev = base[(base["day"] >= pa) & (base["day"] <= pb)]
+    named = cur[cur["spc"] != ""]
+    sp_spc = sp_rows(named).groupby("spc")[["v", "q"]].sum()   # SP sales, for target achievement
+    bw = beat_window(a, b, compare)
+    if bw and bw[0] < dmin:
+        bw = None   # the whole past period isn't in the sheet
+    full = base[(base["day"] >= bw[0]) & (base["day"] <= bw[1])] if bw else None
+    full_spc = full[full["spc"] != ""].groupby("spc")[["v", "q"]].sum() if bw else None
+
+    seg_order = list(cur.groupby("seg")["v"].sum().sort_values(ascending=False).index)
+    seg_tot = cur.groupby("seg")[["v", "q"]].sum()
+    by_spc = named.groupby("spc")[["v", "q"]].sum()
+    prev_spc = prev[prev["spc"] != ""].groupby("spc")[["v", "q"]].sum()
+    days_on = named.groupby("spc")["day"].nunique()
+    seg_cell = named.groupby(["spc", "seg"])[["v", "q"]].sum()
+    fam_cell = named.groupby(["spc", "fam"])[["v", "q"]].sum()
+
+    month = a.strftime("%Y-%m")
+    tgt = {}
+    if a.month == b.month and a.year == b.year:  # SPC targets are monthly
+        tgt = scope_spc_targets(load_targets(), sel, month, stores)
+
+    names = sorted(set(by_spc.index) | set(prev_spc.index), key=lambda n: -(by_spc.at[n, "v"] if n in by_spc.index else 0))
+    rows = []
+    for n in names:
+        c = by_spc.loc[n] if n in by_spc.index else None
+        p = prev_spc.loc[n] if n in prev_spc.index else None
+        segs = {}
+        if c is not None:
+            for s in seg_order:
+                if (n, s) in seg_cell.index:
+                    r = seg_cell.loc[(n, s)]
+                    segs[s] = [round(float(r["v"])), round(float(r["q"]))]
+        top = []
+        if c is not None:
+            fm = fam_cell.loc[n].sort_values("v", ascending=False).head(3)
+            top = [[str(k), round(float(r["q"])), round(float(r["v"]))] for k, r in fm.iterrows()]
+        rows.append({"name": n,
+                     "v": round(float(c["v"])) if c is not None else 0, "q": round(float(c["q"])) if c is not None else 0,
+                     "bv": round(float(p["v"])) if p is not None else 0, "bq": round(float(p["q"])) if p is not None else 0,
+                     "days": int(days_on.get(n, 0)), "segs": segs, "top": top, "target": tgt.get(n),
+                     "spv": round(float(sp_spc.at[n, "v"])) if n in sp_spc.index else 0,
+                     "spq": round(float(sp_spc.at[n, "q"])) if n in sp_spc.index else 0,
+                     "fv": round(float(full_spc.at[n, "v"])) if bw and n in full_spc.index else 0,
+                     "fq": round(float(full_spc.at[n, "q"])) if bw and n in full_spc.index else 0})
+
+    fseg = fam_segments(cur)
+    prod_tot = cur.groupby("fam")[["v", "q"]].sum()
+    prod_tot = prod_tot[(prod_tot["v"] + prod_tot["q"]) > 0].sort_values("v", ascending=False).head(150)   # every segment's full list
+    prod_prev = prev.groupby("fam")[["v", "q"]].sum()
+    products = []
+    for k, x in prod_tot.iterrows():
+        by = {}
+        for n in by_spc.index:
+            if (n, k) in fam_cell.index:
+                c = fam_cell.loc[(n, k)]
+                by[n] = [round(float(c["v"])), round(float(c["q"]))]
+        bp = prod_prev.loc[k] if k in prod_prev.index else None
+        products.append({"name": str(k), "seg": fseg.get(k, ""), "v": round(float(x["v"])), "q": round(float(x["q"])),
+                         "bv": round(float(bp["v"])) if bp is not None else 0, "bq": round(float(bp["q"])) if bp is not None else 0, "by": by})
+
+    days = list(pd.date_range(a, b, freq="D"))
+    daily = named.groupby(["day", "spc"])["v"].sum()
+    dq = named.groupby(["day", "spc"])["q"].sum()
+    trend = {"days": [d.strftime("%Y-%m-%d") for d in days],
+             "labels": [f"{d.day} {d:%b}" for d in days],
+             "v": {n: [round(float(daily.get((d, n), 0))) for d in days] for n in by_spc.index},
+             "q": {n: [round(float(dq.get((d, n), 0))) for d in days] for n in by_spc.index}} if len(days) <= 120 else None
+
+    return {
+        "store": sel[0] if len(sel) == 1 else "", "scope": sel, "store_label": scope_label(sel), "stores": stores,
+        "start": a.strftime("%Y-%m-%d"), "end": b.strftime("%Y-%m-%d"),
+        "dmin": dmin.strftime("%Y-%m-%d"), "dmax": dmax.strftime("%Y-%m-%d"),
+        "range": fmt_range(a, b), "base_range": fmt_range(pa, pb), "base_code": code, "compare": compare,
+        "total": {"v": round(float(cur["v"].sum())), "q": round(float(cur["q"].sum())),
+                  "bv": round(float(prev["v"].sum())), "bq": round(float(prev["q"].sum())),
+                  "unassigned_v": round(float(cur.loc[cur["spc"] == "", "v"].sum())),
+                  "unassigned_q": round(float(cur.loc[cur["spc"] == "", "q"].sum())),
+                  "days": int(cur["day"].nunique())},
+        "segments": [{"name": s, "v": round(float(seg_tot.at[s, "v"])), "q": round(float(seg_tot.at[s, "q"]))} for s in seg_order],
+        "spcs": rows, "trend": trend, "products": products, "updated": updated_note(),
+        "beat": {"code": bw[2], "range": fmt_range(bw[0], bw[1]), "days_left": bw[3],
+                 "v": round(float(full["v"].sum())), "q": round(float(full["q"].sum()))} if bw else None,
+    }
+
+
+PERIOD_LIMITS = {"day": 62, "week": 53, "month": 60, "quarter": 40, "year": 20}
+
+
+def periods_data(st, gran, sel_args, sp=False, ff=True):
+    """Every day / week / month / quarter / year in the data (latest first), each with its comparison windows."""
+    daily = daily_frame(st)
+    if daily is None or daily.empty:
+        return {"error": "This sheet has no usable date column."}
+    gran = gran if gran in PERIOD_LIMITS else "month"
+    stores = sorted(s for s in daily["store"].unique() if s)
+    sel = pick_scope(sel_args, stores)
+    d = seg_only(regroup(scope_rows(daily, sel), sp, ff), sel_args)
+    dmin, dmax = daily["day"].min(), daily["day"].max()
+    tot = d.groupby("day")[["v", "q"]].sum()
+    idx = pd.date_range(min(dmin, tot.index.min()) - pd.DateOffset(years=2), dmax, freq="D")
+    cum = tot.reindex(idx, fill_value=0).cumsum()
+
+    def window(a, b):
+        a, b = max(a, idx[0]), min(b, idx[-1])
+        if a > b:
+            return 0.0, 0.0
+        hi = cum.loc[b]
+        lo = cum.loc[a - DAY] if a - DAY >= idx[0] else cum.iloc[0] * 0
+        return float(hi["v"] - lo["v"]), float(hi["q"] - lo["q"])
+
+    starts = []
+    s = {"day": dmax, "week": week_start_sun(dmax), "month": dmax.replace(day=1),
+         "quarter": quarter_start(dmax), "year": pd.Timestamp(dmax.year, 1, 1)}[gran]
+    step = {"day": pd.Timedelta(days=1), "week": pd.Timedelta(days=7), "month": pd.DateOffset(months=1),
+            "quarter": pd.DateOffset(months=3), "year": pd.DateOffset(years=1)}[gran]
+    while s + step > dmin and len(starts) < PERIOD_LIMITS[gran]:  # keep every period that overlaps the data
+        starts.append(s)
+        s = s - step
+    rows = []
+    for s in starts:
+        w = ov_window(gran, s, dmax)
+        lab = ov_labels(gran, w)
+        v, q = window(w["s"], w["eff"])
+        bases = [{"key": b["key"], "code": b["code"], "range": b["range"], "v": round(x[0]), "q": round(x[1])}
+                 for b in lab["bases"] for x in [window(*w["bases"][b["key"]])]]
+        rows.append({"label": lab["label"], "range": lab["ranges"]["cur"], "partial": w["partial"], "code": lab["codes"]["cur"],
+                     "v": round(v), "q": round(q), "days": int(((tot.index >= w["s"]) & (tot.index <= w["eff"])).sum()),
+                     "bases": bases})
+    return {"gran": gran, "scope": sel, "rows": rows, "dmax": dmax.strftime("%Y-%m-%d")}
+
+
+def overview_data(st, mode, date_s, sel_args, sp=False, ff=True):
+    daily = daily_frame(st)
+    if daily is None or daily.empty:
+        return {"error": "This sheet has no usable date column, so the overview can't be built."}
+    stores = sorted(s for s in daily["store"].unique() if s)
+    sel = pick_scope(sel_args, stores)
+    store = sel[0] if len(sel) == 1 else ""
+    d = seg_only(regroup(scope_rows(daily, sel), sp, ff), sel_args)
+    dmin, dmax = daily["day"].min(), daily["day"].max()
+    date = parse_date(date_s)
+    date = dmax if date is None else min(max(date.normalize(), dmin), dmax)
+    dims = [(k, lab) for k, lab in OV_DIMS if (daily[k] != "").any() and not (k == "store" and len(sel) == 1)]
+    segs_sold = [k for k, v in d.groupby("seg")["v"].sum().sort_values(ascending=False).items() if k and v > 0]
+    base = {"mode": mode, "date": date.strftime("%Y-%m-%d"), "store": store, "stores": stores, "scope": sel, "segments": segs_sold,
+            "store_label": scope_label(sel), "fam_seg": fam_segments(d),
+            "dims": [{"key": k, "label": lab} for k, lab in dims], "updated": updated_note(),
+            "dmax": dmax.strftime("%Y-%m-%d"), "dmin": dmin.strftime("%Y-%m-%d")}
+
+    if mode == "all":
+        periods, dim_rows = [], {k: {} for k, _ in dims}
+        for m in OV_MODES:
+            w, cur, frames = ov_period(m, d, date, dmax)
+            periods.append({"mode": m, **ov_labels(m, w), "cur": ov_stats(cur),
+                            "bstats": {k: ov_stats(f) for k, f in frames.items()},
+                            "plan": ov_plan(m, w, sel, stores, dmin, cur)})
+            for k, _ in dims:
+                for r in ov_dim(cur, frames, k, 40):
+                    rec = dim_rows[k].setdefault(r["name"], {"name": r["name"], "p": {}})
+                    rec["p"][m] = {"c": [r["v"], r["q"]], "b": r["b"]}
+        mw, yw = ov_window("month", date, dmax), ov_window("year", date, dmax)
+        return {**base, "label": f"{date:%A}, {date.day} {date:%B %Y}", "periods": periods,
+                "charts": {"month": ov_chart_for("month", d, mw, dmax, date), "year": ov_chart_for("year", d, yw, dmax, date),
+                           "month_label": f"{mw['s']:%B %Y}", "year_label": str(yw["s"].year)},
+                "table": {k: list(v.values()) for k, v in dim_rows.items()},
+                "prev_date": (date - DAY).strftime("%Y-%m-%d"), "next_date": (date + DAY).strftime("%Y-%m-%d"),
+                "can_prev": bool(date > dmin), "can_next": bool(date < dmax), "is_latest": bool(date == dmax)}
+
+    w, cur, frames = ov_period(mode, d, date, dmax)
+    if mode == "day":
+        prev_date, next_date = date - DAY, date + DAY
+    elif mode == "week":
+        prev_date, next_date = w["s"] - 7 * DAY, w["e"] + DAY
+    elif mode == "month":
+        prev_date, next_date = (w["s"] - DAY).replace(day=1), w["e"] + DAY
+    elif mode == "quarter":
+        prev_date, next_date = w["s"] - pd.DateOffset(months=3), w["e"] + DAY
+    else:
+        prev_date, next_date = pd.Timestamp(date.year - 1, 1, 1), w["e"] + DAY
+    res = {**base, **ov_labels(mode, w),
+           "cur": ov_stats(cur), "bstats": {k: ov_stats(f) for k, f in frames.items()},
+           "chart": ov_chart_for(mode, d, w, dmax, date),
+           "sel": date.strftime("%Y-%m-%d") if mode == "day" else None,
+           "dim": {k: ov_dim(cur, frames, k) for k, _ in dims},
+           "prev_date": prev_date.strftime("%Y-%m-%d"), "next_date": next_date.strftime("%Y-%m-%d"),
+           "can_prev": bool(w["s"] > dmin), "can_next": bool(w["e"] < dmax),
+           "is_latest": bool(w["s"] <= dmax <= w["e"]),
+           "plan": ov_plan(mode, w, sel, stores, dmin, cur)}
+    if w["partial"]:   # still under way: the whole of each past period to beat, and the days left to do it
+        codes = {k: full for k, _td, full in OV_BASES.get(mode, ())}
+        fw = ov_full_windows(mode, w)
+        fullf = {k: ov_slice(d, fa, fb) for k, (fa, fb) in fw.items()}
+        res["beat"] = {"days_left": int((w["e"] - w["eff"]).days), "days_gone": int((w["eff"] - w["s"]).days) + 1,
+                       "bases": {k: {"code": codes.get(k, k), "range": fmt_range(fa, fb), "ok": bool(fa >= dmin), **ov_stats(fullf[k])}
+                                 for k, (fa, fb) in fw.items()}}
+        # the same for every row of the breakdown (segments, products, SPCs, stores)
+        for col, _lab in dims:
+            tot = {k: {str(i): (float(r["v"]), float(r["q"])) for i, r in f.groupby(col, observed=True)[["v", "q"]].sum().iterrows()}
+                   for k, f in fullf.items()}
+            for row in res["dim"].get(col, []):
+                row["f"] = {k: [round(t.get(row["name"], (0, 0))[0]), round(t.get(row["name"], (0, 0))[1])] for k, t in tot.items()}
+    if mode == "day":
+        res["chart2"] = ov_chart_for("month", d, ov_window("month", date, dmax), dmax, date)
+    return res
+
+
+
+# ════════════════════════════════════════════════════════════════════
+#  STORE COMPARISON
+# ════════════════════════════════════════════════════════════════════
+NO_SPC = "(No SPC name)"
+SP_TIERS = ["Mass", "Mid", "High", "Premium", "Flagship"]
+CLAIM_REASONS = ["Activation issue", "Validation issue", "Days gap issue", "Corp IMEI", "Other"]
+
+
+def price_tier(cat):
+    """The sheet's Category ('Sp_mid', 'SP-Mass', 'SP_FLAGSHIP'…) as one SP price tier; '' for non-SP."""
+    c = re.sub(r"[\s_\-]+", " ", str(cat).strip().lower())
+    if not c.startswith("sp"):
+        return ""
+    return next((k.capitalize() for k in ("flagship", "premium", "high", "mid", "mass") if k in c), "")
+
+
+def claim_reason(status):
+    """FinalStatus as a claim outcome: 'OK', one of CLAIM_REASONS, or None for the sheet's repeated header rows."""
+    t = str(status).strip().lower()
+    if t == "ok":
+        return "OK"
+    if t in ("", "nan", "finalstatus", "final status"):
+        return None
+    for key, lab in (("activation", "Activation issue"), ("validation", "Validation issue"), ("days ga", "Days gap issue"), ("corp", "Corp IMEI")):
+        if key in t:
+            return lab
+    return "Other"
+
+
+def deep_frames(st):
+    """(counted rows with price tier and store profile, every row with its claim outcome) for comparison and claims."""
+    with _lock:
+        if _state.get("deep_mtime") == st["mtime"]:
+            return _state["deep"]
+    df, raw, ctx = st["df"], st.get("raw"), st["ctx"]
+
+    def text(frame, *groups, exact=()):
+        c = find_col(list(frame.columns), *groups, exact=exact)
+        return frame[c].fillna("").astype(str).str.strip() if c else pd.Series("", index=frame.index)
+    cols = list(df.columns)
+    dp = find_col(cols, ("tentative", "dp"), exact=("tentative dp",))
+    ok = pd.DataFrame({
+        "day": df[ctx["date"]].dt.normalize(),
+        "store": text(df, ("channel", "name"), ("channel",)),
+        "spc": text(df, exact=(ctx["spc"].lower().strip(),)) if ctx["spc"] else "",
+        "v": pd.to_numeric(df[dp], errors="coerce").fillna(0) if dp else 0.0,
+        "tier": text(df, exact=("category",)).map(price_tier),
+        "city": text(df, exact=("city",)).str.title(),
+    })
+    claims = None
+    if raw is not None and ctx["date"] in raw.columns:
+        rd = raw[ctx["date"]]
+        rd = rd if pd.api.types.is_datetime64_any_dtype(rd) else to_dates(rd)
+        claims = pd.DataFrame({
+            "day": pd.to_datetime(rd, errors="coerce").dt.normalize(),
+            "store": text(raw, ("channel", "name"), ("channel",)),
+            "spc": text(raw, exact=(ctx["spc"].lower().strip(),)) if ctx["spc"] else "",
+            "reason": text(raw, exact=("finalstatus", "final status")).map(claim_reason),
+            "remark": text(raw, ("validation", "remark")).str.capitalize(),
+        })
+        claims = claims[claims["reason"].notna() & claims["day"].notna()]
+    out = (ok, claims)
+    with _lock:
+        _state.update(deep=out, deep_mtime=st["mtime"])
+    return out
+
+
+def deep_metrics(st, by_spc, home, sel, a, b):
+    """Per store (or per SPC of one store), for the period a..b: SP price tiers, weekday split and the store's city."""
+    ok, _claims = deep_frames(st)
+    o = ok[(ok["day"] >= a) & (ok["day"] <= b)]
+    if by_spc:
+        o = o[o["store"] == home]
+        o = o.assign(ent=o["spc"].where(o["spc"] != "", NO_SPC))
+    else:
+        o = o.assign(ent=o["store"])
+    o = o[o["ent"].isin(sel)]
+    sp = o[o["tier"] != ""]
+    tq_ = sp.pivot_table(index="ent", columns="tier", values="v", aggfunc="size", fill_value=0)
+    tv_ = sp.pivot_table(index="ent", columns="tier", values="v", aggfunc="sum", fill_value=0)
+    week = o.assign(wd=o["day"].dt.dayofweek).pivot_table(index="ent", columns="wd", values="v", aggfunc="sum", fill_value=0).reindex(columns=range(7), fill_value=0)
+
+    def common(col):
+        x = o[o[col] != ""]
+        return x.groupby("ent")[col].agg(lambda s_: s_.value_counts().index[0]) if len(x) else pd.Series(dtype=object)
+    city = common("city") if not by_spc else pd.Series(dtype=object)
+    cell = lambda tb, r, col: (tb.at[r, col] if r in tb.index and col in tb.columns else 0)
+    ents_t, ents_w = set(tq_.index), set(week.index)
+    out = {}
+    for e in sel:
+        out[e] = {
+            "tiers": {t: ([int(cell(tq_, e, t)), round(float(cell(tv_, e, t)))] if e in ents_t else [0, 0]) for t in SP_TIERS},
+            "week": [round(float(x)) for x in week.loc[e].tolist()] if e in ents_w else [0] * 7,
+            "city": str(city.get(e, "")),
         }
-        res = requests.post(APPS_SCRIPT_URL, json=payload_data)
-        return jsonify(res.json())
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    return out
 
 
-@app.route('/favicon.ico')
-def favicon():
-    return send_from_directory(os.path.join(app.root_path, 'static'),
-                               'favicon.ico', mimetype='image/vnd.microsoft.icon')
+GAP_MIN_STORES = 10   # with fewer stores trading, a day nobody sold on can simply be a quiet day
+
+
+def sheet_gap_days(f):
+    """Days inside the sheet's range when none of the stores already trading sold anything: almost certainly a day
+    missing from the upload, not a day of zero sales. Needs GAP_MIN_STORES trading, so one store's quiet days don't count."""
+    f = f[f["store"] != ""]
+    if f.empty:
+        return []
+    first = f.groupby("store")["day"].min().sort_values().values
+    sold = set(pd.DatetimeIndex(f["day"].unique()))
+    out = []
+    for d in pd.date_range(f["day"].min(), f["day"].max(), freq="D"):
+        if d not in sold and int(first.searchsorted(d.to_datetime64(), side="right")) >= GAP_MIN_STORES:
+            out.append(d)
+    return out
+
+
+def compare_data(st, args):
+    f, _ = chart_frame(st)
+    if f is None or f.empty:
+        return {"error": "This sheet has no usable date column."}
+    stores = sorted(s for s in f["store"].unique() if s)
+    if not stores:
+        return {"error": "This sheet has no Channel Name (store) column, so stores can't be compared."}
+    picked = pick_scope(args, stores)
+    dmin, dmax = f["day"].min(), f["day"].max()
+    a, b = parse_date(args.get("start")), parse_date(args.get("end"))
+    a = dmax.replace(day=1) if a is None else a.normalize()
+    b = dmax if b is None else min(b.normalize(), dmax)
+    if a > b:
+        a, b = b, a
+    by_spc = args.get("by") == "spc"
+    home, spc_all = "", []
+    if by_spc:
+        # the SPCs of one store: the store asked for, else the one picked, else the period's top seller
+        home = args.get("home") if args.get("home") in stores else (picked[0] if len(picked) == 1 else "")
+        if not home:
+            pv = f[(f["day"] >= a) & (f["day"] <= b) & (f["store"] != "")].groupby("store")["v"].sum()
+            home = str(pv.idxmax()) if len(pv) else stores[0]
+        src = f[f["store"] == home]
+        src = src.assign(store=src["spc"].where(src["spc"] != "", NO_SPC))   # from here on, "store" is the SPC
+        per = src[(src["day"] >= a) & (src["day"] <= b)].groupby("store")["v"].sum().sort_values(ascending=False)
+        spc_all = [str(x) for x in per.index] or sorted(src["store"].unique())
+        asked_spcs = [x for x in (args.getlist("spc") if hasattr(args, "getlist") else []) if x in spc_all]
+        sel = asked_spcs if len(asked_spcs) >= 2 else spc_all
+        picked = asked_spcs if len(asked_spcs) >= 2 else []
+    else:
+        src = f
+        sel = picked if len(picked) >= 2 else stores
+    asked = "ly" if args.get("compare") == "ly" else "prev"
+    # which stores have real data in each comparison window: none before a store's first sale or the sheet's start,
+    # partial when the window starts before that, none when nothing at all is recorded for the store in the window
+    in_sel = src[src["store"].isin(sel)]
+    first_sale = in_sel.groupby("store")["day"].min()
+    windows = {k: spc_base_window(a, b, k) for k in ("prev", "ly")}
+    gap_days = sheet_gap_days(f)
+    def gaps_in(wa, wb):
+        return [d for d in gap_days if wa <= d <= wb]
+    cur_gaps = gaps_in(a, b)
+    status = {}
+    for k, (wa, wb, _c) in windows.items():
+        present = set(in_sel.loc[(in_sel["day"] >= wa) & (in_sel["day"] <= wb), "store"].unique())
+        for sn in sel:
+            fs = first_sale.get(sn)
+            start = max(fs, dmin) if fs is not None else None
+            if start is None or wb < start:
+                why = (f"the sheet starts {dmin.day} {dmin:%b %Y}" if fs is not None and fs <= dmin
+                       else f"first sale {start.day} {start:%b %Y}" if start is not None else "no sales")
+                status[(k, sn)] = ("none", why, "")
+            elif wa < start:
+                why = f"the sheet starts {dmin.day} {dmin:%b %Y}" if start == dmin else f"first sale {start.day} {start:%b %Y}"
+                status[(k, sn)] = ("partial", why, start.strftime("%Y-%m-%d"))
+            elif sn not in present:
+                status[(k, sn)] = ("none", "no sales recorded then", "")
+            else:
+                status[(k, sn)] = ("ok", "", "")
+        # days missing from the whole sheet (in this window or the period picked): not an equal period for anyone
+        gw = gaps_in(wa, wb) or cur_gaps
+        if gw:
+            why = "the sheet has no data for " + _runs_text(pd.DatetimeIndex(gw), 3) + ("" if gaps_in(wa, wb) else " (in the period picked)")
+            for sn in sel:
+                if status[(k, sn)][0] in ("ok", "partial"):
+                    status[(k, sn)] = ("gap", why, "")
+    bases = {k: {"code": c, "range": fmt_range(wa, wb),
+                 **{x: sum(1 for sn in sel if status[(k, sn)][0] == x) for x in ("ok", "partial", "none", "gap")},
+                 "sheet_gap": (_runs_text(pd.DatetimeIndex(gaps_in(wa, wb) or cur_gaps), 3) if (gaps_in(wa, wb) or cur_gaps) else ""),
+                 "gap_in_cur": bool(cur_gaps)}
+             for k, (wa, wb, c) in windows.items()}
+    other = "prev" if asked == "ly" else "ly"
+    compare = other if not bases[asked]["ok"] and bases[other]["ok"] else asked   # never land on a comparison nobody has
+    pa, pb, code = windows[compare]
+    sp = args.get("sp") == "1" if "sp" in args else group_pref("sp", False)
+    ff = args.get("ff") == "1" if "ff" in args else group_pref("ff", True)
+    base = seg_only(regroup(src[src["store"].isin(sel)], sp, ff), args)
+    cur = base[(base["day"] >= a) & (base["day"] <= b)]
+    prev = base[(base["day"] >= pa) & (base["day"] <= pb)]
+    one_month = a.day == 1 and a.month == b.month and a.year == b.year
+    deep = deep_metrics(st, by_spc, home, sel, a, b)
+    bw = beat_window(a, b, compare)
+    if bw and bw[0] < dmin:
+        bw = None
+    full_by = base[(base["day"] >= bw[0]) & (base["day"] <= bw[1])].groupby("store")[["v", "q"]].sum() if bw else None
+    month = a.strftime("%Y-%m")
+    t = load_targets()
+    m_end = a + pd.offsets.MonthEnd(0)
+    days_total = (m_end - a).days + 1
+    days_cov = (b - a).days + 1
+    days_left = max(0, (m_end - b).days) if one_month else 0
+    seg_order = list(cur.groupby("seg")["v"].sum().sort_values(ascending=False).index)
+    days = list(pd.date_range(a, b, freq="D"))
+    by_day = len(days) <= 120
+    if by_day:   # one table per measure (store x day), read row by row below
+        dvt = cur.pivot_table(index="store", columns="day", values="v", aggfunc="sum").reindex(columns=days).fillna(0)
+        dqt = cur.pivot_table(index="store", columns="day", values="q", aggfunc="sum").reindex(columns=days).fillna(0)
+    cur_by, prev_by = dict(tuple(cur.groupby("store"))), dict(tuple(prev.groupby("store")))
+    empty = cur.iloc[0:0]
+    spc_t_home = spc_targets(t, home, month, stores) if (by_spc and one_month) else {}
+    rows = []
+    for sn in sel:
+        c, p = cur_by.get(sn, empty), prev_by.get(sn, empty)
+        v, q = float(c["v"].sum()), float(c["q"].sum())
+        spc_ = sp_rows(c)
+        tgt = (None if not one_month else spc_t_home.get(sn) if by_spc
+               else scope_target(t, [sn], month, stores)[0])
+        segs = c.groupby("seg")[["v", "q"]].sum()
+        top = c.groupby("fam")[["v", "q"]].sum().sort_values("v", ascending=False).head(3)
+        rows.append({
+            "name": sn, "v": round(v), "q": round(q), "bv": round(float(p["v"].sum())), "bq": round(float(p["q"].sum())),
+            "spv": round(float(spc_["v"].sum())), "spq": round(float(spc_["q"].sum())),
+            "spcs": int(c.loc[c["spc"] != "", "spc"].nunique()), "models": int(c["fam"].nunique()),
+            "days": int(c["day"].nunique()), "target": tgt,
+            "segs": {str(k): [round(float(x["v"])), round(float(x["q"]))] for k, x in segs.iterrows()},
+            "top": [[str(k), round(float(x["q"])), round(float(x["v"]))] for k, x in top.iterrows()],
+            "dv": ([round(float(x)) for x in dvt.loc[sn].tolist()] if sn in dvt.index else [0] * len(days)) if by_day else None,
+            "dq": ([round(float(x)) for x in dqt.loc[sn].tolist()] if sn in dqt.index else [0] * len(days)) if by_day else None,
+            "bs": status[(compare, sn)][0], "bwhy": status[(compare, sn)][1], "bfrom": status[(compare, sn)][2],
+            "deep": deep.get(sn),
+            "fv": round(float(full_by.at[sn, "v"])) if bw and sn in full_by.index else 0,
+            "fq": round(float(full_by.at[sn, "q"])) if bw and sn in full_by.index else 0,
+        })
+    return {"stores": stores, "scope": picked, "compared": sel, "start": a.strftime("%Y-%m-%d"), "end": b.strftime("%Y-%m-%d"),
+            "by": "spc" if by_spc else "store", "home": home, "spc_all": spc_all, "tiers": SP_TIERS, "reasons": CLAIM_REASONS,
+            "beat": {"code": bw[2], "range": fmt_range(bw[0], bw[1]), "days_left": bw[3]} if bw else None,
+            "dmin": dmin.strftime("%Y-%m-%d"), "dmax": dmax.strftime("%Y-%m-%d"), "range": fmt_range(a, b),
+            "base_range": fmt_range(pa, pb), "base_code": code, "compare": compare, "one_month": one_month,
+            "bases": bases, "switched": asked if compare != asked else "",
+            "days_total": days_total, "days_covered": days_cov, "days_left": days_left,
+            "segments": seg_order, "labels": [f"{d.day} {d:%b}" for d in days] if len(days) <= 120 else None,
+            "rows": rows, "updated": updated_note()}
+
+
+# ════════════════════════════════════════════════════════════════════
+#  ACTIVATION PENDING  (from the full sheet: these rows are usually not FinalStatus OK)
+# ════════════════════════════════════════════════════════════════════
+def activation_frame(st):
+    raw, ctx = st.get("raw"), st["ctx"]
+    if raw is None:
+        return None, "No data."
+    cols = list(raw.columns)
+    low = {c: c.lower().strip() for c in cols}
+    act = next((c for c in cols if low[c] == "activation date"), "") or \
+        next((c for c in cols if "activation" in low[c] and "date" in low[c]), "")
+    if not act:
+        return None, "This sheet has no Activation Date column."
+    sale = ctx["date"] if ctx["date"] in cols else find_col(cols, ("sale", "date"))
+    if not sale:
+        return None, "This sheet has no sale date column."
+    ad = raw[act] if pd.api.types.is_datetime64_any_dtype(raw[act]) else to_dates(raw[act])
+    sd = raw[sale] if pd.api.types.is_datetime64_any_dtype(raw[sale]) else to_dates(raw[sale])
+    if not pd.api.types.is_datetime64_any_dtype(ad):
+        ad = pd.to_datetime(ad, errors="coerce")
+    pend = raw[ad.isna() & sd.notna()]
+    sdp = sd[pend.index].dt.normalize()
+
+    def col(*groups, exact=()):
+        c = find_col(cols, *groups, exact=exact)
+        return pend[c].fillna("").astype(str).str.strip() if c else pd.Series("", index=pend.index)
+    fam_c = ctx["fam"] or find_col(cols, ("family",))
+    fmap = family_map(raw[fam_c]) if fam_c else {}
+    dp = find_col(cols, ("tentative", "dp"), exact=("tentative dp",))
+    out = pd.DataFrame({
+        "sale": sdp,
+        "store": col(("channel", "name"), ("channel",)),
+        "spc": col(("spc", "name")),
+        "fam": pend[fam_c].astype(str).map(lambda x: fmap.get(x, clean_family(x))) if fam_c else "",
+        "model": col(("model", "code"), ("sku", "code")),
+        "imei": col(exact=("imei",)),
+        "status": col(exact=("finalstatus", "final status")),
+        "remark": col(("validation", "remark")),
+        "v": pd.to_numeric(pend[dp], errors="coerce").fillna(0) if dp else 0.0,
+    })
+    today = eod_today()
+    out["days"] = (today - out["sale"]).dt.days.clip(lower=0)
+    return out, ""
+
+
+def activation_data(st, args):
+    fr, err = activation_frame(st)
+    if fr is None:
+        return {"error": err}
+    stores = sorted(x for x in fr["store"].unique() if x)
+    all_stores = sorted(s for s in daily_frame(st)["store"].unique() if s) if daily_frame(st) is not None else stores
+    sel = pick_scope(args, sorted(set(stores) | set(all_stores)))
+    d = fr[fr["store"].isin(sel)] if sel else fr
+    # one sale month at a time, the current month unless another (or "all") is asked for
+    now_m = eod_today().strftime("%Y-%m")
+    first_m = d["sale"].min().strftime("%Y-%m") if len(d) else now_m
+    months = [x.strftime("%Y-%m") for x in pd.period_range(min(first_m, now_m), max(first_m, now_m), freq="M")]
+    month = args.get("month", "")
+    month = "all" if month == "all" else month if month in months else now_m
+    per_month = d["sale"].dt.strftime("%Y-%m").value_counts()
+    if month != "all":
+        d = d[d["sale"].dt.strftime("%Y-%m") == month]
+    d = d.sort_values(["days", "v"], ascending=[False, False])
+    buckets = [("0–1 days", 0, 1), ("2–3 days", 2, 3), ("4–7 days", 4, 7), ("8–15 days", 8, 15), ("16+ days", 16, 10 ** 6)]
+    by = lambda c: [{"name": k or "(blank)", "n": int(g.shape[0]), "v": round(float(g["v"].sum())), "max": int(g["days"].max())}
+                    for k, g in d.groupby(c)] if len(d) else []
+    return {
+        "stores": all_stores, "scope": sel, "store_label": scope_label(sel), "today": eod_today().strftime("%Y-%m-%d"),
+        "month": month, "current_month": now_m,
+        "months": [{"key": k, "label": pd.Timestamp(k + "-01").strftime("%B %Y"), "n": int(per_month.get(k, 0))} for k in months],
+        "summary": {"n": int(len(d)), "v": round(float(d["v"].sum())), "avg_days": round(float(d["days"].mean()), 1) if len(d) else 0,
+                    "max_days": int(d["days"].max()) if len(d) else 0, "over7": int((d["days"] > 7).sum())},
+        "buckets": [{"label": lab, "n": int(((d["days"] >= lo) & (d["days"] <= hi)).sum()),
+                     "v": round(float(d.loc[(d["days"] >= lo) & (d["days"] <= hi), "v"].sum()))} for lab, lo, hi in buckets],
+        "by_store": sorted(by("store"), key=lambda r: -r["n"]), "by_spc": sorted(by("spc"), key=lambda r: -r["n"]),
+        "rows": [{"sale": r.sale.strftime("%Y-%m-%d"), "store": r.store, "spc": r.spc, "fam": r.fam, "model": r.model,
+                  "imei": r.imei, "status": r.status, "remark": r.remark, "v": round(float(r.v)), "days": int(r.days)}
+                 for r in d.head(1500).itertuples()],
+        "truncated": bool(len(d) > 1500), "updated": updated_note(),
+        "claims": claim_quality(st, sel, month),
+    }
+
+
+def claim_quality(st, sel, month):
+    """Records uploaded in the sale month, accepted (FinalStatus OK) or rejected and why: per store, or per SPC for one store."""
+    _ok, cl = deep_frames(st)
+    if cl is None or cl.empty:
+        return None
+    if sel:
+        cl = cl[cl["store"].isin(sel)]
+    if month != "all":
+        cl = cl[cl["day"].dt.strftime("%Y-%m") == month]
+    by = "spc" if len(sel) == 1 else "store"
+    cl = cl.assign(ent=cl[by].where(cl[by] != "", NO_SPC if by == "spc" else "(no store)"))
+    if cl.empty:
+        return {"by": by, "reasons": CLAIM_REASONS, "rows": [], "total": 0, "ok": 0}
+    tab = cl.groupby(["ent", "reason"]).size().unstack(fill_value=0)
+    bad = cl[(cl["reason"] != "OK") & (cl["remark"].str.lower() != "correct")]
+    rem = bad.groupby("ent")["remark"].agg(lambda x: x.value_counts().index[0]) if len(bad) else pd.Series(dtype=object)
+    rows = []
+    for e in tab.index:
+        tot = int(tab.loc[e].sum()); okn = int(tab.loc[e].get("OK", 0))
+        rows.append({"name": str(e), "total": tot, "ok": okn, "remark": str(rem.get(e, "")),
+                     "reasons": {r: int(tab.loc[e].get(r, 0)) for r in CLAIM_REASONS}})
+    rows.sort(key=lambda r: (r["ok"] / r["total"] if r["total"] else 1, -r["total"]))
+    return {"by": by, "reasons": CLAIM_REASONS, "rows": rows[:300], "more": max(0, len(rows) - 300),
+            "total": int(len(cl)), "ok": int((cl["reason"] == "OK").sum())}
+
+
+# ════════════════════════════════════════════════════════════════════
+#  DATA AVAILABILITY + CONNECTION CHECK
+# ════════════════════════════════════════════════════════════════════
+def meta_data(st):
+    daily = daily_frame(st)
+    if daily is None or daily.empty:
+        return {"rows": int(len(st["df"])), "updated": get_upload_time()}
+    days = daily["day"]
+    dmin, dmax = days.min(), days.max()
+    ym = sorted(set(zip(days.dt.year, days.dt.month)))
+    return {"from": dmin.strftime("%d %b %Y"), "to": dmax.strftime("%d %b %Y"),
+            "from_iso": dmin.strftime("%Y-%m-%d"), "to_iso": dmax.strftime("%Y-%m-%d"),
+            "months": [pd.Timestamp(y, m, 1).strftime("%b %Y") for y, m in ym],
+            "years": sorted({int(y) for y, _ in ym}), "days": int(days.nunique()),
+            "rows": int(len(st["df"])), "stores": int((daily["store"] != "").groupby(daily["store"]).any().sum()),
+            "updated": get_upload_time(), **data_coverage(daily)}
+
+
+def data_coverage(daily):
+    """Holes inside the sheet's date range: days with no sales at all, and runs of months with very little in them."""
+    days = pd.DatetimeIndex(daily["day"].unique()).sort_values()
+    span = pd.date_range(days.min(), days.max(), freq="D")
+    gaps, run = [], []
+    for d in span.difference(days):
+        if run and (d - run[-1]).days != 1:
+            gaps.append(run)
+            run = []
+        run.append(d)
+    if run:
+        gaps.append(run)
+    # a month with under 5% of the busiest month's sales is mostly missing from the sheet
+    by_m = daily.groupby(daily["day"].dt.to_period("M"))["v"].sum()
+    peak = float(by_m.max()) if len(by_m) else 0.0
+    thin_m = [p for p, v in by_m.items() if peak and v < 0.05 * peak]
+    full_m = [float(v) for p, v in by_m.items() if p not in thin_m]
+    thin, cur = [], []
+    for p in thin_m:
+        if cur and (p - cur[-1]).n != 1:
+            thin.append(cur)
+            cur = []
+        cur.append(p)
+    if cur:
+        thin.append(cur)
+    month_label = lambda a, b: f"{a:%b %Y}" if a == b else (f"{a:%b} – {b:%b %Y}" if a.year == b.year else f"{a:%b %Y} – {b:%b %Y}")
+    return {
+        "calendar_days": len(span), "missing_days": int(sum(len(g) for g in gaps)),
+        "gaps": [{"label": fmt_range(g[0], g[-1]), "days": len(g)} for g in reversed(gaps)],   # newest first
+        "thin": [{"label": month_label(r[0], r[-1]), "months": len(r),
+                  "low": inr_short(min(float(by_m[p]) for p in r)), "high": inr_short(max(float(by_m[p]) for p in r))} for r in thin],
+        "typical": f"{inr_short(min(full_m))}–{inr_short(max(full_m))}" if full_m else "",
+    }
+
+# ════════════════════════════════════════════════════════════════════
+#  ASK DATA: questions in plain English, answered from the sheet
+#  Built-in engine always works offline. If ANTHROPIC_API_KEY is set, Claude reads the question and
+#  calls the same safe query engine as a tool (no code is ever run from the question).
+# ════════════════════════════════════════════════════════════════════
+MONTHS = {m: i for i, m in enumerate(["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
+_MON = r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
+ASK_SEG_WORDS = [(r"\bflagships?\b|\bbb\b|\bpremium\b", "seg", "Flagship"), (r"\binnovative\b|\bwb\b|\bmid[- ]?range\b", "seg", "Innovative"),
+                 (r"\btabs?\b|\btablets?\b", "cat", "tab"), (r"\bwearables?\b|\bwatch(?:es)?\b|\bbuds\b", "cat", "wear"),
+                 (r"\bnpc\b|\blaptops?\b|\bnote ?pcs?\b|\bnotebooks?\b", "cat", "pc"),
+                 (r"\bsmart ?phones?\b|\bphones?\b|\bmobiles?\b|\bsp\b|\bhhp\b", "cat", "sp")]
+CAT_NAMES = {"sp": "Smartphones", "tab": "Tabs", "wear": "Wearables", "pc": "NPC", "acc": "Accessories", "care": "Care+"}
+BY_WORDS = [("spc", r"\bspcs?\b|\bsales ?(?:person|man|men|people)\b|\bpromoters?\b|\bstaff\b|\bwho\b|\bemployees?\b"),
+            ("store", r"\bstores?\b|\bchannels?\b|\bbranch(?:es)?\b|\boutlets?\b|\bshowrooms?\b"),
+            ("fam", r"\bmodels?\b|\bproducts?\b|\bfamil(?:y|ies)\b|\bdevices?\b|\bhandsets?\b|\bskus?\b|\bitems?\b"),
+            ("seg", r"\bsegments?\b|\bcategor(?:y|ies)\b"),
+            ("weekday", r"\bweekdays?\b|\bday of (?:the )?week\b|\bwhich day of\b"),
+            ("day", r"\bday[- ]?wise\b|\bdaily\b|\bper day\b|\bwhich (?:day|date)\b|\bby (?:day|date)\b|\beach day\b|\bbest day\b|\bworst day\b|\bdates?\b"),
+            ("week", r"\bweek[- ]?wise\b|\bweekly\b|\bby week\b|\beach week\b"),
+            ("month", r"\bmonth[- ]?wise\b|\bmonthly\b|\bby month\b|\beach month\b")]
+LABELS = {"spc": "SPC", "store": "Store", "fam": "Model", "seg": "Segment", "day": "Date", "week": "Week of", "month": "Month", "weekday": "Weekday"}
+
+
+def inr_short(v):
+    a = abs(v or 0)
+    sgn = "-" if (v or 0) < 0 else ""
+    if a >= 1e7:
+        return f"{sgn}{a / 1e7:.2f}Cr"
+    if a >= 1e5:
+        return f"{sgn}{a / 1e5:.2f}L"
+    if a >= 1e3:
+        return f"{sgn}{a / 1e3:.2f}K"
+    return f"{sgn}{a:,.0f}"
+
+
+def inr_full(v):
+    n = int(round(v or 0))
+    s = str(abs(n))
+    if len(s) > 3:
+        s = re.sub(r"(\d)(?=(\d\d)+$)", r"\1,", s[:-3]) + "," + s[-3:]
+    return ("-" if n < 0 else "") + s
+
+
+def _grow(c, b):
+    if not b:
+        return None
+    return (c - b) / b * 100
+
+
+def _gtxt(g):
+    if g is None:
+        return "new"
+    return (">+999%" if g > 999 else f"{'+' if g >= 0 else ''}{g:.1f}%")
+
+
+def ask_when(spec, dmax):
+    """The exact dates an answer covers (the asked period, cut at the last day in the sheet)."""
+    a, b = spec["start"], min(spec["end"], dmax)
+    return fmt_range(a, b) if a <= b else fmt_range(spec["start"], spec["end"])
+
+
+def ask_small_base(cur, base):
+    """True when the earlier figure is so small that a growth % says little."""
+    return bool(base) and cur > 0 and base < cur * 0.1
+
+
+def ask_proj(spec, dmin, dmax):
+    """(days with data, days left, end date, what) for a straight-line projection of the asked period to its natural end."""
+    a, lab = spec["start"], spec.get("period", "")
+    eff = min(spec["end"], dmax)
+    if re.search(r"quarter|^Q\d", lab):
+        end, what = quarter_start(a) + pd.DateOffset(months=3) - DAY, "quarter-end"
+    elif re.fullmatch(r"\d{4}( so far)?", lab) or "year" in lab:
+        end, what = pd.Timestamp(a.year, 12, 31), "year-end"
+    else:
+        end, what = eff.replace(day=1) + pd.offsets.MonthEnd(0), "month-end"
+    cov = max(1, (eff - max(a, dmin)).days + 1)
+    return cov, max(0, (end - eff).days), end, what
+
+
+def ask_period(text, dmin, dmax, today):
+    """(start, end, label, explicit) from words like 'last month', 'oct', '12 oct', 'last 7 days', 'from 1 to 10 oct'."""
+    t = text
+    anchor = dmax
+
+    def month_range(y, m):
+        a = pd.Timestamp(y, m, 1)
+        return a, a + pd.offsets.MonthEnd(0)
+
+    def year_for(m):
+        y = anchor.year
+        return y if m <= anchor.month else y - 1
+
+    def one_date(day, mon, year):
+        m = MONTHS[mon[:3]]
+        y = int(year) if year else year_for(m)
+        try:
+            return pd.Timestamp(y, m, int(day))
+        except ValueError:
+            return None
+    dates = []
+    for mt in re.finditer(r"\b(\d{1,2})(?:st|nd|rd|th)?[ \-/]*" + _MON + r"\b\.?(?:[ ,\-/]*(\d{4}))?", t):
+        d = one_date(mt.group(1), mt.group(2), mt.group(3))
+        if d is not None:
+            dates.append((mt.start(), d))
+    for mt in re.finditer(r"\b" + _MON + r"\.? (\d{1,2})(?:st|nd|rd|th)?\b(?:,? (\d{4}))?", t):
+        d = one_date(mt.group(2), mt.group(1), mt.group(3))
+        if d is not None and all(abs(p - mt.start()) > 3 for p, _ in dates):
+            dates.append((mt.start(), d))
+    for mt in re.finditer(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b", t):
+        try:
+            dates.append((mt.start(), pd.Timestamp(int(mt.group(1)), int(mt.group(2)), int(mt.group(3)))))
+        except ValueError:
+            pass
+    for mt in re.finditer(r"\b(\d{1,2})[/.](\d{1,2})[/.](\d{2,4})\b", t):
+        y = int(mt.group(3)); y = y + 2000 if y < 100 else y
+        try:
+            dates.append((mt.start(), pd.Timestamp(y, int(mt.group(2)), int(mt.group(1)))))
+        except ValueError:
+            pass
+    # "1 to 10 oct" / "1-10 oct": the first number borrows the month
+    mt = re.search(r"\b(\d{1,2})(?:st|nd|rd|th)?\s*(?:to|-|–|till|until|and)\s*(\d{1,2})(?:st|nd|rd|th)?\s*" + _MON + r"\b(?:[ ,]*(\d{4}))?", t)
+    if mt:
+        a, b = one_date(mt.group(1), mt.group(3), mt.group(4)), one_date(mt.group(2), mt.group(3), mt.group(4))
+        if a is not None and b is not None:
+            return min(a, b), max(a, b), fmt_range(min(a, b), max(a, b)), True
+    dates.sort()
+    if len(dates) >= 2:
+        a, b = dates[0][1], dates[1][1]
+        return min(a, b), max(a, b), fmt_range(min(a, b), max(a, b)), True
+    if len(dates) == 1:
+        d = dates[0][1]
+        return d, d, f"{d.day} {d:%b %Y}", True
+    if re.search(r"\btoday\b|\btoday's\b", t):
+        return today, today, f"today ({today.day} {today:%b})", True
+    if re.search(r"\byesterday\b", t):
+        y = today - DAY
+        return y, y, f"yesterday ({y.day} {y:%b})", True
+    if re.search(r"\b(latest|last) (data )?day\b|\blast date\b", t):
+        return anchor, anchor, f"{anchor.day} {anchor:%b %Y} (latest day)", True
+    mt = re.search(r"\b(?:last|past|previous) (\d{1,3}) days?\b", t)
+    if mt:
+        n = int(mt.group(1))
+        return anchor - (n - 1) * DAY, anchor, f"last {n} days", True
+    mt = re.search(r"\b(?:last|past|previous) (\d{1,2}) weeks?\b", t)
+    if mt:
+        n = int(mt.group(1))
+        return anchor - (7 * n - 1) * DAY, anchor, f"last {n} weeks", True
+    mt = re.search(r"\b(?:last|past|previous) (\d{1,2}) months?\b", t)
+    if mt:
+        n = int(mt.group(1))
+        a = (anchor.replace(day=1) - pd.DateOffset(months=n - 1))
+        return a, anchor, f"last {n} months", True
+    if re.search(r"\bthis week\b|\bwtd\b|\bweek to date\b|\bcurrent week\b", t):
+        a = week_start_sun(anchor)
+        return a, anchor, "this week", True
+    if re.search(r"\b(last|previous|prior) week\b", t):
+        a = week_start_sun(anchor) - 7 * DAY
+        return a, a + 6 * DAY, "last week", True
+    if re.search(r"\b(last|previous|prior) month\b|\blm\b", t):
+        a, b = month_range(*(lambda x: (x.year, x.month))(anchor.replace(day=1) - DAY))
+        return a, b, f"{a:%B %Y}", True
+    if re.search(r"\b(last|previous|prior) quarter\b", t):
+        a = quarter_start(anchor) - pd.DateOffset(months=3)
+        return a, quarter_start(anchor) - DAY, f"Q{(a.month - 1) // 3 + 1} {a.year}", True
+    if re.search(r"\bthis quarter\b|\bqtd\b|\bquarter to date\b", t):
+        return quarter_start(anchor), anchor, "this quarter", True
+    if re.search(r"\b(last|previous|prior) year\b", t):
+        y = anchor.year - 1
+        return pd.Timestamp(y, 1, 1), pd.Timestamp(y, 12, 31), str(y), True
+    if re.search(r"\bthis year\b|\bytd\b|\byear to date\b", t):
+        return pd.Timestamp(anchor.year, 1, 1), anchor, f"{anchor.year} so far", True
+    if re.search(r"\ball time\b|\boverall\b|\bever\b|\bin total\b|\bentire\b|\bwhole data\b|\ball data\b", t):
+        return dmin, dmax, "all data", True
+    mt = re.search(r"\bq([1-4])\b(?:\s*(\d{4}))?", t)
+    if mt:
+        qn = int(mt.group(1)); y = int(mt.group(2)) if mt.group(2) else anchor.year
+        a = pd.Timestamp(y, 3 * (qn - 1) + 1, 1)
+        return a, a + pd.DateOffset(months=3) - DAY, f"Q{qn} {y}", True
+    mt = re.search(r"\b" + _MON + r"\b(?:\.?[ ,'\-]*(\d{4}|'\d{2}))?", t)
+    if mt and not re.search(r"\bmay (i|we|you)\b", t):
+        m = MONTHS[mt.group(1)[:3]]
+        y = int(mt.group(2).replace("'", "20")) if mt.group(2) else year_for(m)
+        a, b = month_range(y, m)
+        return a, b, f"{a:%B %Y}", True
+    mt = re.search(r"\b(?:in |for |year )?(20\d\d)\b", t)
+    if mt:
+        y = int(mt.group(1))
+        if y == anchor.year:
+            return pd.Timestamp(y, 1, 1), anchor, f"{y} so far", True
+        return pd.Timestamp(y, 1, 1), pd.Timestamp(y, 12, 31), str(y), True
+    if re.search(r"\b(this|current) month\b|\bmtd\b|\bmonth to date\b|\bso far\b", t):
+        return anchor.replace(day=1), anchor, f"{anchor:%B %Y} to date", True
+    return anchor.replace(day=1), anchor, f"{anchor:%B %Y} to date", False
+
+
+def ask_match_names(text, names, min_len=3):
+    """Names mentioned in the text (longest first, no overlaps)."""
+    found, used = [], text
+    for n in sorted({x for x in names if x}, key=len, reverse=True):
+        k = n.lower().strip()
+        if len(k) < min_len:
+            continue
+        pat = r"(?<![a-z0-9])" + re.escape(k) + r"(?![a-z0-9])"
+        if re.search(pat, used):
+            found.append(n)
+            used = re.sub(pat, " ", used)
+    return found, used
+
+
+def ask_store_keys(stores):
+    """Short names people use for a store: the part in brackets, or the part after the last dash."""
+    keys = {}
+    for s in stores:
+        keys[s.lower()] = s
+        m = re.search(r"\(([^)]+)\)", s)
+        if m:
+            keys[m.group(1).strip().lower()] = s
+        parts = re.split(r"\s[-–]\s", s)
+        if len(parts) > 1:
+            keys[parts[-1].strip(" ()").lower()] = s
+    return keys
+
+
+ASK_STOP = set("""a an the of in on at for to from by with and or vs versus compare compared comparison against between than over
+sales sale sold sell selling value values revenue units unit qty quantity volume asp price prices average avg daily per day days week weeks
+weekly month months monthly year years yearly quarter quarters today yesterday last this next previous prior current top best worst
+highest lowest most least total how many much what which who whom show give tell me my our us is are was were be been do does did
+store stores channel channels outlet outlets branch branches spc spcs model models product products segment segments category
+categories share growth grow grew growing trend trends projection projected project forecast end target targets achievement achieved
+data all each every wise only so far till until up upto mtd ytd qtd lm ly please can you could would number count list rank ranking
+ranked increase decrease drop dropped decline fall fell change changed performance perform performing business numbers figure figures
+january february march april may june july august september october november december jan feb mar apr jun jul aug sep sept oct nov dec
+sunday monday tuesday wednesday thursday friday saturday mon tue wed thu fri sat sun estimate expected expect will reach hit
+smartphone smartphones phone phones mobile mobiles flagship flagships innovative premium tab tabs tablet tablets wearable wearables
+watch watches buds npc laptop laptops notebook notebooks pending activation activated date dates range latest first second half
+""".split())
+MODEL_LIKE = re.compile(r"\b(?:galaxy\s+)?(?:z\s?)?(?:fold|flip)\s?\d{1,2}\b|\b[samf]\d{2,3}(?:\s?(?:ultra|plus|fe|edge|5g))?\b"
+                        r"|\btab\s?[as]\d{1,2}\b|\bbuds\s?\d\b|\bwatch\s?\d{1,2}\b|\bbook\s?\d\b")
+_ASK_VOCAB = {}
+
+
+def _words(s):
+    return re.findall(r"[a-z0-9]+", str(s).lower())
+
+
+def ask_vocab(f):
+    """Every store, SPC and model the question can name, with the short forms people type (cached per data load)."""
+    if _ASK_VOCAB.get("key") == id(f):
+        return _ASK_VOCAB["v"]
+    stores = sorted(x for x in f["store"].unique() if x)
+    spcs = sorted(x for x in f["spc"].unique() if x)
+    fams = sorted(x for x in f["fam"].unique() if x and x != "Unknown")
+
+    def add(d, k, v):
+        k = re.sub(r"\s+", " ", k).strip()
+        if k and v not in d.setdefault(k, []):
+            d[k].append(v)
+    fam_alias, spc_alias, store_alias = {}, {}, {}
+    for n in fams:
+        low = n.lower()
+        forms = {low, re.sub(r"^(?:samsung|galaxy)\s+", "", low)}
+        forms |= {re.sub(r"^z\s+", "", x) for x in forms}               # 'Z Fold 7' -> 'fold 7'
+        forms |= {x.replace(" ", "") for x in forms if re.search(r"\d", x) and len(x.replace(" ", "")) >= 4}   # 's26ultra'
+        for x in forms:
+            add(fam_alias, x, n)
+    for k, v in list(fam_alias.items()):     # a short form two models share stays only with the model of that exact name
+        if len(v) > 1:
+            exact = [n for n in v if n.lower() == k]
+            fam_alias[k] = exact or v[:1]
+    # a whole series by its group name: 'S26F' / 'S26 series' -> S26, S26+, S26 Ultra, S26 FE; 'FF7' -> Fold 7, Flip 7, Flip 7 FE
+    series = {}
+    for n in fams:
+        g = series_name(n)
+        if g:
+            series.setdefault(g, []).append(n)
+    series_label = {}
+    for g, members in series.items():
+        num = re.sub(r"\D", "", g)
+        keys = {g.lower(), f"{g[0].lower()}{num} series", f"{g[0].lower()}{num} family"} | ({f"ff {num}", f"fold {num} series", f"flip {num} series"} if g.startswith("FF") else set())
+        for k in keys:
+            fam_alias[k] = list(members)
+            series_label[k] = g
+    spc_df = Counter(w for n in spcs for w in set(_words(n)))
+    for n in spcs:
+        add(spc_alias, n.lower(), n)
+        add(spc_alias, re.sub(r"[\s.]+$", "", n.lower()), n)     # 'M.SENTHILKUMAR . . . .' as typed: 'm.senthilkumar'
+        add(spc_alias, " ".join(_words(n)), n)
+        for w in set(_words(n)):                                       # a distinctive name on its own: 'sathishraj'
+            if len(w) >= 5 and spc_df[w] <= 8 and w not in ASK_STOP and not w.isdigit():
+                add(spc_alias, w, n)
+    for s in stores:
+        add(store_alias, s.lower(), s)
+    store_df = Counter(w for s in stores for w in set(_words(s)))
+    v = {"stores": stores, "spcs": spcs, "fams": fams, "fam_alias": fam_alias, "spc_alias": spc_alias, "series_label": series_label, "series": sorted(series),
+         "store_alias": store_alias, "store_norm": {s: " " + " ".join(_words(s)) + " " for s in stores},
+         "store_words": sorted(w for w in store_df if len(w) >= 4 and not w.isdigit() and w not in ASK_STOP)}
+    _ASK_VOCAB.update(key=id(f), v=v)
+    return v
+
+
+def ask_find(text, alias, min_len=2):
+    """Aliases found in the text, longest first and without overlaps; matched words are blanked out (same length)."""
+    hits = []
+    for a in sorted(alias, key=len, reverse=True):
+        if len(a) < min_len or a not in text:
+            continue
+        pat = re.compile(r"(?<![a-z0-9])" + re.escape(a) + r"(?![a-z0-9])")
+        found = list(pat.finditer(text))
+        if found:
+            hits += [{"pos": m.start(), "values": list(alias[a]), "text": m.group(0)} for m in found]
+            text = pat.sub(lambda m: " " * len(m.group(0)), text)
+    return hits, text
+
+
+def ask_store_words(text, vocab):
+    """Places typed loosely ('velachery', 'anna nagar'): every store whose name has those words; small spelling slips are fine."""
+    hits, toks, i = [], [(m.start(), m.group(0)) for m in re.finditer(r"[a-z0-9]+", text)], 0
+    limit = max(25, len(vocab["stores"]) // 30)       # a word in more stores than this is too common to mean a place
+    while i < len(toks):
+        step = 1
+        for n in (3, 2, 1):
+            grp = toks[i:i + n]
+            ws = [w for _, w in grp]
+            if len(grp) < n or any(w in ASK_STOP or w.isdigit() for w in ws) or (n == 1 and len(ws[0]) < 4):
+                continue
+            phrase = " ".join(ws)
+            if n == 1:   # the word and its near spellings ('velachery' also finds 'velacherry')
+                close = set(difflib.get_close_matches(ws[0], vocab["store_words"], n=6, cutoff=0.85)) | {ws[0]}
+                found = [s for s, nm in vocab["store_norm"].items() if any(f" {c} " in nm for c in close)]
+            else:
+                found = [s for s, nm in vocab["store_norm"].items()
+                         if f" {phrase} " in nm or phrase.replace(" ", "") in nm.replace(" ", "")]
+            if found and (n > 1 or len(found) <= limit):
+                hits.append({"pos": grp[0][0], "values": found, "text": phrase, "end": grp[-1][0] + len(grp[-1][1])})
+                step = n
+                break
+        i += step
+    for h in hits:
+        text = text[:h["pos"]] + " " * (h["end"] - h["pos"]) + text[h["end"]:]
+    return hits, text
+
+
+def ask_mentions(hits, kind):
+    out = []
+    for h in sorted(hits, key=lambda h: h["pos"]):
+        if any(o["values"] == h["values"] for o in out):
+            continue
+        many = len(h["values"]) > 1
+        label = h.get("label") or (h["text"].title() + f" ({len(h['values'])} {dict(store='stores', spc='SPCs').get(kind, 'matches')})" if many else h["values"][0])
+        out.append({"kind": h.get("kind", kind), "values": h["values"], "label": label, "pos": h["pos"]})
+    return out
+
+
+GROWTH_RANK = re.compile(r"\bby growth\b|\b(?:fastest|highest|most|best|top|biggest)\s+(?:\w+\s+)?grow|\bgrowth\b.*\b(?:top|highest|best|most|rank\w*|lowest|worst)\b"
+                         r"|\b(?:top|highest|best|rank\w*|lowest|worst)\b.*\bgrowth\b|\bmost improved\b")
+CHANGE_RANK = re.compile(r"\b(?:biggest|largest|most|top|worst)\s+(?:\w+\s+)?(?:increase|gain|jump|rise|drop|decline|fall|decrease)s?\b"
+                         r"|\b(?:dropped|declined|fell|fallen|grew|increased|rose) the most\b")
+DOWN_WORDS = re.compile(r"\b(?:declin\w*|drop\w*|fall|fell|fallen|decreas\w*|shrank|shrink\w*|lowest growth|worst growth|negative)\b")
+VS_SPLIT = re.compile(r"\bvs\.?(?![a-z])|\bversus\b|\bcompared? (?:to|with)\b|\bagainst\b")
+
+
+def ask_parse(text, f, scope, dmin, dmax, today):
+    t = " " + re.sub(r"\s+", " ", text.lower().replace("’", "'")).strip() + " "
+    vocab = ask_vocab(f)
+    spec = {"filters": {}, "by": None, "metric": None, "top": None, "order": "desc", "compare": None, "share": False,
+            "versus": None, "periods": None, "rank_by": None, "unknown": [], "next": False}
+    # 'vs last month / last year' is the base for growth, not something to compare side by side
+    cm = re.search(r"\b(?:vs\.?|versus|compared? (?:to|with)|than|against|over)\s+(?:the\s+)?(?:same\s+(?:period|days|time)\s+)?"
+                   r"(last|previous|prior|same)\s+(year|month|week|period|day)\b", t)
+    if cm:
+        spec["compare"] = "ly" if cm.group(2) == "year" else "prev"
+        t = t[:cm.start()] + " " + t[cm.end():]
+    if re.search(r"\bgrowth\b|\bgrew\b|\bgrow(?:ing|n)?\b|\bchange\b|\bincrease[ds]?\b|\bdecrease[ds]?\b|\bdrop(?:ped)?\b|\bdeclin\w*\b|\bup or down\b", t):
+        spec["compare"] = spec["compare"] or ("ly" if re.search(r"\blast year\b|\bly\b|\byoy\b|\byear on year\b", t) else "prev")
+        if spec["compare"] == "ly":
+            t = re.sub(r"\blast year\b|\bly\b|\byoy\b|\byear on year\b", " ", t)
+    vs_words = bool(re.search(r"\bvs\.?(?![a-z])|\bversus\b|\bcompare[ds]?\b|\bcomparison\b|\bagainst\b|\bbetween\b", t))
+
+    # names: exact store names, models (with short forms), SPCs, then places typed loosely, then segments
+    work = t
+    store_hits, work = ask_find(work, vocab["store_alias"], 4)
+    fam_hits, work = ask_find(work, vocab["fam_alias"], 2)
+    for h in fam_hits:   # a series asked by its group name keeps that name in answers
+        if h["text"] in vocab["series_label"]:
+            h["label"] = vocab["series_label"][h["text"]]
+    spc_hits, work = ask_find(work, vocab["spc_alias"], 4)
+    loose, work = ask_store_words(work, vocab)
+    seg_hits = []
+    segs_present = set(f["seg"].unique())
+    for pat, kind, val in ASK_SEG_WORDS:
+        for m in re.finditer(pat, work):
+            if kind == "cat" or val in segs_present:
+                seg_hits.append({"pos": m.start(), "values": [val], "text": m.group(0), "kind": kind})
+        work = re.sub(pat, lambda m: " " * len(m.group(0)), work)
+    spec["unknown"] = list(dict.fromkeys(m.group(0).strip() for m in MODEL_LIKE.finditer(work)))
+    ments = {"store": ask_mentions(store_hits + loose, "store"), "fam": ask_mentions(fam_hits, "fam"),
+             "spc": ask_mentions(spc_hits, "spc"), "seg": ask_mentions(seg_hits, "seg")}
+    for m in ments["seg"]:
+        m["label"] = CAT_NAMES.get(m["values"][0], m["values"][0]) if m["kind"] == "cat" else m["values"][0]
+    union = lambda ms: list(dict.fromkeys(v for m in ms for v in m["values"]))
+    named_stores = union(ments["store"])
+    spec["store_from"] = "question" if named_stores else ("picker" if scope else "all")
+    spec["filters"] = {"store": named_stores or list(scope), "spc": union(ments["spc"]), "fam": union(ments["fam"]),
+                       "seg": union([m for m in ments["seg"] if m["kind"] == "seg"]),
+                       "cat": union([m for m in ments["seg"] if m["kind"] == "cat"])}
+    spec["mentions"] = ments
+
+    # side by side: two or more of the same kind of thing, or two periods
+    if vs_words:
+        for kind in ("fam", "store", "spc", "seg"):
+            if len(ments[kind]) >= 2:
+                spec["versus"] = {"kind": kind, "groups": ments[kind]}
+                break
+        if not spec["versus"]:
+            parts = [p for p in VS_SPLIT.split(work) if p.strip()]
+            if len(parts) < 2 and re.search(r"\bcompare|\bbetween\b", work):
+                parts = [p for p in re.split(r"\band\b", work) if p.strip()]
+            got = []
+            for p in parts:
+                a, b, lab, ex = ask_period(" " + p + " ", dmin, dmax, today)
+                if ex and all((a, b) != (x[0], x[1]) for x in got):
+                    got.append((a, b, lab))
+            if len(got) >= 2:
+                spec["periods"] = got
+    if (spec["versus"] or spec["periods"]) and not cm and not re.search(r"\bgrowth\b|\bgrew\b", t):
+        spec["compare"] = None        # 'compare A and B' is the side-by-side, not growth
+    elif vs_words and not spec["compare"]:
+        spec["compare"] = "ly" if re.search(r"\blast year\b|\bly\b|\byoy\b", t) else "prev"
+
+    a, b, label, explicit = ask_period(work, dmin, dmax, today)
+    if spec["periods"]:
+        a, b, label = spec["periods"][0]
+        explicit = True
+    spec.update(start=a, end=b, period=label, period_explicit=explicit)
+    # what to measure
+    if re.search(r"\basp\b|\baverage (?:selling )?price\b|\bavg\.? (?:selling )?price\b|\bprice per unit\b", t):
+        spec["metric"] = "asp"
+    elif re.search(r"\bhow many (?:spcs?|sales ?people|promoters|staff)\b|\bnumber of (?:spcs?|promoters)\b|\bcount of spcs?\b|\bactive spcs?\b", t):
+        spec["metric"] = "spcs"
+    elif re.search(r"\bhow many (?:models?|products?|families)\b|\bnumber of (?:models?|products?)\b", t):
+        spec["metric"] = "models"
+    elif re.search(r"\bhow many (?:stores?|channels?)\b", t):
+        spec["metric"] = "stores"
+    elif re.search(r"\bhow many (?:bills?|rows?|records?|transactions?|entries|invoices?)\b|\bnumber of (?:bills?|rows?|records?|transactions?)\b", t):
+        spec["metric"] = "rows"
+    elif re.search(r"\bunits?\b|\bqty\b|\bquantity\b|\bvolume\b|\bpieces?\b|\bpcs\b|\bnos\b|\bhow many\b|\bcount\b|\bsold the most\b|\bmost sold\b|\bbest[- ]?sell", t):
+        spec["metric"] = "q"
+    else:
+        spec["metric"] = "v"
+    avg_pat = r"\bper day\b|\bdaily average\b|\baverage daily\b|\bavg\.? daily\b|\baverage per day\b|\brun ?rate\b|\bavg per day\b|\bdaily avg\b|\bdaily rate\b"
+    spec["avg_day"] = bool(re.search(avg_pat, t))
+    t_by = re.sub(avg_pat, " ", t)
+    if not spec["versus"]:
+        for key, pat in BY_WORDS:
+            if re.search(pat, t_by):
+                # 'which store' only breaks down by store when no single store is already named
+                if key == "store" and len(ments["store"]) == 1 and not re.search(r"\b(each|all|every|which|per|by) stores?\b|\bstore[- ]?wise\b", t):
+                    continue
+                if key == "spc" and ments["spc"] and not re.search(r"\b(each|all|every|which|per|by) spcs?\b|\bspc[- ]?wise\b", t):
+                    continue
+                if key == "fam" and ments["fam"] and not re.search(r"\b(each|all|every|which|per|by) (models?|products?)\b|\bmodel[- ]?wise\b", t):
+                    continue
+                spec["by"] = key
+                break
+    mt = re.search(r"\b(?:top|best|highest|bottom|worst|lowest|first)\s+(\d{1,2})\b", t)
+    if mt:
+        spec["top"] = int(mt.group(1))
+    elif re.search(r"\b(top|best|highest|most|leading|biggest|maximum|max|worst|lowest|least|bottom|minimum|min|weakest|poorest|fastest|slowest)\b", t):
+        plural = re.search(r"\b(top|best|worst|bottom|fastest)\b", t) and re.search(r"(spcs|stores|models|products|segments|days|weeks|months)\b", t)
+        spec["top"] = 5 if plural else 1
+    if re.search(r"\b(worst|lowest|least|bottom|minimum|min|weakest|poorest|slowest)\b", t):
+        spec["order"] = "asc"
+    # ranking by growth % or by the change itself
+    if GROWTH_RANK.search(t) or CHANGE_RANK.search(t):
+        spec["rank_by"] = "change" if CHANGE_RANK.search(t) and not GROWTH_RANK.search(t) else "growth"
+        spec["compare"] = spec["compare"] or "prev"
+        if DOWN_WORDS.search(t) or re.search(r"\b(worst|lowest|least|bottom|slowest)\b", t):
+            spec["order"] = "asc"
+        spec["by"] = spec["by"] or "store"
+        plural = re.search(r"\b(?:stores|models|products|spcs|segments|categories)\b", t) and not re.search(r"\b(?:top|bottom|first)\s+\d", t)
+        spec["top"] = 5 if (not spec["top"] or (spec["top"] == 1 and plural)) else spec["top"]
+    if (spec["metric"], spec["by"]) in (("spcs", "spc"), ("models", "fam"), ("stores", "store")):
+        spec["by"] = None
+    spec["on_topic"] = bool(re.search(r"\bsales?\b|\bsold\b|\bsell|\bvalue\b|\brevenue\b|\bunits?\b|\bqty\b|\basp\b|\bprice\b|"
+                                      r"\btarget|\bgrowth\b|\bspcs?\b|\bstores?\b|\bmodels?\b|\bproducts?\b|\bsegments?\b|\btop\b|"
+                                      r"\bbest\b|\bworst\b|\bhow many\b|\btotal\b|\btrend|\bcompare|\bactivat|\bdata\b|\bachiev|\bforecast|\bproject|"
+                                      r"\bshare\b|\bmix\b|\bbusiness\b|\bperformance\b|\bnumbers?\b|\bvs\b|\bweek|\bmonth|\byear|\bday",
+                                      t)) or any(spec["filters"][k] for k in ("spc", "fam", "seg", "cat")) or bool(named_stores) or bool(spec["unknown"])
+    if spec["top"] and not spec["by"] and not spec["versus"]:
+        spec["by"] = "spc" if re.search(r"\bwho\b", t) else ("fam" if spec["metric"] == "q" else "spc")
+    spec["share"] = bool(re.search(r"\bshare\b|\bcontribution\b|\bcontribut|\bpercent\b|%|\bmix\b", t))
+    spec["projection"] = bool(re.search(r"\bproject(?:ed|ion)?\b|\bforecast\b|\bmonth[- ]end\b|\bquarter[- ]end\b|\byear[- ]end\b|\bexpected\b|"
+                                        r"\bestimate[ds]?\b|\bwill (?:we|it|they) (?:reach|hit|end|close|finish|do)\b|\bat this (?:rate|pace)\b", t))
+    spec["next"] = bool(re.search(r"\bnext month\b|\bcoming month\b|\bupcoming month\b", t))
+    if spec["projection"] and not spec["period_explicit"]:   # 'quarter end' / 'year end' with no period: this quarter / this year so far
+        if re.search(r"\bquarter[- ]end\b|\bthis quarter\b", t):
+            spec.update(start=quarter_start(dmax), end=dmax, period="this quarter", period_explicit=True)
+        elif re.search(r"\byear[- ]end\b", t):
+            spec.update(start=pd.Timestamp(dmax.year, 1, 1), end=dmax, period=f"{dmax.year} so far", period_explicit=True)
+    spec["target"] = bool(re.search(r"\btargets?\b|\bachieve(?:ment|d)?\b|\bach\b|\bach%|\bbalance\b|\brequired\b|\bneed to sell\b", t))
+    spec["activation"] = bool(re.search(r"\bactivat|\bnot activated\b|\bpending activation\b", t))
+    spec["meta"] = bool(re.search(r"\b(latest|last) (?:date|update|upload)\b|\bdata (?:range|available|availability|from)\b|\bdate range\b|\btill when\b|\bupto which date\b|\bup to which date\b|\bhow much data\b|\bwhen was (?:the )?data\b|\blast updated\b", t))
+    # holes in the data: days with no sales, months with very little
+    spec["gaps"] = bool(re.search(r"\bmissing\b|\bmissed\b|\bgaps?\b|\bholes?\b|\bno (?:data|sales|entries)\b|\bwithout (?:data|sales)\b|\bempty (?:days?|dates?|months?)\b"
+                                  r"|\bincomplete\b|\bnot (?:uploaded|in the (?:sheet|data))\b|\bcoverage\b|\bwhich (?:days|dates|months) (?:are|have|had|were)\b", t))
+    spec["meta"] = spec["meta"] or (spec["gaps"] and spec["by"] not in ("store", "spc", "fam", "seg")
+                                    and not spec["filters"]["fam"] and not spec["filters"]["spc"])
+    spec["on_topic"] = spec["on_topic"] or spec["meta"]
+    spec["help"] = bool(re.search(r"^\s*(help|hi|hello|hey|what can you do|what can i ask|examples?|how to use)\b", t))
+    return spec
+
+
+def ask_filter(f, spec):
+    fl = spec["filters"]
+    m = (f["day"] >= spec["start"]) & (f["day"] <= spec["end"])
+    for k in ("store", "spc", "fam", "seg", "cat"):
+        if fl.get(k):
+            m &= f[k].isin(fl[k])
+    return f[m]
+
+
+def ask_base_window(spec, dmax):
+    a, b = spec["start"], spec["end"]
+    if spec["compare"] == "ly":
+        return a - pd.DateOffset(years=1), b - pd.DateOffset(years=1), "same period last year"
+    if a.day == 1 and (b + DAY).day == 1:
+        pa = (a - DAY).replace(day=1)
+        return pa, pa + pd.offsets.MonthEnd(0), f"{pa:%B %Y}"
+    if a.day == 1 and a.month == b.month:
+        pa, pb = month_back(a, 1, (b - a).days)
+        return pa, pb, f"same days last month ({fmt_range(pa, pb)})"
+    span = (b - a).days + 1
+    return a - span * DAY, b - span * DAY, f"previous {span} days ({fmt_range(a - span * DAY, b - span * DAY)})"
+
+
+def ask_metric_of(g, metric):
+    v, q = float(g["v"].sum()), float(g["q"].sum())
+    if metric == "q":
+        return q
+    if metric == "asp":
+        return v / q if q else 0.0
+    if metric == "spcs":
+        return float(g.loc[g["spc"] != "", "spc"].nunique())
+    if metric == "models":
+        return float(g["fam"].nunique())
+    if metric == "stores":
+        return float(g.loc[g["store"] != "", "store"].nunique())
+    if metric == "rows":
+        return float(len(g))
+    return v
+
+
+def ask_fmt(x, metric):
+    if metric in ("v", "asp"):
+        return inr_short(x)
+    return inr_full(x)
+
+
+def ask_amt(x, metric):
+    """A figure for a sentence: units say so."""
+    return ask_fmt(x, metric) + (" units" if metric == "q" else "")
+
+
+def ask_scope_text(spec):
+    fl, bits = spec["filters"], []
+    if fl.get("store"):
+        bits.append(", ".join(fl["store"][:3]) + (f" +{len(fl['store']) - 3}" if len(fl["store"]) > 3 else ""))
+    else:
+        bits.append("all stores")
+    for k in ("spc", "fam", "seg"):
+        if fl.get(k):
+            bits.append(", ".join(fl[k]))
+    if fl.get("cat"):
+        bits.append(", ".join(CAT_NAMES.get(c, c) for c in fl["cat"]))
+    return " · ".join(bits)
+
+
+METRIC_WORD = {"v": "sales value", "q": "units", "asp": "average selling price", "spcs": "active SPCs", "models": "models sold",
+               "stores": "stores selling", "rows": "sale records"}
+
+
+def ask_run(st, spec):
+    """Run a parsed question; returns {'text','table','chips'}. Shared by the built-in engine and the AI tool."""
+    f, _ = chart_frame(st)
+    dmin, dmax = f["day"].min(), f["day"].max()
+    metric, by = spec["metric"], spec["by"]
+    cur = ask_filter(f, spec)
+    where = f"{ask_when(spec, dmax)} · {ask_scope_text(spec)}"
+    out = {"text": "", "table": None, "where": where}
+    if cur.empty:
+        hint = ""
+        if spec["end"] > dmax or spec["start"] > dmax:
+            hint = f" The sheet has sales up to {dmax.day} {dmax:%b %Y}."
+        elif spec["end"] < dmin:
+            hint = f" The sheet starts on {dmin.day} {dmin:%b %Y}."
+        if not hint and spec["filters"].get("store") and any(spec["filters"].get(k) for k in ("spc", "fam", "seg", "cat")):
+            wide = ask_filter(f, {**spec, "filters": {**spec["filters"], "store": []}})
+            if not wide.empty:
+                hint = f" Across all stores it was {ask_amt(ask_metric_of(wide, metric), metric)} in the same dates."
+        out["text"] = f"I found no sales for {where}.{hint}"
+        return out
+    total = ask_metric_of(cur, metric)
+    word = METRIC_WORD[metric]
+    if by:
+        if by in ("day", "week", "month", "weekday"):
+            d = cur["day"]
+            key = {"day": d, "week": d - pd.to_timedelta((d.dt.weekday + 1) % 7, unit="D"),
+                   "month": d - pd.to_timedelta(d.dt.day - 1, unit="D"), "weekday": (d.dt.weekday + 1) % 7}[by]
+        else:
+            key = cur[by]
+        groups = {k: g for k, g in cur.groupby(key) if str(k) != ""}
+        vals = {k: ask_metric_of(g, metric) for k, g in groups.items()}
+        base_vals, base_txt = {}, ""
+        if spec["compare"]:
+            pa, pb, base_txt = ask_base_window(spec, dmax)
+            bf = ask_filter(f, {**spec, "start": pa, "end": pb})
+            if by not in ("day", "week", "month"):
+                bkey = bf[by] if by != "weekday" else (bf["day"].dt.weekday + 1) % 7
+                base_vals = {k: ask_metric_of(g, metric) for k, g in bf.groupby(bkey)}
+        time_dim = by in ("day", "week", "month", "weekday")
+        ranked = sorted(vals.items(), key=lambda kv: kv[1], reverse=spec["order"] != "asc")
+        if time_dim and not spec["top"]:
+            ranked = sorted(vals.items(), key=lambda kv: kv[0])
+        rank_by, left_out, floor = spec.get("rank_by") if base_vals and not time_dim else None, 0, 0
+        if rank_by == "growth":
+            # a % on a tiny base is noise: rank only rows whose earlier figure is at least a quarter of the average one
+            pos = [x for x in base_vals.values() if x > 0]
+            floor = 0.25 * sum(pos) / len(pos) if pos else 0
+            elig = {k: x for k, x in vals.items() if base_vals.get(k, 0) > 0 and base_vals.get(k, 0) >= floor}
+            left_out = len(vals) - len(elig)
+            ranked = sorted(elig.items(), key=lambda kv: _grow(kv[1], base_vals[kv[0]]), reverse=spec["order"] != "asc")
+        elif rank_by == "change":
+            ranked = sorted(vals.items(), key=lambda kv: kv[1] - base_vals.get(kv[0], 0), reverse=spec["order"] != "asc")
+        shown = ranked[:spec["top"]] if spec["top"] else ranked[:25]
+        proj = None
+        if spec.get("projection") and metric in ("v", "q"):
+            cov, left, _, pwhat = ask_proj(spec, dmin, dmax)
+            if left:
+                proj = (cov, left, pwhat)
+
+        def name(k):
+            if by == "weekday":
+                return WEEKDAYS[int(k)]
+            if by == "day":
+                return f"{k.day} {k:%b %Y} ({k:%a})"
+            if by == "week":
+                return f"week of {k.day} {k:%b}"
+            if by == "month":
+                return f"{k:%B %Y}"
+            return str(k)
+        tot_for_share = sum(vals.values()) if metric in ("v", "q") else 0
+        cols = [LABELS[by], word[:1].upper() + word[1:]]
+        if tot_for_share:
+            cols.append("Share")
+        if base_vals:
+            cols += ["Before", "Change", "Growth"]
+        if proj:
+            cols.append(f"Projected {proj[2]}")
+        rows = []
+        for k, x in shown:
+            r = [name(k), ask_fmt(x, metric)]
+            if tot_for_share:
+                r.append(f"{x / tot_for_share * 100:.1f}%")
+            if base_vals:
+                bv = base_vals.get(k, 0)
+                r += [ask_fmt(bv, metric), ("+" if x >= bv else "-") + ask_fmt(abs(x - bv), metric), _gtxt(_grow(x, bv))]
+            if proj:
+                r.append(ask_fmt(x + x / proj[0] * proj[1], metric))
+            rows.append(r)
+        out["table"] = {"cols": cols, "rows": rows}
+        lead = shown[0] if shown else None
+        what = {"spc": "SPC", "store": "store", "fam": "model", "seg": "segment", "day": "day", "week": "week",
+                "month": "month", "weekday": "weekday"}[by]
+        if lead and (spec["top"] == 1 or (spec["top"] and not time_dim)):
+            adj = "lowest" if spec["order"] == "asc" else "highest"
+            share = f" ({lead[1] / tot_for_share * 100:.1f}% of the total)" if tot_for_share else ""
+            out["text"] = f"The {what} with the {adj} {word} for {where} is <b>{name(lead[0])}</b> at <b>{ask_amt(lead[1], metric)}</b>{share}."
+            if spec["top"] and spec["top"] > 1:
+                out["text"] = f"Top {len(shown)} {what}s by {word} for {where}; <b>{name(lead[0])}</b> leads with <b>{ask_amt(lead[1], metric)}</b>{share}."
+                if spec["order"] == "asc":
+                    out["text"] = f"Bottom {len(shown)} {what}s by {word} for {where}; <b>{name(lead[0])}</b> is lowest at <b>{ask_amt(lead[1], metric)}</b>."
+        else:
+            out["text"] = f"{word[:1].upper() + word[1:]} by {what} for {where}: <b>{ask_amt(total, metric)}</b> in total across {len(vals)} {what}s."
+            if lead and not time_dim:
+                out["text"] += f" <b>{name(lead[0])}</b> is highest at {ask_amt(lead[1], metric)}."
+            if time_dim and vals:
+                best = max(vals.items(), key=lambda kv: kv[1])
+                out["text"] += f" Best {what}: <b>{name(best[0])}</b> ({ask_amt(best[1], metric)})."
+        if rank_by and shown:
+            k0, x0 = shown[0]
+            b0 = base_vals.get(k0, 0)
+            low = spec["order"] == "asc"
+            how = "growth" if rank_by == "growth" else "change"
+            moved = _gtxt(_grow(x0, b0)) if rank_by == "growth" else ("+" if x0 >= b0 else "-") + ask_amt(abs(x0 - b0), metric)
+            head = (f"{'Bottom' if low else 'Top'} {len(shown)} {what}s by {how}" if len(shown) > 1
+                    else f"The {what} with the {'lowest' if low else 'highest'} {how}")
+            out["text"] = (f"{head} in {word}, {where}, against {base_txt}: "
+                           f"<b>{name(k0)}</b> {'is lowest' if low else 'leads'} at <b>{moved}</b> ({ask_amt(x0, metric)} vs {ask_amt(b0, metric)}).")
+            if left_out:
+                out["text"] += (f" {left_out} {what}s with a small earlier figure (under {ask_fmt(floor, metric)}) or none at all are left out, "
+                                f"so the % is meaningful.")
+        elif base_txt and base_vals:
+            out["text"] += f" Growth is against {base_txt}."
+        if proj:
+            out["text"] += f" Projected {proj[2]} assumes each keeps its current daily pace for the {proj[1]} days left."
+        if len(ranked) > len(shown) and not spec["top"]:
+            out["text"] += f" Showing {len(shown)} of {len(ranked)}."
+        return out
+    # a single number
+    v, q = float(cur["v"].sum()), float(cur["q"].sum())
+    days = int(cur["day"].nunique())
+    txt = f"{word[:1].upper() + word[1:]} for {where}: <b>{ask_fmt(total, metric)}</b>"
+    if metric == "v":
+        txt += f" from {inr_full(q)} units (ASP {inr_short(v / q if q else 0)})"
+    elif metric == "q":
+        txt += f" units worth {inr_short(v)}"
+    txt += "."
+    rows = [["Value", inr_short(v)], ["Units", inr_full(q)], ["ASP", inr_short(v / q if q else 0)], ["Selling days", str(days)],
+            ["Per day", inr_short(v / days) if days else "–"]]
+    if spec["compare"]:
+        pa, pb, base_txt = ask_base_window(spec, dmax)
+        bf = ask_filter(f, {**spec, "start": pa, "end": pb})
+        bt = ask_metric_of(bf, metric) if not bf.empty else 0
+        g = _grow(total, bt)
+        txt += f" That is <b>{_gtxt(g)}</b> against {base_txt} ({ask_fmt(bt, metric)})." if bt else f" There were no sales in {base_txt} to compare with."
+        if ask_small_base(total, bt):
+            txt += " <span class='muted'>(The earlier figure is very small, so treat that % with care.)</span>"
+        rows.append(["Before", ask_fmt(bt, metric)])
+        if bt:
+            rows.append(["Growth", _gtxt(g)])
+    if spec["avg_day"] and days:
+        txt += f" Per selling day: <b>{ask_amt(total / days, metric)}</b> over {days} days."
+    if spec["projection"] and metric in ("v", "q"):
+        cov, left, end, pwhat = ask_proj(spec, dmin, dmax)
+        if left:
+            proj = total + total / cov * left
+            txt += (f" Projected {pwhat} ({end.day} {end:%b %Y}): <b>{ask_amt(proj, metric)}</b>, if the current pace of "
+                    f"{ask_amt(total / cov, metric)} a day over {cov} days holds for the {left} days left.")
+            rows += [["Daily pace", ask_fmt(total / cov, metric)], ["Days left", str(left)], [f"Projected {pwhat}", ask_fmt(proj, metric)]]
+        else:
+            txt += f" This period is already complete in the sheet, so there is nothing left to project."
+    if spec["share"] and metric in ("v", "q"):
+        allf = ask_filter(f, {**spec, "filters": {**spec["filters"], "spc": [], "fam": [], "seg": [], "cat": []}})
+        at = ask_metric_of(allf, metric)
+        if at:
+            txt += f" That is <b>{total / at * 100:.1f}%</b> of the {'store' if spec['filters'].get('store') else 'overall'} total."
+    out["text"] = txt
+    out["table"] = {"cols": ["Measure", "Amount"], "rows": rows}
+    return out
+
+
+def ask_target(st, spec, sel_scope):
+    f, _ = chart_frame(st)
+    stores = sorted(x for x in f["store"].unique() if x)
+    sel = spec["filters"].get("store") or sel_scope
+    dmax = f["day"].max()
+    month = min(spec["end"], dmax).strftime("%Y-%m")
+    s = pd.Timestamp(month + "-01")
+    e = s + pd.offsets.MonthEnd(0)
+    eff = min(e, dmax)
+    t = load_targets()
+    tg, _ = scope_target(t, sel, month, stores)
+    sales_sel, who = sel, scope_label(sel)
+    if len(sel) != 1 and not t.get(f"*|{month}"):
+        # several stores: targets and sales of the same stores only (as on Overview), and say how many
+        pool = sel or stores
+        per = {x: scope_target(t, [x], month, stores)[0] for x in pool}
+        have = [x for x in pool if per[x] and (per[x].get("v") is not None or per[x].get("q") is not None)]
+        if have:
+            tg, sales_sel = sum_targets([per[x] for x in have]), have
+            who = (have[0] if len(have) == 1 else f"{len(have)} stores") + f" ({len(have)} of {len(pool)} with a target)"
+    cur = sp_rows(scope_rows(f, sales_sel))
+    cur = cur[(cur["day"] >= s) & (cur["day"] <= eff)]
+    v, q = float(cur["v"].sum()), float(cur["q"].sum())
+    if not tg or (tg.get("v") is None and tg.get("q") is None):
+        return {"text": f"No SP target is set for {who} in {s:%B %Y}. SP sales so far: <b>{inr_short(v)}</b> ({inr_full(q)} units). "
+                        "Set targets on the Target vs Achievement page.", "table": None, "where": f"{s:%B %Y} · {who} · SP"}
+    days_total, elapsed = (e - s).days + 1, max(1, (eff - s).days + 1)
+    left = days_total - elapsed
+    rows = []
+    for key, got, fmt in (("v", v, inr_short), ("q", q, inr_full)):
+        tt = tg.get(key)
+        if not tt:
+            continue
+        ach = got / tt * 100
+        proj = got + got / elapsed * left
+        need90 = max(0, tt * 0.9 - got)
+        rows.append(["Value" if key == "v" else "Units", fmt(tt), fmt(got), f"{ach:.1f}%", fmt(max(0, tt - got)), fmt(need90),
+                     fmt(need90 / left) if left else "–", f"{fmt(proj)} ({proj / tt * 100:.1f}%)"])
+    first = rows[0]
+    text = (f"<b>{who}</b> has achieved <b>{first[3]}</b> of the {s:%B} SP {first[0].lower()} target ({first[2]} of {first[1]}) "
+            f"with {elapsed} of {days_total} days gone. ")
+    key0 = "v" if tg.get("v") else "q"
+    got0 = v if key0 == "v" else q
+    if got0 >= tg[key0]:
+        text += f"The target is already reached. Projected: {first[7]}."
+    elif got0 >= tg[key0] * 0.9:
+        text += f"90% is reached; {first[4]} to go for 100%. Projected: {first[7]}."
+    else:
+        text += f"Balance {first[4]}; reaching 90% needs {first[5]} more" + (f" ({first[6]} a day)" if left else "") + f". Projected: {first[7]}."
+    return {"text": text, "table": {"cols": ["Measure", "Target", "Achieved", "Ach%", "Balance", "Required for 90%", "Per day for 90%", "Projected"],
+                                    "rows": rows}, "where": f"{s:%B %Y} · {who} · smartphones only"}
+
+
+def ask_activation(st, spec, sel_scope):
+    fr, err = activation_frame(st)
+    if fr is None:
+        return {"text": err, "table": None, "where": ""}
+    sel = spec["filters"].get("store") or sel_scope
+    d = fr[fr["store"].isin(sel)] if sel else fr
+    if spec["filters"].get("spc"):
+        d = d[d["spc"].isin(spec["filters"]["spc"])]
+    if spec["filters"].get("fam"):
+        d = d[d["fam"].isin(spec["filters"]["fam"])]
+    who = scope_label(sel)
+    if d.empty:
+        return {"text": f"No activations are pending for {who}.", "table": None, "where": who}
+    d = d.sort_values("days", ascending=False)
+    txt = (f"<b>{len(d)}</b> sale{'s are' if len(d) != 1 else ' is'} waiting for activation in {who}, worth <b>{inr_short(d['v'].sum())}</b>. "
+           f"The oldest has been pending <b>{int(d['days'].max())} days</b>; {int((d['days'] > 7).sum())} are over a week old.")
+    rows = [[r.fam, inr_short(r.v), f"{r.sale:%d %b %Y}", r.spc or "–", str(int(r.days))] for r in d.head(15).itertuples()]
+    return {"text": txt, "table": {"cols": ["Model", "Value", "Sale date", "SPC", "Days pending"], "rows": rows}, "where": who,
+            "link": "/activation"}
+
+
+def ask_versus(st, spec):
+    """Side by side: two or more models / stores / SPCs / segments over one period, or one scope over two or more periods."""
+    f, _ = chart_frame(st)
+    dmin, dmax = f["day"].min(), f["day"].max()
+    metric = spec["metric"] if spec["metric"] in ("v", "q", "asp") else "v"
+    word = METRIC_WORD[metric]
+    groups = []
+    if spec.get("periods"):
+        for a, b, lab in spec["periods"]:
+            groups.append({"label": lab, "start": a, "end": b, "filters": {}})
+        kind_label = "Period"
+    else:
+        kind = spec["versus"]["kind"]
+        for m in spec["versus"]["groups"]:
+            flt = {"seg": [], "cat": []} if kind == "seg" else {}
+            flt["cat" if m["kind"] == "cat" else ("seg" if kind == "seg" else kind)] = m["values"]
+            groups.append({"label": m["label"], "filters": flt, "values": m["values"]})
+        kind_label = {"fam": "Model", "store": "Store", "spc": "SPC", "seg": "Segment"}[kind]
+    res = []
+    for g in groups:
+        sp2 = {**spec, "filters": {**spec["filters"], **g["filters"]}}
+        if "start" in g:
+            sp2.update(start=g["start"], end=g["end"])
+        cur = ask_filter(f, sp2)
+        v, q = float(cur["v"].sum()), float(cur["q"].sum())
+        item = {"g": g, "spec": sp2, "v": v, "q": q, "x": {"v": v, "q": q, "asp": v / q if q else 0.0}[metric],
+                "days": int(cur["day"].nunique()), "a": sp2["start"], "b": min(sp2["end"], dmax)}
+        item["cal"] = max(0, (item["b"] - item["a"]).days + 1)
+        if spec["compare"] and not spec.get("periods"):
+            pa, pb, base_txt = ask_base_window(sp2, dmax)
+            item["base"], item["base_txt"] = ask_metric_of(ask_filter(f, {**sp2, "start": pa, "end": pb}), metric), base_txt
+        if spec.get("projection") and metric in ("v", "q"):
+            cov, left, _, pwhat = ask_proj(sp2, dmin, dmax)
+            item["proj"] = (item["x"] + item["x"] / cov * left, pwhat) if left else None
+        res.append(item)
+    if all(r["v"] == 0 and r["q"] == 0 for r in res):
+        return {"text": f"I found no sales for any of these in the uploaded data ({' vs '.join(r['g']['label'] for r in res)}).", "table": None}
+    combined = sum(r["x"] for r in res) if metric in ("v", "q") else 0
+    cols = [kind_label] + (["Dates"] if spec.get("periods") else []) + ["Value", "Units", "ASP"]
+    if combined and not spec.get("periods"):
+        cols.append(f"Share of these ({'value' if metric == 'v' else 'units'})")
+    cols += ["Selling days", "Per day" + (" (units)" if metric == "q" else "")]
+    has_base = any("base" in r for r in res)
+    if has_base:
+        cols += ["Before", "Growth"]
+    has_proj = any(r.get("proj") for r in res)
+    if has_proj:
+        cols.append("Projected " + next(r["proj"][1] for r in res if r.get("proj")))
+    rows = []
+    for r in res:
+        row = [r["g"]["label"]] + ([fmt_range(r["a"], r["b"]) if r["a"] <= r["b"] else "no data yet"] if spec.get("periods") else [])
+        row += [inr_short(r["v"]), inr_full(r["q"]), inr_short(r["v"] / r["q"]) if r["q"] else "–"]
+        if combined and not spec.get("periods"):
+            row.append(f"{r['x'] / combined * 100:.1f}%")
+        row += [str(r["days"]), ask_fmt(r["x"] / r["cal"], metric) if r["cal"] and metric != "asp" else "–"]
+        if has_base:
+            row += [ask_fmt(r.get("base", 0), metric), _gtxt(_grow(r["x"], r.get("base", 0)))]
+        if has_proj:
+            row.append(ask_fmt(r["proj"][0], metric) if r.get("proj") else "–")
+        rows.append(row)
+    fmt = lambda r: f"<b>{r['g']['label']}</b>: {ask_amt(r['x'], metric)}" + (f" ({inr_short(r['v'])})" if metric == "q" else f" ({inr_full(r['q'])} units)" if metric == "v" else "")
+    scope_txt = ask_scope_text({**spec, "filters": {**spec["filters"], **({} if spec.get("periods") else {k: [] for k in ("store", "spc", "fam", "seg", "cat") if k in res[0]["g"]["filters"]})}})
+    if spec.get("periods"):
+        a, b = sorted(res[:2], key=lambda r: r["a"], reverse=True)    # growth is the later period against the earlier one
+        lab = lambda r: f"<b>{r['g']['label']}</b> ({fmt_range(r['a'], r['b']) if r['a'] <= r['b'] else 'no data yet'})"
+        txt = f"{word[:1].upper() + word[1:]}, {scope_txt}: {lab(a)} {ask_amt(a['x'], metric)} vs {lab(b)} {ask_amt(b['x'], metric)}"
+        g = _grow(a["x"], b["x"])
+        txt += f", so {a['g']['label']} is <b>{_gtxt(g)}</b> on {b['g']['label']}." if b["x"] else "."
+        if ask_small_base(a["x"], b["x"]):
+            txt += f" <span class='muted'>({b['g']['label']} has very little in the sheet, so treat that % with care.)</span>"
+        if len(res) == 2 and a["cal"] and b["cal"] and a["cal"] != b["cal"] and metric in ("v", "q"):
+            # one period is only partly in the sheet: also compare the same number of days from each start
+            n = min(a["cal"], b["cal"])
+            lfl = [ask_metric_of(ask_filter(f, {**r["spec"], "start": r["a"], "end": r["a"] + (n - 1) * DAY}), metric) for r in (a, b)]
+            txt += (f" The sheet covers {a['cal']} vs {b['cal']} days, so like for like (the first {n} days of each): "
+                    f"{ask_fmt(lfl[0], metric)} vs {ask_fmt(lfl[1], metric)}, <b>{_gtxt(_grow(lfl[0], lfl[1]))}</b>.")
+    else:
+        order = sorted(res, key=lambda r: r["x"], reverse=True)
+        when = ask_when(spec, dmax)
+        txt = f"{word[:1].upper() + word[1:]}, {when} · {scope_txt}: " + " vs ".join(fmt(r) for r in res) + "."
+        top, low = order[0], order[-1]
+        if len(res) == 2 and low["x"] and metric in ("v", "q"):
+            txt += (f" <b>{top['g']['label']}</b> is ahead by <b>{ask_amt(top['x'] - low['x'], metric)}</b>"
+                    f" ({top['x'] / low['x']:.2f}× {low['g']['label']}).")
+        elif len(res) > 2:
+            txt += f" Highest: <b>{top['g']['label']}</b>; lowest: <b>{low['g']['label']}</b>."
+        none = [r["g"]["label"] for r in res if not r["v"] and not r["q"]]
+        if none:
+            txt += f" {', '.join(none)} had no sales in these dates and stores."
+        if has_base:
+            txt += f" Growth is against {res[0].get('base_txt', 'the previous period')}."
+            if any(ask_small_base(r["x"], r.get("base", 0)) for r in res):
+                txt += " <span class='muted'>(Some earlier figures are very small, so read those % with care.)</span>"
+        many = [r for r in res if len(r["g"].get("values", [])) > 1]
+        if many:
+            txt += " " + " ".join(f"<span class='muted'>{r['g']['label']}: {', '.join(r['g']['values'][:4])}{' …' if len(r['g']['values']) > 4 else ''}.</span>" for r in many)
+    if has_proj:
+        txt += " Projections assume the current daily pace holds."
+    return {"text": txt, "table": {"cols": cols, "rows": rows}}
+
+
+def ask_next_month(st, spec):
+    """Estimate next month from the uploaded data: the last 30 days' pace, and last year's month-to-month change when the sheet has it."""
+    f, _ = chart_frame(st)
+    dmin, dmax = f["day"].min(), f["day"].max()
+    metric = spec["metric"] if spec["metric"] in ("v", "q") else "v"
+    flt = lambda a, b: ask_metric_of(ask_filter(f, {**spec, "start": a, "end": b}), metric)
+    m0 = dmax.replace(day=1)
+    m_end = m0 + pd.offsets.MonthEnd(0)
+    nxt = m_end + DAY
+    nxt_end = nxt + pd.offsets.MonthEnd(0)
+    n_days = (nxt_end - nxt).days + 1
+    r_from = max(dmin, dmax - 29 * DAY)
+    r_days = (dmax - r_from).days + 1
+    recent = flt(r_from, dmax)
+    pace = recent / r_days
+    est_a = pace * n_days
+    cur = flt(m0, dmax)
+    cov = (dmax - m0).days + 1
+    cur_proj = cur + cur / cov * (m_end - dmax).days
+    scope = ask_scope_text(spec)
+    rows = [["Last 30 days' pace", f"{ask_fmt(pace, metric)} a day ({fmt_range(r_from, dmax)})", ask_fmt(est_a, metric)]]
+    txt = (f"Estimate for <b>{nxt:%B %Y}</b> ({METRIC_WORD[metric]}, {scope}), worked out only from the uploaded sheet: "
+           f"about <b>{ask_fmt(est_a, metric)}</b> if the last 30 days' pace of {ask_fmt(pace, metric)} a day holds for {n_days} days.")
+    ly0, ly1 = m0 - pd.DateOffset(years=1), nxt - pd.DateOffset(years=1)
+    if ly0 >= dmin and ly1 + pd.offsets.MonthEnd(0) <= dmax:
+        a_ly, b_ly = flt(ly0, ly0 + pd.offsets.MonthEnd(0)), flt(ly1, ly1 + pd.offsets.MonthEnd(0))
+        if a_ly and b_ly:
+            ratio = b_ly / a_ly
+            est_b = cur_proj * ratio
+            rows.append([f"Last year's {ly0:%b}→{ly1:%b} change", f"{_gtxt((ratio - 1) * 100)} on {m0:%B}'s projected {ask_fmt(cur_proj, metric)}",
+                         ask_fmt(est_b, metric)])
+            txt += (f" Last year {ly1:%B} was {_gtxt((ratio - 1) * 100)} on {ly0:%B}; applied to {m0:%B}'s projected "
+                    f"{ask_fmt(cur_proj, metric)}, that gives about <b>{ask_fmt(est_b, metric)}</b>.")
+    txt += " <span class='muted'>These are estimates, not data: the sheet has nothing after " f"{dmax.day} {dmax:%b %Y}.</span>"
+    return {"text": txt, "table": {"cols": ["Method", "Basis", "Estimate"], "rows": rows}}
+
+
+def ask_unknown(spec, vocab, question):
+    """A model-like name the sheet doesn't have: say so instead of answering for everything."""
+    names = vocab["fam_alias"]
+    chips, bits = [], []
+    for u in spec["unknown"][:2]:
+        close = difflib.get_close_matches(u.lower(), list(names), n=8, cutoff=0.5)
+        sugg = list(dict.fromkeys(names[c][0] for c in close))[:3]
+        typed = re.search(re.escape(u).replace(r"\ ", r"\s*"), question, re.I)
+        bits.append(f"<b>{typed.group(0) if typed else u}</b>" + (f" (closest: {', '.join(sugg)})" if sugg else ""))
+        for s in sugg:
+            chips.append(re.sub(re.escape(u), s, question, count=1, flags=re.I))
+    return {"text": f"I couldn't find {' or '.join(bits)} in the uploaded sales data, so I haven't answered. "
+                    "I only use models that appear in the sheet.", "chips": chips[:4]}
+
+
+def ask_read(spec, dmax):
+    """How the question was read: shown under every answer so the scope is never a guess."""
+    r = [["Period", ask_when(spec, dmax) + ("" if spec.get("period_explicit") else " (none asked: this month)")]]
+    if spec.get("periods"):
+        r = [["Periods", " vs ".join(fmt_range(a, min(b, dmax)) if a <= dmax else lab for a, b, lab in spec["periods"])]]
+    stores = spec["filters"].get("store") or []
+    who = "All stores" if not stores else (stores[0] if len(stores) == 1 else f"{len(stores)} stores")
+    r.append(["Stores", who + (" (picked in Stores)" if spec.get("store_from") == "picker" else "")])
+    for k, lab in (("spc", "SPC"), ("fam", "Model"), ("seg", "Segment")):
+        if spec["filters"].get(k):
+            vals = spec["filters"][k]
+            r.append([lab, ", ".join(vals[:3]) + (f" +{len(vals) - 3}" if len(vals) > 3 else "")])
+    if spec["filters"].get("cat"):
+        r.append(["Category", ", ".join(CAT_NAMES.get(c, c) for c in spec["filters"]["cat"])])
+    r.append(["Measure", METRIC_WORD.get(spec.get("metric"), "sales value")])
+    if spec.get("versus"):
+        r.append(["Side by side", " vs ".join(m["label"] for m in spec["versus"]["groups"])])
+    if spec.get("by"):
+        r.append(["Breakdown", LABELS.get(spec["by"], spec["by"])])
+    if spec.get("rank_by"):
+        r.append(["Ranked by", "growth %" if spec["rank_by"] == "growth" else "change"])
+    if spec.get("compare"):
+        r.append(["Against", "same period last year" if spec["compare"] == "ly" else "previous period"])
+    if spec.get("projection") or spec.get("next"):
+        r.append(["Projection", "straight line at the current pace"])
+    return r
+
+
+ASK_EXAMPLES = ["Total sales this month", "Top 5 SPCs by value last month", "S26 Ultra vs S25 Ultra units this month",
+                "Compare Velachery and Anna Nagar sales this month", "October vs September sales", "Flagship vs Innovative units this month",
+                "Top 5 stores by growth vs last month", "Projected month-end sales by segment", "Forecast next month sales",
+                "Target achievement", "Activation pending", "Sales in 2025 vs 2026"]
+
+
+def ask_builtin(st, question, sel):
+    f, _ = chart_frame(st)
+    if f is None or f.empty:
+        return {"text": "This sheet has no usable date column, so I can't answer questions about it yet."}
+    dmin, dmax = f["day"].min(), f["day"].max()
+    spec = ask_parse(question, f, sel, dmin, dmax, eod_today())
+    if spec["help"] or not question.strip() or not spec.get("on_topic", True):
+        if question.strip() and not spec["help"]:
+            return {"text": "I can only answer questions about your sales sheet: totals, rankings, growth, targets, products, "
+                            "SPCs, stores and activations. Try one of these:", "chips": ASK_EXAMPLES[:6]}
+        return {"text": "Ask me about your sales in plain English: totals, rankings, growth, targets, products, SPCs, stores or "
+                        "activations. I read the period (today, last month, 12 Oct, Q3…), stores, SPCs, models and segments from your question.",
+                "chips": ASK_EXAMPLES[:6]}
+    if spec["meta"] and spec.get("gaps"):
+        m = meta_data(st)
+        txt = (f"Between <b>{m['from']}</b> and <b>{m['to']}</b> the sheet has sales on {m['days']} of {m['calendar_days']} days, "
+               f"so <b>{m['missing_days']} day{'s' if m['missing_days'] != 1 else ''}</b> have none" + (f" ({len(m['gaps'])} gaps, newest first in the table)." if m['gaps'] else "."))
+        if m["thin"]:
+            txt += (" <b>Very little data</b> in " + ", ".join(f"{t['label']} ({t['low']}–{t['high']} a month)" for t in m["thin"])
+                    + f", against {m['typical']} a month in the rest; those months look mostly missing from the sheet.")
+        rows = [[g["label"], str(g["days"])] for g in m["gaps"][:40]]
+        return {"text": txt, "table": {"cols": ["No sales on", "Days"], "rows": rows} if rows else None,
+                "read": [["Period", f"{m['from']} – {m['to']}"], ["Measure", "days with no sales"]]}
+    if spec["meta"]:
+        m = meta_data(st)
+        return {"text": f"The sheet has sales from <b>{m['from']}</b> to <b>{m['to']}</b> ({m['days']} selling days, "
+                        f"{inr_full(m['rows'])} rows) across {m['stores']} stores. Months: {', '.join(m['months'])}."
+                        + (f" Last uploaded {m['updated']}." if m.get("updated") else "")}
+    if spec["unknown"]:
+        return {**ask_unknown(spec, ask_vocab(f), question), "read": ask_read(spec, dmax)}
+    if spec["activation"]:
+        return ask_activation(st, spec, sel)
+    if spec["target"]:
+        return ask_target(st, spec, sel)
+    if spec["next"]:
+        res = ask_next_month(st, spec)
+    elif spec["versus"] or spec["periods"]:
+        res = ask_versus(st, spec)
+    else:
+        res = ask_run(st, spec)
+    res["read"] = ask_read(spec, dmax)
+    return res
+
+
+# ---------- optional: Claude reads the question and uses the same engine as a tool ----------
+ASK_TOOL = {
+    "name": "query_sales",
+    "description": "Query the sales sheet (FinalStatus OK rows). Returns totals or a ranked breakdown, with optional growth vs the previous period or last year.",
+    "input_schema": {"type": "object", "properties": {
+        "start": {"type": "string", "description": "YYYY-MM-DD"}, "end": {"type": "string", "description": "YYYY-MM-DD"},
+        "metric": {"type": "string", "enum": ["v", "q", "asp", "spcs", "models", "stores", "rows"], "description": "v = sales value, q = units"},
+        "group_by": {"type": "string", "enum": ["", "spc", "store", "fam", "seg", "day", "week", "month", "weekday"]},
+        "top": {"type": "integer"}, "order": {"type": "string", "enum": ["desc", "asc"]},
+        "compare": {"type": "string", "enum": ["", "prev", "ly"]},
+        "stores": {"type": "array", "items": {"type": "string"}}, "spcs": {"type": "array", "items": {"type": "string"}},
+        "models": {"type": "array", "items": {"type": "string"}}, "segments": {"type": "array", "items": {"type": "string"}},
+        "categories": {"type": "array", "items": {"type": "string", "enum": ["sp", "tab", "wear", "pc", "acc", "care"]}}},
+        "required": ["start", "end", "metric"]}}
+EXTRA_TOOLS = [
+    {"name": "target_status", "description": "SP target vs achievement for a month (balance, required for 90%, projection).",
+     "input_schema": {"type": "object", "properties": {"month": {"type": "string", "description": "YYYY-MM"},
+                                                        "stores": {"type": "array", "items": {"type": "string"}}}, "required": ["month"]}},
+    {"name": "activation_pending", "description": "Sales still waiting for activation (model, value, date, SPC, days pending).",
+     "input_schema": {"type": "object", "properties": {"stores": {"type": "array", "items": {"type": "string"}}}}},
+]
+
+
+def ask_tool_call(st, name, args, sel):
+    f, _ = chart_frame(st)
+    dmax = f["day"].max()
+    pick = lambda vals, pool: [v for v in (vals or []) if v in pool]
+    stores = sorted(x for x in f["store"].unique() if x)
+    if name == "target_status":
+        m = parse_date((args.get("month") or dmax.strftime("%Y-%m")) + "-01") or dmax
+        spec = {"filters": {"store": pick(args.get("stores"), stores)}, "end": m + pd.offsets.MonthEnd(0)}
+        return ask_target(st, spec, sel)
+    if name == "activation_pending":
+        return ask_activation(st, {"filters": {"store": pick(args.get("stores"), stores)}}, sel)
+    a, b = parse_date(args.get("start")) or dmax.replace(day=1), parse_date(args.get("end")) or dmax
+    spec = {"filters": {"store": pick(args.get("stores"), stores) or list(sel), "spc": pick(args.get("spcs"), set(f["spc"])),
+                        "fam": pick(args.get("models"), set(f["fam"])), "seg": pick(args.get("segments"), set(f["seg"])),
+                        "cat": pick(args.get("categories"), {"sp", "tab", "wear", "pc", "acc", "care"})},
+            "start": a.normalize(), "end": b.normalize(), "period": fmt_range(a.normalize(), b.normalize()),
+            "metric": args.get("metric") if args.get("metric") in METRIC_WORD else "v",
+            "by": args.get("group_by") or None, "top": args.get("top"), "order": args.get("order") or "desc",
+            "compare": args.get("compare") or None, "share": False, "avg_day": False, "projection": False}
+    if spec["by"] not in (None, *LABELS):
+        spec["by"] = None
+    return ask_run(st, spec)
+
+
+def ask_llm(st, question, history, sel):
+    import urllib.request
+    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    f, _ = chart_frame(st)
+    m = meta_data(st)
+    names = lambda col, n=80: ", ".join(sorted(x for x in f[col].unique() if x)[:n])
+    system = (f"You answer questions about a retail sales sheet for a phone retailer in India. Today is {eod_today():%d %b %Y}. "
+              f"Data runs {m.get('from')} to {m.get('to')}. Values are rupees (write 1.25L / 2.40Cr, Indian grouping). "
+              f"Stores: {names('store')}. SPCs: {names('spc')}. Models: {names('fam', 120)}. Segments: {names('seg')}. "
+              f"Currently selected stores in the app: {', '.join(sel) or 'all stores'}. "
+              "Always use the tools for numbers; never invent figures. Reply in 1-4 short sentences, plain text, "
+              "and mention the period and stores you used. Targets are smartphone (SP) only.")
+    msgs = [{"role": h["role"], "content": str(h["content"])[:2000]} for h in (history or [])[-6:] if h.get("role") in ("user", "assistant")]
+    msgs.append({"role": "user", "content": question})
+    last_table = None
+    for _ in range(5):
+        body = json.dumps({"model": os.environ.get("ASK_MODEL", "claude-sonnet-5-5"), "max_tokens": 900, "system": system,
+                           "messages": msgs, "tools": [ASK_TOOL] + EXTRA_TOOLS}).encode()
+        req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=body, method="POST",
+                                     headers={"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"})
+        with urllib.request.urlopen(req, timeout=45) as r:
+            resp = json.loads(r.read())
+        content = resp.get("content", [])
+        msgs.append({"role": "assistant", "content": content})
+        calls = [c for c in content if c.get("type") == "tool_use"]
+        if not calls:
+            text = " ".join(c.get("text", "") for c in content if c.get("type") == "text").strip()
+            esc = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            esc = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", esc)
+            return {"text": esc or "I couldn't find an answer to that.", "table": last_table, "ai": True}
+        results = []
+        for c in calls:
+            try:
+                res = ask_tool_call(st, c.get("name"), c.get("input") or {}, sel)
+                if res.get("table"):
+                    last_table = res["table"]
+                payload = {"summary": re.sub(r"<[^>]+>", "", res.get("text", "")), "table": res.get("table")}
+            except Exception as exc:  # noqa: BLE001 - report the tool error back to the model
+                payload = {"error": str(exc)}
+            results.append({"type": "tool_result", "tool_use_id": c.get("id"), "content": json.dumps(payload)[:12000]})
+        msgs.append({"role": "user", "content": results})
+    return {"text": "That needed more steps than I can take; try asking in a simpler way.", "table": last_table, "ai": True}
+
+
+# ════════════════════════════════════════════════════════════════════
+#  APP HELP: how-to answers about the dashboard itself, from this built-in guide (no data needed)
+# ════════════════════════════════════════════════════════════════════
+APP_HELP = [
+    {"id": "overview", "q": "How does the Overview page work?", "page": "/",
+     "keys": [r"\boverview\b", r"\bhome page\b", r"\bmain page\b", r"\bkey numbers\b", r"\btop gainers\b", r"\bdecliners\b", r"\bsales by period\b", r"\bmix change\b"],
+     "text": "Overview shows sales for one period at a time, compared with the matching earlier periods.",
+     "steps": ["Pick <b>Day, Week, Month, Qtr, Year</b> or <b>All</b>. The arrows (or left/right keys, or a swipe on the sales card) step back and forward; <b>Show Latest</b> jumps back.",
+               "Pick <b>Value</b> or <b>Units</b>, then the base pill (for a month: <b>vs LMTD, vs LLMTD, vs LYSMTD</b>).",
+               "Tap a bar in the chart for its segment split, average and last year.",
+               "Below: Month-end Projection (SP), Sales Drivers, Breakdown vs Past Periods by SPC / Products / Segments / Stores (Show List or Show Table; <b>Sort by change</b> puts the biggest gains first and drops last), Share Shift and Period History."],
+     "link": "/", "rel": ["bases", "store_target", "stores"]},
+    {"id": "bases", "q": "What do LMTD, LLMTD and LYSMTD mean?", "strong": [r"\bl+m?td\b", r"\blysmtd\b", r"\blmtd\b", r"\bllmtd\b", r"\blytd\b", r"\blwtd\b", r"\blyswtd\b", r"\blqtd\b", r"\blysqtd\b", r"\blmwtd\b", r"\blmw\b", r"\blmsd\b", r"\blysd\b", r"\bmtd\b", r"\bytd\b", r"\bqtd\b", r"\bwtd\b"],
+     "keys": [r"\bbase pills?\b", r"\bcompared? with\b", r"\bsame days\b"],
+     "text": "The base pills compare the current period, cut at the sheet's last date, with the same stretch of an earlier period:",
+     "steps": ["<b>MTD</b>: this month to the last date in the sheet. <b>LMTD</b>: the same number of days from the 1st of last month. <b>LLMTD</b>: the same, two months back. <b>LYSMTD</b>: the same dates last year.",
+               "Day: <b>Prev Day</b>, <b>LMSD</b> (same date last month), <b>LYSD</b> (364 days back, the same weekday last year).",
+               "Week (Sunday to Saturday): <b>LWTD</b> (same days last week), <b>LMWTD</b> (same days 4 weeks back: the matching week last month), <b>LYSWTD</b> (364 days back).",
+               "Quarter: <b>LQTD</b>, <b>LYSQTD</b>. Year: <b>LYTD</b>. A finished period compares in full: LM, LLM, LYM, LW, LMW, LYW, LQ, LYQ, LY."],
+     "link": "/", "rel": ["overview", "formulas"]},
+    {"id": "store_target", "q": "How do I set the SP target for a store?", "page": "/targets",
+     "strong": [r"\b(?:set|edit|enter|add|change|update|save|put|type|give)\w* (?:a |the |my |our |this |store |sp |month(?:ly)? |value |units? |qty )*targets?\b", r"\btargets? page\b", r"\btarget vs achievement page\b"],
+     "keys": [r"\btargets?\b"],
+     "text": "Targets are monthly and for smartphones (SP) only. Set them on <b>Target vs Achievement</b>:",
+     "steps": ["Target vs Achievement shows one store at a time: tap the store name at the top and pick the store.",
+               "Use the month arrows to reach the month (up to two months ahead).",
+               "Type <b>SP value target</b> and <b>SP units target</b>. <b>Split equally across N SPCs</b> is ticked by default, so saving shares it out equally; untick it to keep the SPC targets as they are.",
+               "Press <b>Save</b> (or Enter). Saving needs the <b>admin passcode</b> once every 15 minutes; a small box asks for it and then saves. The Overview's <b>Set Target</b> button (Month mode, one store picked) saves the same target."],
+     "link": "/targets", "rel": ["spc_targets", "formulas", "cant_edit"]},
+    {"id": "spc_targets", "q": "How do I set SPC targets?", "page": "/targets",
+     "strong": [r"\bspc[- ]?(?:wise )?targets?\b", r"\bsplit (?:the )?(?:value |units? |qty )?targets? equally\b", r"\badd (?:an )?spc\b", r"\bclear spc\b", r"\bsplit equally\b"],
+     "text": "SPC targets are on <b>Target vs Achievement</b>, under <b>SPC Target Tracker</b>:",
+     "steps": ["Pick one store in <b>Stores</b> and the month.",
+               "Tap <b>Edit SPC targets</b>. Type each SPC's value and units, or tap <b>Split value target equally</b> / <b>Split units target equally</b> (the store target must be set first).",
+               "<b>+ Add SPC</b> adds someone not in the list (type the name as it appears in the sheet). <b>Clear SPC targets</b> empties the boxes.",
+               "Press <b>Save SPC targets</b>. A warning shows when the SPC targets don't add up to the store target."],
+     "link": "/targets", "rel": ["store_target", "formulas", "cant_edit"]},
+    {"id": "formulas", "q": "How are Ach%, balance, required for 90% / 80% and projection worked out?",
+     "strong": [r"\brequired (?:for )?90\b", r"\b90 ?%", r"\brun ?rate\b", r"\bach ?%", r"\bbalance\b", r"\bprojected?\b.*\b(?:calculat|work|mean|how)\w*", r"\bhow (?:is|are) .*(?:calculat|work|comput|count)\w*", r"\btime gone\b", r"\bon track\b", r"\bat risk\b", r"\bneeds push\b"],
+     "text": "Every target figure uses SP (smartphone) sales as a whole, with no split by segment:",
+     "steps": ["<b>Ach%</b> = achieved ÷ target. <b>Balance</b> = target − achieved (never below 0).",
+               "<b>Run rate</b> = achieved ÷ days the sheet covers this month. <b>Projected</b> = achieved + run rate × days left (counted from the sheet's last date).",
+               "<b>Required for</b> is <b>90% for the store</b> and <b>80% for each SPC</b>, on value and units alike: that share of the target − achieved. <b>Per day</b> divides what's left by the days left; ✓ reached shows once the level is met.",
+               "<b>Time gone</b> = days elapsed ÷ days in the month. Ach% is green at 100%+, neutral when ahead of time gone, red when behind. SPC badges: Achieved, On track, Needs push, At risk."],
+     "link": "/targets", "rel": ["store_target", "sp_rule"]},
+    {"id": "cant_edit", "q": "Why can't I edit targets?", "strong": [r"\b(?:can'?t|cannot|unable to|not able to)\b(?: \w+){0,2} (?:edit|set|change|save|type)\b", r"\bwhy (?:can'?t|cannot|isn'?t|doesn'?t|won'?t)\b", r"\b(?:locked|disabled|greyed out|grayed out)\b", r"\bset target (?:button )?(?:missing|not showing|not there)\b"],
+     "text": "Targets are set one store at a time, and saving needs the admin passcode:",
+     "steps": ["Saving asks for the <b>admin passcode</b> (it stays unlocked for 15 minutes). Ask whoever manages the dashboard; if none is set yet, set it in Gear → <b>Data &amp; upload</b> on the computer running the dashboard.",
+               "Target vs Achievement always shows one store; tap the store name at the top to switch. On Overview, <b>Set Target</b> needs one store picked (All Stores adds up the stores' targets).",
+               "On Overview, <b>Set Target</b> shows only in <b>Month</b> mode. Quarter and Year add up the month targets and show achievement once every month has one.",
+               "Targets are SP as a whole; there are no separate Flagship / Innovative targets."],
+     "link": "/targets", "rel": ["store_target", "stores"]},
+    {"id": "eod", "q": "How do I fill in the EOD report?", "page": "/eod",
+     "strong": [r"\beod\b", r"\bend of (?:the )?day\b", r"\bday ?end report\b", r"\bdaily report\b"], "keys": [r"\bfill\b", r"\btoday'?s figures\b"],
+     "text": "The <b>EOD Report</b> is for today. Month-to-date comes from the sheet (up to yesterday) plus what you type for today:",
+     "steps": ["Pick the store in <b>Stores</b> (EOD is one store at a time).",
+               "Type <b>Total day sales</b>, <b>Bills</b> and <b>Walk-ins</b>; Units and Conversion work themselves out.",
+               "Type today's FTD qty and value per category, FF8 / S26F qty, and Care+ (FTD and MTD are typed). Accessories MTD can be typed, or left empty to use sheet + today.",
+               "Add <b>Today's Models Sold</b>, check the <b>WhatsApp Preview</b>, then share. Everything is saved as a draft for each store, for today only."],
+     "link": "/eod", "rel": ["eod_share", "eod_models", "eod_terms"]},
+    {"id": "eod_share", "q": "How do I send the EOD report on WhatsApp?", "strong": [r"\bwhats ?app\b", r"\bshare (?:the )?(?:eod|report)\b", r"\bsend (?:the )?(?:eod|report)\b", r"\bcopy (?:the )?(?:text|report)\b"],
+     "text": "Next to <b>WhatsApp Preview</b> on the EOD Report, tap the share icon:",
+     "steps": ["<b>WhatsApp</b> opens WhatsApp with the report text ready to send.",
+               "<b>Copy text</b> copies it (you'll see <b>EOD report copied</b>) to paste anywhere.",
+               "<b>More…</b> opens the phone's own share sheet, where available. The preview shows exactly what will be sent."],
+     "link": "/eod", "rel": ["eod", "eod_models"]},
+    {"id": "eod_models", "q": "How do I add today's models sold?", "strong": [r"\bmodels? sold\b", r"\badd (?:a )?(?:model|row)\b", r"\bremove (?:a )?(?:model|row)\b"],
+     "text": "In <b>Today's Models Sold</b> on the EOD Report:",
+     "steps": ["Type in a row's <b>Search family name…</b> box; pick from the suggestions (↑/↓ and Enter work). A name not in the sheet is kept as typed.",
+               "Set the qty with <b>−</b> / <b>+</b> (1 to 10). <b>✕</b> removes the row.",
+               "The <b>+</b> and <b>−</b> next to the heading add or remove a row."],
+     "link": "/eod", "rel": ["eod", "eod_share"]},
+    {"id": "eod_terms", "q": "What are MX, Store MTD and Care+ attach%?", "strong": [r"\bmx\b", r"\bstore mtd\b", r"\battach ?%?\b", r"\bcare ?\+?\b", r"\bftd\b", r"\bconversion\b", r"\bwalk[- ]?ins?\b"],
+     "text": "Terms on the EOD Report:",
+     "steps": ["<b>MX</b> = SP + Tab + NPC + Wearables. <b>FTD</b> = for the day (today); <b>MTD</b> = month to date.",
+               "<b>Store MTD</b> = MX MTD value + Accessories MTD value + Care+ MTD value.",
+               "<b>Care+ MTD attach%</b> = Care+ MTD qty ÷ MX MTD qty. <b>Conversion</b> = bills ÷ walk-ins.",
+               "<b>SP achievement</b> uses SP MTD only, against the SP value and units targets."],
+     "link": "/eod", "rel": ["eod", "sp_rule"]},
+    {"id": "stores", "q": "How do I pick one store or several stores?", "strong": [r"\b(?:pick|select|choose|change|switch|filter)\w* (?:a |one |the |my |another |several |multiple |two |many |more )?(?:stores?|branch|outlet|channel)\b", r"\bstores? (?:button|picker|menu|list|filter)\b", r"\bseveral stores\b", r"\bmultiple stores\b", r"\badd (?:up )?stores\b"],
+     "text": "Use the <b>Stores</b> button in the top bar. Your choice is shared by every page:",
+     "steps": ["Type in <b>Search N stores</b> to find one; Enter picks the first match.",
+               "Tap a store's name to show just that store. Tap <b>All Stores</b> for everything.",
+               "Tick the boxes next to several stores, then tap <b>Show</b> to add them up, or <b>Compare</b> (two or more) to see them side by side.",
+               "EOD Report always works on one store."],
+     "link": None, "rel": ["compare", "cant_edit"]},
+    {"id": "compare", "q": "How do I compare stores side by side?", "page": "/compare",
+     "strong": [r"\bcompare (?:two |2 |the |my |several |multiple |different )?(?:stores|branches|outlets)\b", r"\bstore comparison\b", r"\bside[- ]by[- ]side\b"],
+     "text": "Use <b>Comparison</b>:",
+     "steps": ["At the top of the page choose <b>Stores</b> or <b>SPCs of a store</b>. For SPCs, tap the store name to pick the store; tap SPC names to compare just some (two or more).",
+               "For stores: tap the store name, tick two or more and tap <b>Compare</b>. With fewer than two ticked it compares every store.",
+               "Pick the period (MTD, Last month, … or Custom), <b>Value</b> / <b>Units</b>, and <b>vs LM</b> / <b>vs LY</b>.",
+               "You get a sortable <b>Store Performance</b> table (tap a column; the bar in Value shows each one's size), Segment Share, Daily Trend and Best Sellers. SP target, SP ach%, Required for 90% (stores) or 80% (SPCs) and SP projected show when the range is within one month starting on the 1st.",
+               "Deep analysis from every column in the sheet: <b>Business Scorecard</b> (ASP, high-end SP share, EMI, scheme units, selling days, best weekday, activation gap, logged the same day, claims accepted, city, distributor, SPD), <b>SP Price Tiers</b> and <b>Weekday Pattern</b>. Claim Quality (records rejected and why) is on Activations & Claims.",
+               "In the help chat (the ? in the top bar) you can also type, for example, <b>Compare Velachery and Anna Nagar sales this month</b>."],
+     "link": "/compare", "rel": ["stores", "ask"]},
+    {"id": "charts", "q": "How do I build a chart?", "page": "/charts",
+     "strong": [r"\bcharts? page\b", r"\b(?:build|make|create|draw)\w* (?:a |my )?(?:chart|graph)\b", r"\bsplit by\b", r"\bx[- ]axis\b", r"\bchart types?\b", r"\b(?:donut|stacked|line|area|horizontal) (?:chart|bar)\b", r"\bvalue labels\b", r"\baverage line\b", r"\bdata table\b"],
+     "keys": [r"\bcharts?\b", r"\bgraphs?\b"],
+     "text": "On <b>Chart Builder</b>, every chart is built from a few choices:",
+     "steps": ["<b>Period</b>: MTD, Last month, Last 7 / 30 / 90 days, QTD, YTD, Last 12 months, All data or Custom (From / To).",
+               "<b>Chart type</b>: Bar, Stacked, 100% stacked, Line, Area, Horizontal bar or Donut. <b>Measure</b>: Value, Units or ASP.",
+               "<b>X axis</b> (Day, Week, Month, Weekday, Segment, Model, SPC, Store or other sheet columns), <b>Split by</b> (up to 6 series), <b>Compare</b> (previous period or last year as a dashed line), <b>Show</b> (Top 5 to All).",
+               "Options: Value labels, Average line, Data table, Sort by size. Hover or tap a bar for details."],
+     "link": "/charts", "rel": ["export", "quick"]},
+    {"id": "spc_page", "q": "What does the SPC Performance page show?", "page": "/spc",
+     "strong": [r"\bspc contribution\b", r"\basp index\b", r"\bgrowth contrib\w*\b", r"\bshare (?:delta|Δ)\b", r"\bsegment mix by spc\b", r"\bproducts by spc\b", r"\bdaily contribution\b", r"\bconcentration\b"],
+     "text": "<b>SPC Performance</b> shows who drives the store and how:",
+     "steps": ["Pick the period, <b>Value</b> / <b>Units</b>, and <b>vs LM</b> / <b>vs LY</b> (a month-to-date range compares with the same days last month).",
+               "Store Snapshot and Insights, then the <b>SPC Scorecard</b> table: tap a column to sort. <b>ASP index</b> puts the store at 100; <b>Growth contrib.</b> is each SPC's part of the store's growth.",
+               "Who Sells Each Segment (or each SPC's own mix), Products × SPC (each SPC's best models are its top rows) and Daily Contribution (Daily, Cumulative, Share %).",
+               "<b>SP target ach.</b> uses SPC targets when the range is within one month."],
+     "link": "/spc", "rel": ["spc_targets", "export"]},
+    {"id": "activation", "q": "What is Activations & Claims?", "page": "/activation",
+     "strong": [r"\bactivation\w*\b", r"\bnot activated\b", r"\bdays pending\b", r"\bimei\b"],
+     "text": "<b>Activations & Claims</b> lists sales with no Activation Date yet, from every row of the sheet (not only FinalStatus OK):",
+     "steps": ["<b>Days pending</b> = today − sale date. Amber over 7 days, red over 15.",
+               "Search model, SPC, store, IMEI, model code, status or remark; filter by age (0–3, 4–7, 8–15, 16+ days).",
+               "Tap a column heading to sort (again to reverse). By Store and By SPC show who has the most waiting."],
+     "link": "/activation", "rel": ["data_rules"]},
+    {"id": "quick", "q": "What do SP combined, Foldables grouped and S series grouped do?", "strong": [r"\bsp combined\b", r"\bff ?\d+\b", r"\bs\d{1,2}f\b", r"\bseries grouped\b", r"\bfoldables? grouped\b", r"\bff8 grouped\b", r"\bfamily grouping\b", r"\bgroup(?:ing)? (?:the )?(?:models|series|famil\w+)\b", r"\bgrouped\b", r"\bquick settings?\b", r"\bsliders?\b"],
+     "text": "Three switches in <b>Quick settings</b> (the sliders button in the top bar) decide how models and segments are grouped. They apply to Overview, Chart Builder, SPC Performance and Comparison:",
+     "steps": ["<b>SP combined</b> shows Flagship and Innovative together as one SP segment.",
+               "<b>Foldables grouped</b>: every Fold / Flip of one number as one, <b>FF8, FF7, FF6, FF5…</b>",
+               "<b>S series grouped</b>: S26, S26+, S26 Ultra and S26 FE as <b>S26F</b>, and the same for <b>S25F, S24F, S23F…</b> Tab S models are never grouped.",
+               "Turn a switch off to see the individual models again. The help chat understands FF7 or S26F either way.",
+               "Targets are not affected: they always use SP sales."],
+     "link": None, "rel": ["settings", "sp_rule"]},
+    {"id": "settings", "q": "How do I switch to dark mode or the phone layout?", "strong": [r"\bdark (?:mode|theme)\b", r"\blight (?:mode|theme)\b", r"\btheme\b", r"\bappearance\b", r"\blayout\b", r"\bphone (?:view|layout|mode)\b", r"\bdesktop (?:view|layout|mode)\b", r"\bsettings?\b", r"\bgear\b"],
+     "text": "Open the <b>gear</b> (Settings) in the top bar. <b>Quick settings</b> (the sliders) sets full or short numbers, the chart average line and values on bars, and model grouping. Value / Units and the comparison are switched on each page, and the choice carries to every page:",
+     "steps": ["<b>Display</b>: Light or Dark. On your first visit it matches your device; after that it changes only when you tap.",
+               "<b>View</b>: Phone (a narrow column) or Desktop (a wide view); the page reloads. The first visit picks one from your screen size.",
+               "<b>Sales data</b> shows the date range, months, selling days and stores, plus any dates with no sales. <b>Data &amp; upload</b> (admin passcode) is there too."],
+     "link": None, "rel": ["upload", "connection"]},
+    {"id": "upload", "q": "How do I upload a new sheet?", "strong": [r"\bupload\w*\b", r"\bnew (?:sales )?(?:sheet|file|data)\b", r"\breplace (?:the )?data\b", r"\b(?:excel|xlsx|xls|csv)\b", r"\bupload pin\b", r"\brefresh (?:the )?data\b"],
+     "text": "Gear → <b>Data &amp; upload</b> (or open /upload). It needs the admin passcode:",
+     "steps": ["Enter the <b>admin passcode</b> to unlock. It stays unlocked for 15 minutes of use; <b>Lock now</b> ends it. Too many wrong tries lock the form for 15 minutes. The first passcode can only be set on the computer running the dashboard. Forgot it? On that computer, delete <b>admin.json</b> in the data folder, then open Data &amp; upload to set a new one.",
+               "Keep a copy: <b>Download current data (CSV)</b>.",
+               "Choose the new sheet (Excel .xlsx / .xls or CSV, up to 128 MB) and tap <b>Check this sheet</b>. Nothing changes yet.",
+               "The check shows the dates, days, rows, stores and value next to the data loaded now, and warns about days or stores the new sheet would lose.",
+               "To go ahead, tick <b>I have the raw data sheet saved</b>, type <b>REPLACE</b> and tap <b>Replace data</b>. Targets are kept. <b>Restore the previous upload</b> switches back if needed.",
+               "A sheet without a date or Tentative DP column is refused and nothing changes."],
+     "link": "/upload", "link_label": "Open Data & upload", "rel": ["data_rules"]},
+    {"id": "data_rules", "q": "Which sales rows are counted?", "strong": [r"\bfinal ?status\b", r"\bwhich (?:rows|sales|records)\b", r"\b(?:rows?|records?|sales) (?:are |is |get |gets )?(?:counted|excluded|left out|missing|ignored)\b", r"\bnumbers? (?:don'?t|do not) match\b", r"\bother segment\b", r"\bbb\b", r"\bwb\b", r"\bsegment names?\b", r"\bw/?o ta\b"],
+     "text": "How the sheet is read:",
+     "steps": ["Only rows whose <b>FinalStatus</b> is <b>OK</b> count, on every page except Activations & Claims.",
+               "Segments: <b>BB</b> = Flagship, <b>WB</b> = Innovative, Note PC = NPC, Wearable = Wearables. A blank segment takes the segment the same model has elsewhere in the sheet.",
+               "Model names are merged, e.g. 'A17 5G w/o TA' → 'A17 5G'.",
+               "Value is Tentative DP. Units come from a qty column, or each row counts as 1."],
+     "link": None, "rel": ["sp_rule", "upload", "formats"]},
+    {"id": "sp_rule", "q": "What counts as SP for targets?", "strong": [r"\bwhat (?:is|counts as|does) sp\b", r"\bsp only\b", r"\bsmartphones? only\b", r"\bwhy (?:only )?sp\b", r"\bsp (?:mean|means|stand)\b"],
+     "text": "<b>SP</b> means smartphones: Flagship + Innovative (the SEG2 'SP' rows).",
+     "steps": ["All targets and achievement use SP sales only, for value and units: Targets, Overview's Run Rate &amp; Target, Comparison, SPC Performance and the EOD report.",
+               "Totals, shares and growth elsewhere still count every segment (Tab, NPC, Wearables…)."],
+     "link": "/targets", "rel": ["formulas", "quick"]},
+    {"id": "export", "q": "How do I save a section as an image?", "strong": [r"\bdownload\w*\b", r"\bexport\w*\b", r"\bsave (?:a |the |this )?(?:section|table|chart|image|picture)\b", r"\bpng\b", r"\bscreenshot\b", r"\bas (?:an )?image\b"],
+     "text": "Every section heading has a small download icon (<b>Save this section as an image</b>):",
+     "steps": ["Tap it to save that section as a PNG, with its title, store, period and the export time. Wide tables are captured in full.",
+               "On phones that support it, the share sheet opens instead so you can send it straight away.",
+               "Not available on the EOD Report (use its share button)."],
+     "link": None, "rel": ["eod_share", "charts"]},
+    {"id": "connection", "q": "What does the coloured light at the top mean?", "strong": [r"\b(?:green|yellow|red) (?:light|dot)\b", r"\b(?:light|dot) (?:at the top|in the top bar)\b", r"\bserver offline\b", r"\bno internet\b", r"\bonline\b", r"\bconnection\b", r"\boffline\b"],
+     "text": "The light in the top bar (a dot next to the title on phones) shows the connection:",
+     "steps": ["<b>Green · Online</b>: connected to the dashboard server.",
+               "<b>Yellow · Server offline</b>: the internet works but the dashboard server isn't answering; numbers on screen may be old.",
+               "<b>Red · No internet</b>: check Wi-Fi or mobile data. Tap the light to see the full message."],
+     "link": None, "rel": ["settings"]},
+    {"id": "explore", "q": "How do I move between pages?", "strong": [r"\bexplore\b", r"\b(?:other|another|all|which) pages?\b", r"\bnavigat\w*\b", r"\bgo to (?:the )?\w+ page\b", r"\bfind (?:the )?\w+ page\b", r"\bmenu\b"],
+     "text": "Tap <b>Explore</b> in the top bar:",
+     "steps": ["<b>Insights</b>: Overview, Chart Builder, SPC Performance, Comparison.",
+               "<b>Plan</b>: Target vs Achievement. <b>Daily</b>: EOD Report, Activations & Claims. Questions go to the help chat (the ? in the top bar).",
+               "The page you're on is highlighted. Your store choice and settings carry over."],
+     "link": None, "rel": ["stores", "ask"]},
+    {"id": "formats", "q": "What do K, L and Cr mean?", "strong": [r"\bcrores?\b", r"\blakhs?\b", r"\bwhat (?:is|does|do) (?:k|l|cr)\b", r"\b(?:k|l|cr) (?:mean|means|stand)\b", r"\bnumber format\b"],
+     "text": "Values are rupees without the ₹ sign, in Indian grouping (1,23,45,678):",
+     "steps": ["<b>K</b> = thousand, <b>L</b> = lakh (1,00,000), <b>Cr</b> = crore (1,00,00,000), with 2 decimals.",
+               "Growth chips show ↑ / ↓ with 2 decimals; <b>New</b> means there was nothing to compare with. <b>pp</b> means percentage points."],
+     "link": None, "rel": ["bases"]},
+    {"id": "gaps", "q": "How do I find missing dates in the data?",
+     "strong": [r"\bmissing\b", r"\bmissed\b", r"\bgaps?\b", r"\bno sales (?:on|for|days?)\b", r"\bincomplete\b", r"\bempty (?:days?|dates?|months?)\b", r"\bcoverage\b"],
+     "text": "Open the <b>gear</b> (Settings) → <b>Sales data</b>:",
+     "steps": ["The card shows the date range, months, selling days and stores in the sheet.",
+               "<b>N of M days have no sales</b>: tap it to see every gap, newest first (for example 25–27 Mar 2025 · 3 days).",
+               "<b>Very little data</b> (orange) flags months with under 5% of the busiest month's sales; those months are probably mostly missing from the sheet.",
+               "Or ask here: <b>Which dates have no sales?</b>"],
+     "link": None, "rel": ["upload", "data_rules"], "extra": ["Which dates have no sales?"]},
+    {"id": "ask", "q": "What can I ask the chat?", "page": "/ask",
+     "strong": [r"\bask data\b", r"\bwhat can (?:you|i) ask\b", r"\bwhat (?:can|do) you (?:do|answer)\b", r"\bhow (?:do|can) i ask\b", r"\bchat\b"],
+     "text": "Ask in plain English, about your sales or about using the app:",
+     "steps": ["Totals, top N, breakdowns (by SPC, store, model, segment, day, week, month), growth and rankings by growth.",
+               "Side by side: <b>S26 Ultra vs S25 Ultra units</b>, <b>Compare Velachery and Anna Nagar</b>, <b>October vs September</b>.",
+               "Projections (month, quarter or year end), <b>Forecast next month</b>, target achievement and activation pending.",
+               "How-to questions like <b>How do I set SPC targets?</b>. Answers about sales come only from your uploaded sheet; <b>Read as</b> shows how the question was understood."],
+     "link": "/?ask=1", "link_label": "Open the help chat", "rel": ["explore", "compare"]},
+]
+APP_HELP_BY_ID = {h["id"]: h for h in APP_HELP}
+PAGE_NAMES = {"/": "Overview", "/charts": "Chart Builder", "/spc": "SPC Performance", "/compare": "Comparison",
+              "/targets": "Target vs Achievement", "/eod": "EOD Report", "/activation": "Activations & Claims"}
+HELP_INTENT = re.compile(r"\bhow (?:do|can|to|should|does|would|will)\b|\bhow (?:is|are)\b.*\b(?:calculat|worked? out|count|comput|defin|done|made)\w*"
+                         r"|\bwhere (?:is|are|can|do|does)\b|\bwhat (?:is|are|does|do)\b.*\b(?:mean|meaning|stand for|page|button|show|shows|for)\b"
+                         r"|\bmeaning\b|\bexplain\b|\bhelp\b|\bguide\b|\bsteps?\b|\btutorial\b|\binstructions?\b|\bcan i\b|\bcan'?t\b|\bcannot\b|\bunable\b"
+                         r"|\bnot working\b|\bwhy (?:is|does|do|are|can'?t|cant|isn'?t|doesn'?t)\b")
+WHAT_IS = re.compile(r"\bwhat(?:'s| is| are)\s+(?:the |a |an )?(?:[\w+%&./-]{2,14}\s?){1,3}\??\s*$")   # 'what is LMTD', 'what is ASP index'
+THIS_PAGE = re.compile(r"\b(?:this|the current|current) (?:page|screen|section|report)\b|\bhere\b|\bon this\b")
+
+
+def ask_help(question, page=""):
+    """A how-to answer from APP_HELP when the question is about using the app; None when it is a data question."""
+    t = " " + re.sub(r"\s+", " ", (question or "").lower().replace("’", "'")).strip() + " "
+    intent = bool(HELP_INTENT.search(t))
+    weak = not intent and bool(WHAT_IS.search(t))   # 'what is X' is help only when X is an app term, not 'what is total sales'
+    data_words = re.search(r"\bsales?\b|\bsold\b|\bunits?\b|\bvalue\b|\brevenue\b|\bgrowth\b|\btop \d|\bvs\b|\bhow many\b|\bhow much\b|\btotal\b", t)
+    scored = []
+    for h in APP_HELP:
+        s = 2 * sum(1 for k in h.get("strong", []) if re.search(k, t)) + sum(1 for k in h.get("keys", []) if re.search(k, t))
+        if s:
+            scored.append((s, h))
+    scored.sort(key=lambda x: -x[0])
+    best = scored[0][1] if scored else None
+    top = scored[0][0] if scored else 0
+    if intent and THIS_PAGE.search(t) and (not best or top < 2):
+        best = next((h for h in APP_HELP if h.get("page") == page), best)
+        top = max(top, 2)
+    if best and (top >= 3 or (intent and top >= 1) or (weak and top >= 2 and not data_words)):
+        rel = (best.get("extra", []) + [APP_HELP_BY_ID[r]["q"] for r in best.get("rel", []) if r in APP_HELP_BY_ID])[:3]
+        link = best.get("link")
+        label = best.get("link_label") or (f"Open {PAGE_NAMES.get(link, 'the page')}" if link else None)
+        out = {"text": best["text"], "steps": best["steps"], "chips": rel, "help": True}
+        if link and link != page:
+            out.update(link=link, link_label=label)
+        return out
+    if intent and not data_words:
+        return {"text": "I don't have a guide entry for that exact question yet. These are the things I can explain; tap one, or ask about your sales.",
+                "chips": [h["q"] for h in APP_HELP[:2]] + [APP_HELP_BY_ID[i]["q"] for i in ("store_target", "spc_targets", "eod", "eod_share", "stores", "upload")],
+                "help": True}
+    return None
+
+
+def ask_help_welcome(page=""):
+    here = next((h for h in APP_HELP if h.get("page") == page), None)
+    chips = ([here["q"]] if here else []) + [APP_HELP_BY_ID[i]["q"] for i in ("bases", "store_target", "eod_share", "stores", "quick") if not here or i != here["id"]]
+    return {"text": "Ask me how to do anything in this app (targets, EOD, stores, charts, settings, uploads) or ask about your sales. "
+                    "Sales answers come only from your uploaded sheet.", "chips": chips[:6], "help": True}
+
+
+def ask_answer(st, question, history, sel, page=""):
+    question = (question or "").strip()[:500]
+    if not question or re.fullmatch(r"(?i)\s*(?:help|hi|hello|hey|\?)\s*[!.?]*", question):
+        return ask_help_welcome(page)
+    helped = ask_help(question, page)   # questions about using the app come from the built-in guide, never from the AI
+    if helped:
+        return helped
+    if os.environ.get("ANTHROPIC_API_KEY", "").strip() and question:
+        try:
+            return ask_llm(st, question, history, sel)
+        except Exception as exc:  # noqa: BLE001 - fall back to the built-in engine
+            res = ask_builtin(st, question, sel)
+            res["note"] = f"AI service unavailable ({type(exc).__name__}); answered with the built-in engine."
+            return res
+    return ask_builtin(st, question, sel)
 
 
 @app.get("/")
 def home():
     st = get_state()
     if st is None:
-        return render_template_string(UPLOAD_HTML, error=None)
-    return render_template_string(WORKSPACE_HTML, ctx=st["ctx"], upload_time=get_upload_time())
+        return upload_page_html(_source["error"] and f"Couldn't load the shared sheet: {_source['error']}")
+    return render_template_string(OVERVIEW_HTML)
 
 
-@app.get("/upload")
-def upload_page():
-    return render_template_string(UPLOAD_HTML, error=None)
-
-
-@app.post("/dashboard")
-def dashboard():
-    f = request.files.get("file")
-    if not f or not f.filename:
+@app.get("/eod")
+def eod_page():
+    st = get_state()
+    if st is None:
         return redirect(url_for("home"))
-    name = f.filename.lower()
-    try:
-        if name.endswith(".csv"):
-            df = pd.read_csv(f)
-        elif name.endswith((".xlsx", ".xls")):
-            df = pd.read_excel(f)
-        else:
-            raise ValueError("unsupported file type, please use .xlsx, .xls or .csv")
-        if df.empty:
-            raise ValueError("the file has no rows")
-        save_data(df)
-    except Exception as exc:
-        return render_template_string(UPLOAD_HTML, error=f"Couldn't read that file: {exc}"), 400
-    return redirect(url_for("home"))
+    return render_template_string(EOD_HTML, eod_json=eod_boot_json(st))
 
 
-@app.post("/calculate")
-def calculate():
+@app.get("/spc")
+def spc_page():
+    if get_state() is None:
+        return redirect(url_for("home"))
+    return render_template_string(SPC_HTML)
+
+
+@app.get("/api/spc")
+def api_spc():
     st = get_state()
     if st is None:
         return jsonify({"error": "No data available."}), 400
     try:
-        payload, _, code = build_view(st, request.form)
+        return jsonify(spc_data(st, request.args))
     except Exception as exc:
-        return jsonify({"error": f"An error occurred: {exc}"}), 500
-    return jsonify(payload), code
+        return jsonify({"error": f"Could not work out SPC contribution: {exc}"}), 500
 
 
-@app.get("/download")
-def download():
+@app.get("/charts")
+def charts_page():
+    if get_state() is None:
+        return redirect(url_for("home"))
+    return render_template_string(CHARTS_HTML)
+
+
+@app.get("/api/chart")
+def api_chart():
     st = get_state()
     if st is None:
-        return "No data to download", 400
+        return jsonify({"error": "No data available."}), 400
     try:
-        payload, export, _ = build_view(st, request.args, want_export=True)
-        if export is None:
-            return payload.get("error", "Nothing to export"), 400
-        out = write_excel(payload, export)
+        return jsonify(chart_data(st, request.args))
     except Exception as exc:
-        return f"Export failed: {exc}", 500
-    return send_file(out, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                     download_name=f"{slug(payload['title'])}.xlsx", as_attachment=True)
+        return jsonify({"error": f"Could not build the chart: {exc}"}), 500
+
+
+@app.get("/targets")
+def targets_page():
+    if get_state() is None:
+        return redirect(url_for("home"))
+    return render_template_string(TARGETS_HTML)
+
+
+@app.get("/api/targets")
+def api_targets_get():
+    st = get_state()
+    if st is None:
+        return jsonify({"error": "No data available."}), 400
+    try:
+        return jsonify(targets_data(st, request.args.get("month", ""), request.args, request.args.get("seg", "")))
+    except Exception as exc:
+        return jsonify({"error": f"Could not load targets: {exc}"}), 500
+
+
+def target_num(x):
+    if x in (None, ""):
+        return None
+    try:
+        f = float(str(x).replace(",", "").strip())
+    except ValueError:
+        raise ValueError(f"'{x}' is not a number.")
+    if f < 0 or f != f or f == float("inf"):
+        raise ValueError("Targets can't be negative.")
+    return f
+
+
+@app.post("/api/targets")
+@admin_api
+def api_targets_post():
+    if get_state() is None:
+        return jsonify({"error": "No data available."}), 400
+    body = request.get_json(silent=True) or {}
+    month = str(body.get("month", ""))
+    if not re.fullmatch(r"\d{4}-\d{2}", month):
+        return jsonify({"error": "Month must look like 2026-10."}), 400
+    def part(name):
+        if name not in body or body[name] is None:
+            return None
+        return {str(k)[:120]: {"v": target_num(v.get("v")), "q": target_num(v.get("q"))}
+                for k, v in (body.get(name) or {}).items() if isinstance(v, dict) and str(k).strip()}
+    try:
+        store_t = None
+        if body.get("store_target") is not None:
+            st_t = body.get("store_target") or {}
+            store_t = {"v": target_num(st_t.get("v")), "q": target_num(st_t.get("q"))}
+        spc, seg = part("spc"), part("seg")
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    store = str(body.get("store", ""))[:200].strip()
+    if not store:
+        return jsonify({"error": "Pick one store: targets are set store by store."}), 400
+    if seg is not None and body.get("seg_merge"):   # one segment changed: keep the others
+        seg = {**seg_targets(load_targets(), store, month), **seg}
+    save_month_targets(store, month, store_t, spc, seg)
+    audit("targets saved", f"{store or 'All Stores'} · {month}" + (" · SPC" if spc else "") + (" · segment" if seg else ""))
+    return jsonify({"ok": True})
+
+
+@app.post("/api/target")
+@admin_api
+def api_target():
+    if get_state() is None:
+        return jsonify({"error": "No data available."}), 400
+    body = request.get_json(silent=True) or {}
+    month = str(body.get("month", ""))
+    if not re.fullmatch(r"\d{4}-\d{2}", month):
+        return jsonify({"error": "Month must look like 2026-10."}), 400
+
+    def num(x):
+        if x in (None, ""):
+            return None
+        try:
+            f = float(str(x).replace(",", ""))
+        except ValueError:
+            raise ValueError("Targets must be numbers.")
+        if f < 0 or f != f:
+            raise ValueError("Targets can't be negative.")
+        return f
+    if not str(body.get("store", "")).strip():
+        return jsonify({"error": "Pick one store: targets are set store by store."}), 400
+    try:
+        save_target(str(body.get("store", ""))[:200], month, num(body.get("v")), num(body.get("q")))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    audit("targets saved", f"{str(body.get('store', ''))[:200] or 'All Stores'} · {month}")
+    return jsonify({"ok": True})
+
+
+@app.get("/api/periods")
+def api_periods():
+    st = get_state()
+    if st is None:
+        return jsonify({"error": "No data available."}), 400
+    try:
+        return jsonify(periods_data(st, request.args.get("gran", "month"), request.args,
+                                    sp=request.args.get("sp") == "1", ff=request.args.get("ff", "1") == "1"))
+    except Exception as exc:
+        return jsonify({"error": f"Could not list the periods: {exc}"}), 500
+
+
+@app.get("/api/overview")
+def api_overview():
+    st = get_state()
+    if st is None:
+        return jsonify({"error": "No data available."}), 400
+    mode = request.args.get("mode", "day")
+    mode = mode if mode in OV_MODES + ("all",) else "day"
+    try:
+        return jsonify(overview_data(st, mode, request.args.get("date"), request.args,
+                                     sp=request.args.get("sp") == "1", ff=request.args.get("ff", "1") == "1"))
+    except Exception as exc:
+        return jsonify({"error": f"Could not build the overview: {exc}"}), 500
+
+
+def page(tpl):
+    if get_state() is None:
+        return redirect(url_for("home"))
+    return render_template_string(tpl)
+
+
+@app.get("/compare")
+def compare_page():
+    return page(COMPARE_HTML)
+
+
+@app.get("/activation")
+def activation_page():
+    return page(ACT_HTML)
+
+
+@app.get("/ask")
+def ask_page():
+    """The questions page was the same assistant as the help chat on every page: open that instead."""
+    return redirect("/?ask=1")
+
+
+def api(fn):
+    st = get_state()
+    if st is None:
+        return jsonify({"error": "No data available. Upload a sales sheet first."}), 400
+    try:
+        return jsonify(fn(st))
+    except Exception as exc:  # noqa: BLE001 - surface the reason instead of a blank page
+        return jsonify({"error": f"Something went wrong: {exc}"}), 500
+
+
+@app.get("/api/compare")
+def api_compare():
+    return api(lambda st: compare_data(st, request.args))
+
+
+@app.get("/api/activation")
+def api_activation():
+    return api(lambda st: activation_data(st, request.args))
+
+
+@app.get("/api/meta")
+def api_meta():
+    return api(meta_data)
+
+
+@app.get("/api/ping")
+def api_ping():
+    return jsonify({"ok": True, "t": datetime.now().strftime("%H:%M:%S")})
+
+
+@app.get("/api/ask/vocab")
+def api_ask_vocab():
+    """Names for the question box's autofill: exactly the stores, SPCs, models and segments in the uploaded sheet."""
+    def run(st):
+        f, _ = chart_frame(st)
+        v = ask_vocab(f)
+        m = meta_data(st)
+        segs = [x for x in f.groupby("seg")["v"].sum().sort_values(ascending=False).index if x and x != "Other"]
+        return {"stores": v["stores"], "spcs": sorted({re.sub(r"[\s.]+$", "", n) for n in v["spcs"]}), "models": v["fams"],
+                "segments": segs + [c for c in ("Smartphones", "Tabs", "Wearables", "NPC")
+                                    if c.lower().rstrip("s") not in {x.lower().rstrip("s") for x in segs}],
+                "from": m.get("from"), "to": m.get("to")}
+    return api(run)
+
+
+@app.post("/api/ask")
+def api_ask():
+    body = request.get_json(silent=True) or {}
+
+    def run(st):
+        f, _ = chart_frame(st)
+        stores = sorted(x for x in f["store"].unique() if x) if f is not None else []
+        sel = [x for x in (body.get("stores") or []) if x in stores]
+        return ask_answer(st, str(body.get("q", "")), body.get("history") or [], sel, str(body.get("page", ""))[:40])
+    return api(run)
+
+
+@app.get("/download/<which>")
+def download_data(which):
+    """The raw sheet as it was uploaded (every row), so it can be kept before a new upload replaces it. Admin only."""
+    if not is_unlocked(extend=True):
+        return redirect(url_for("upload_page"))
+    path = {"current": DATA_FILE_PATH, "previous": PREV_DATA_PATH}.get(which)
+    if not path or not os.path.exists(path):
+        return Response("No data to download.", status=404, mimetype="text/plain")
+    audit("downloaded", "current data" if which == "current" else "previous upload (backup)")
+    df = pd.read_pickle(path)
+    stamp = datetime.fromtimestamp(os.path.getmtime(path)).strftime("%Y-%m-%d")
+    body = df.to_csv(index=False).encode("utf-8-sig")   # BOM so Excel opens it with the right characters
+    return Response(body, mimetype="text/csv", headers={
+        "Content-Disposition": f'attachment; filename="sales_data_{which}_{stamp}.csv"', "Cache-Control": "no-store"})
+
+
+@app.get("/upload")
+def upload_page():
+    return upload_page_html()
+
+
+@app.post("/dashboard")
+def dashboard():
+    """The old one-step upload is gone: a sheet now goes through the passcode, a check and a confirmation."""
+    return redirect(url_for("upload_page"), 303)
+
+
+def admin_action(fn):
+    """POST actions: an unlocked browser and its own form token, or nothing happens."""
+    def wrapped(*a, **kw):
+        if not is_unlocked(extend=True):
+            return upload_page_html("Your unlock has ended. Enter the passcode again; nothing was changed.", 403)
+        if not csrf_ok():
+            return upload_page_html("That request didn't come from this page, so it was ignored. Nothing was changed.", 403)
+        return fn(*a, **kw)
+    wrapped.__name__ = fn.__name__
+    return wrapped
+
+
+@app.post("/upload/setup")
+def upload_setup():
+    if admin_info():
+        return upload_page_html("A passcode is already set.", 403)
+    if not is_local_request() or not same_origin():
+        return upload_page_html("The passcode can only be set on the computer running the dashboard.", 403)
+    code, again = request.form.get("code", ""), request.form.get("again", "")
+    bad = passcode_problem(code, again)
+    if bad:
+        return upload_page_html(bad, 400)
+    set_passcode(code)
+    unlock_session()
+    audit("passcode set")
+    return redirect(url_for("upload_page"), 303)
+
+
+@app.post("/upload/unlock")
+def upload_unlock():
+    if not admin_info():
+        return redirect(url_for("upload_page"), 303)
+    if lock_seconds():
+        return upload_page_html(None, 429)
+    ok = passcode_ok(request.form.get("code", ""))
+    left = note_try(ok)
+    if not ok:
+        audit("wrong passcode")
+        msg = "That passcode isn't right."
+        if lock_seconds():
+            msg += f" Too many wrong tries: the form is locked for {LOCK_MIN} minutes."
+        elif left <= 3:
+            msg += f" {left} {'try' if left == 1 else 'tries'} left before it locks for {LOCK_MIN} minutes."
+        return upload_page_html(msg, 403)
+    unlock_session()
+    audit("unlocked")
+    return redirect(url_for("upload_page"), 303)
+
+
+@app.post("/upload/lock")
+def upload_lock():
+    if is_unlocked():
+        audit("locked")
+    session.clear()
+    return redirect(url_for("upload_page"), 303)
+
+
+@app.post("/upload/check")
+@admin_action
+def upload_check():
+    f = request.files.get("file")
+    if not f or not f.filename:
+        return upload_page_html("Choose a file first.", 400)
+    name = os.path.basename(f.filename)[:120]
+    try:
+        raw = f.read()
+        df = read_upload(raw, name)
+        if df.empty:
+            raise ValueError("the file has no rows")
+    except Exception as exc:  # noqa: BLE001 - shown to the admin; the data is untouched
+        audit("file refused", f"{name}: {exc}")
+        return upload_page_html(f"Couldn't read that file: {exc}. Your current data was not changed.", 400)
+    problems = check_new_sheet(df)
+    if problems:
+        audit("file refused", f"{name}: " + "; ".join(problems))
+        return upload_page_html("This doesn't look like the raw sales sheet: " + "; ".join(problems)
+                                + ". Your current data was not changed.", 400)
+    old = session.get("stage")
+    if old:
+        drop_stage(old.get("token"))
+    token = secrets.token_urlsafe(24)
+    df.to_pickle(stage_path(token))
+    review = compare_sheets(sheet_summary(df), current_summary())
+    review.update(name=name, size=f"{len(raw) / 1048576:.2f} MB" if len(raw) > 1048576 else f"{max(1, len(raw) // 1024)} KB",
+                  sha=hashlib.sha256(raw).hexdigest()[:12])
+    with open(stage_path(token, "json"), "w", encoding="utf-8") as fh:
+        json.dump(review, fh)
+    session["stage"] = {"token": token, "name": name}
+    audit("file checked", f"{name} · {review['new']['rows']} rows · {review['new']['range']}")
+    return redirect(url_for("upload_page"), 303)
+
+
+@app.post("/upload/commit")
+@admin_action
+def upload_commit():
+    stg = session.get("stage") or {}
+    token = request.form.get("token", "")
+    path = stage_path(token)
+    if not stg or token != stg.get("token") or not path or not os.path.exists(path):
+        mine = stage_path(stg.get("token"))
+        if not mine or not os.path.exists(mine):   # a stray request never cancels the sheet being checked
+            session.pop("stage", None)
+        return upload_page_html("That checked file has expired. Choose it again; nothing was changed.", 400)
+    has_data = os.path.exists(DATA_FILE_PATH)
+    if has_data and (request.form.get("confirm", "").strip().upper() != "REPLACE" or request.form.get("ack") != "1"):
+        return upload_page_html("Tick the box and type REPLACE to confirm. Nothing was changed.", 400)
+    with _save_lock:
+        save_data(pd.read_pickle(path))
+    drop_stage(token)
+    session.pop("stage", None)
+    audit("data replaced" if has_data else "data loaded", stg.get("name", ""))
+    return redirect(url_for("home"), 303)
+
+
+@app.post("/upload/discard")
+@admin_action
+def upload_discard():
+    stg = session.pop("stage", None)
+    if stg:
+        drop_stage(stg.get("token"))
+        audit("file discarded", stg.get("name", ""))
+    return redirect(url_for("upload_page"), 303)
+
+
+@app.post("/upload/restore")
+@admin_action
+def upload_restore():
+    if request.form.get("confirm") != "1":
+        return upload_page_html("Confirm the restore first. Nothing was changed.", 400)
+    try:
+        restore_previous()
+    except Exception as exc:  # noqa: BLE001
+        return upload_page_html(f"Couldn't restore: {exc}.", 400)
+    audit("previous upload restored")
+    return upload_page_html(notice="The previous upload is back. The sheet it replaced is now the backup, so you can switch back the same way.")
+
+
+@app.post("/upload/passcode")
+@admin_action
+def upload_passcode():
+    if lock_seconds():
+        return upload_page_html(None, 429)
+    ok = passcode_ok(request.form.get("old", ""))
+    note_try(ok)
+    if not ok:
+        audit("wrong passcode", "while changing it")
+        return upload_page_html("The current passcode isn't right, so it was not changed.", 403)
+    code, again = request.form.get("code", ""), request.form.get("again", "")
+    bad = passcode_problem(code, again)
+    if bad:
+        return upload_page_html(bad + " The passcode was not changed.", 400)
+    set_passcode(code)
+    unlock_session()   # this browser stays unlocked; every other unlocked browser is signed out
+    audit("passcode changed")
+    return upload_page_html(notice="Passcode changed. Any other browser that was unlocked has been locked.")
+
+
+@app.get("/api/upload/status")
+def upload_status():
+    a = admin_info()
+    on = is_unlocked()
+    out = {"protected": bool(a), "unlocked": on, "minutes": max(0, int((session.get("until", 0) - time.time()) // 60)) if on else 0}
+    if on:   # same-origin pages only (no CORS), so other sites can't read it
+        out["csrf"] = session.get("csrf", "")
+    return jsonify(out)
+
+
+@app.post("/api/admin/unlock")
+def api_admin_unlock():
+    """The passcode sheet on any page (e.g. saving targets): same rules and lockout as the Data & upload page."""
+    if not admin_info():
+        return jsonify({"error": "No admin passcode is set yet."}), 400
+    left = lock_seconds()
+    if left:
+        return jsonify({"error": f"Too many wrong passcodes. Try again in {-(-left // 60)} min."}), 429
+    ok = passcode_ok(str((request.get_json(silent=True) or {}).get("code", "")))
+    tries = note_try(ok)
+    if not ok:
+        audit("wrong passcode", "to change targets")
+        msg = "That passcode isn't right."
+        if lock_seconds():
+            msg += f" Too many wrong tries: locked for {LOCK_MIN} minutes."
+        elif tries <= 3:
+            msg += f" {tries} {'try' if tries == 1 else 'tries'} left."
+        return jsonify({"error": msg}), 403
+    unlock_session()
+    audit("unlocked", "to change targets")
+    return jsonify({"ok": True, "csrf": session["csrf"], "minutes": UNLOCK_MIN})
+
+
+@app.errorhandler(413)
+def too_big(_e):
+    if request.path.startswith("/upload"):
+        return upload_page_html("That file is over 128 MB. Your current data was not changed.", 413)
+    return Response("Too large.", status=413, mimetype="text/plain")
+
+
+@app.after_request
+def security_headers(resp):
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    resp.headers.setdefault("Referrer-Policy", "same-origin")
+    if request.path.startswith(("/upload", "/download")) or (request.path == "/" and resp.mimetype == "text/html" and not os.path.exists(DATA_FILE_PATH)):
+        resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.get("/assets/app.css")
 def asset_css():
     return Response(APP_CSS, mimetype="text/css", headers={"Cache-Control": "public, max-age=31536000, immutable"})
+
+
+@app.get("/assets/ov.css")
+def asset_ov_css():
+    return Response(OV_CSS, mimetype="text/css", headers={"Cache-Control": "public, max-age=31536000, immutable"})
+
+
+@app.get("/assets/ov.js")
+def asset_ov_js():
+    return Response(OV_JS, mimetype="application/javascript",
+                    headers={"Cache-Control": "public, max-age=31536000, immutable"})
+
+
+@app.get("/assets/spc.js")
+def asset_spc_js():
+    return Response(SPC_JS, mimetype="application/javascript",
+                    headers={"Cache-Control": "public, max-age=31536000, immutable"})
+
+
+@app.get("/assets/eod.js")
+def asset_eod_js():
+    return Response(EOD_JS, mimetype="application/javascript",
+                    headers={"Cache-Control": "public, max-age=31536000, immutable"})
+
+
+@app.get("/assets/ch.js")
+def asset_ch_js():
+    return Response(CH_JS, mimetype="application/javascript",
+                    headers={"Cache-Control": "public, max-age=31536000, immutable"})
+
+
+@app.get("/assets/xp.js")
+def asset_xp_js():
+    return Response(XP_JS, mimetype="application/javascript",
+                    headers={"Cache-Control": "public, max-age=31536000, immutable"})
+
+
+@app.get("/assets/tg.js")
+def asset_tg_js():
+    return Response(TG_JS, mimetype="application/javascript",
+                    headers={"Cache-Control": "public, max-age=31536000, immutable"})
+
+
+def js_asset(body):
+    return Response(body, mimetype="application/javascript", headers={"Cache-Control": "public, max-age=31536000, immutable"})
+
+
+@app.get("/assets/cmp.js")
+def asset_cmp_js():
+    return js_asset(CMP_JS)
+
+
+@app.get("/assets/act.js")
+def asset_act_js():
+    return js_asset(ACT_JS)
+
+
+
+
+@app.get("/assets/<name>.js")
+def asset_new_js(name):
+    body = {"cmp": globals().get("CMP_JS"), "act": globals().get("ACT_JS")}.get(name)
+    if body is None:
+        return Response("not found", status=404)
+    return Response(body, mimetype="application/javascript", headers={"Cache-Control": "public, max-age=31536000, immutable"})
 
 
 @app.get("/assets/app.js")
@@ -867,301 +4475,205 @@ SPRITE = """
 <symbol id="i-cal" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="16" rx="3.5"/><path d="M8 3v4M16 3v4M3 10h18"/></symbol>
 <symbol id="i-table" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M3 10h18M9 10v10"/></symbol>
 <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+<symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2.5"/><path d="M15 9V6.5A2.5 2.5 0 0012.5 4h-6A2.5 2.5 0 004 6.5v6A2.5 2.5 0 006.5 15H9"/></symbol>
+<symbol id="i-wa" viewBox="0 0 24 24"><path d="M12 3a9 9 0 00-7.8 13.5L3 21l4.6-1.2A9 9 0 1012 3z"/><path d="M9 8.2c.3-.4.8-.4 1 0l.8 1.7c.1.3 0 .6-.2.8l-.5.5c.6 1.2 1.5 2.1 2.7 2.7l.5-.5c.2-.2.5-.3.8-.2l1.7.8c.4.2.4.7 0 1-.8.8-2 1-3 .5a8.5 8.5 0 01-4.3-4.3c-.5-1-.3-2.2.5-3z" fill="currentColor" stroke="none"/></symbol>
 </defs></svg>
 """
 
 HEAD = """<meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="light dark">
-<link rel="icon" href="{{ url_for('favicon') }}" type="image/x-icon">
-<script>(function(){try{var d=document.documentElement,t=localStorage.getItem('ap-theme'),g=localStorage.getItem('ap-glass');
-if(t==='light'||t==='dark')d.dataset.theme=t;if(g)d.style.setProperty('--glass',g);}catch(e){}})();</script>
+<script>(function(){try{var d=document.documentElement,t=localStorage.getItem('ap-theme'),v=localStorage.getItem('ap-view');if(t!=='light'&&t!=='dark'){t=matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';localStorage.setItem('ap-theme',t);}if(v!=='phone'&&v!=='desktop'){v=Math.min(screen.width||9999,innerWidth||9999)<700?'phone':'desktop';localStorage.setItem('ap-view',v);}d.dataset.theme=t;if(v==='phone'||v==='desktop'){d.dataset.view=v;if(v==='desktop'){var m=document.querySelector('meta[name=viewport]');if(m)m.setAttribute('content','width=1200, viewport-fit=cover');}}}catch(e){}})();</script>
 <link rel="stylesheet" href="/assets/app.css?v={{ asset_v }}">
+<script src="/assets/xp.js?v={{ asset_v }}" defer></script>
 <script src="/assets/app.js?v={{ asset_v }}" defer></script>"""
 
 MACROS = """
 {% macro controls(layout=False) %}
-<div class="nav-right">
-  <div class="menu-wrap" id="glassWrap">
-    <button type="button" class="icon-btn" id="glassBtn" aria-label="Liquid Glass transparency" aria-expanded="false" title="Liquid Glass"><svg class="ic"><use href="#i-glass"/></svg></button>
-    <div class="popover" id="glassPop">
-      <div class="pop-title">Liquid Glass</div>
-      <input type="range" id="glassRange" min="30" max="96" step="1" aria-label="Glass transparency">
-      <div class="pop-scale"><span>Clear</span><span>Frosted</span></div>
-    </div>
-  </div>
-
-  <div class="net-status" id="netStatus" aria-live="polite" title="Connection status">
-    <span class="net-dot" id="netDot"></span>
-    <span class="net-text" id="netText">Online</span>
-    <span class="net-sep"></span>
-    <span class="net-text" id="netPing">Ping 0ms</span>
-    <span class="net-sep"></span>
-    <span class="net-text" id="netSpeed">Up 0MB/s · Down 0MB/s</span>
-  </div>
-
-  <button type="button" class="icon-btn" id="saveDriveBtn" title="Save Master Report to Google Drive" aria-label="Save to Google Drive">☁️</button>
-
-  <div class="seg seg-icons" id="themeSeg" data-n="2" role="radiogroup" aria-label="Appearance">
-    <span class="seg-thumb"></span>
-    <input type="radio" name="theme" id="th_light" value="light"><label for="th_light" title="Light" aria-label="Light"><svg class="ic"><use href="#i-sun"/></svg></label>
-    <input type="radio" name="theme" id="th_dark" value="dark"><label for="th_dark" title="Dark" aria-label="Dark"><svg class="ic"><use href="#i-moon"/></svg></label>
-  </div>
-
-  {% if layout %}
-  <label class="ios-switch" title="Switch between desktop and mobile layout">
-    <span class="sw-text">Mobile</span>
-    <input type="checkbox" id="mobileSwitch" role="switch"><span class="track"><span class="knob"></span></span>
-  </label>
-  <a class="icon-btn" href="/upload" aria-label="Upload new file" title="Upload new file"><svg class="ic"><use href="#i-upload"/></svg></a>
-  {% endif %}
-</div>
+<div class="nav-right"></div>
 {% endmacro %}
 """
 
 UPLOAD_HTML = """<!doctype html>
-<html lang="en"><head><title>Analytics Pro</title>""" + HEAD + """</head>
-<body class="upload-page">""" + MACROS + """
+<html lang="en"><head><title>Data & upload</title>""" + HEAD + """</head>
+<body class="upload-page"{% if view in ('manage', 'review') %} data-unlock-min="{{ minutes_left }}"{% endif %}>""" + MACROS + """
 {{ sprite|safe }}
-<header class="nav glass"><span class="brand"><span class="brand-mark"></span>Analytics Pro</span>{{ controls() }}</header>
-<main class="upload-wrap">
-  <h1 class="hero-title">Analytics Engine.</h1>
-  <p class="hero-sub">Upload your sales data to launch the workspace.</p>
-  <form class="upload-card glass" action="/dashboard" method="post" enctype="multipart/form-data" id="uploadForm">
-    {% if error %}<div class="alert" role="alert">{{ error }}</div>{% endif %}
+<header class="nav glass"><span class="brand"><span class="brand-mark"></span></span>{{ controls() }}</header>
+{% macro doc(ext, color, cls='', ext_id='', badge_id='') %}
+<svg class="doc-ic {{ cls }}" viewBox="0 0 64 80" aria-hidden="true">
+  <path d="M9 1.5h32.5L61.5 21.5V73a5.5 5.5 0 01-5.5 5.5H9A5.5 5.5 0 013.5 73V7A5.5 5.5 0 019 1.5z" fill="url(#docPage)" stroke="rgba(0,0,0,.14)"/>
+  <path d="M41.5 1.5V16a5.5 5.5 0 005.5 5.5h14.5" fill="url(#docFold)" stroke="rgba(0,0,0,.14)" stroke-linejoin="round"/>
+  <g fill="#d5d8de"><rect x="12" y="28" width="40" height="3" rx="1.5"/><rect x="12" y="35" width="40" height="3" rx="1.5"/><rect x="12" y="42" width="28" height="3" rx="1.5"/></g>
+  <rect {% if badge_id %}id="{{ badge_id }}" {% endif %}x="3.5" y="54" width="58" height="15" fill="{{ color }}"/>
+  <text {% if ext_id %}id="{{ ext_id }}" {% endif %}x="32.5" y="65.2" text-anchor="middle" fill="#fff" font-size="10" font-weight="700" letter-spacing=".6" font-family="-apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-serif">{{ ext }}</text>
+</svg>
+{% endmacro %}
+{# iOS 27 Files app icon, redrawn as SVG: light tile, blue folder, white sheet #}
+{% macro files_icon(cls='') %}
+<svg class="files-ic {{ cls }}" viewBox="0 0 120 120" aria-hidden="true">
+  <rect x=".5" y=".5" width="119" height="119" rx="27" fill="url(#filesTile)" stroke="rgba(0,0,0,.08)"/>
+  <rect x="2" y="2" width="116" height="116" rx="25.5" fill="none" stroke="rgba(255,255,255,.9)" stroke-width="1.5"/>
+  <g filter="url(#filesShadow)">
+    <path d="M14 31a7.5 7.5 0 017.5-7.5h18.5a7.5 7.5 0 015.7 2.6l3 3.5a5 5 0 003.8 1.8H98.5a7.5 7.5 0 017.5 7.5V88H14z" fill="url(#filesBack)"/>
+    <rect x="18.5" y="34.5" width="83" height="12" rx="4" fill="url(#filesSheet)"/>
+    <rect x="14" y="40" width="92" height="56" rx="9" fill="url(#filesFront)"/>
+    <path d="M23 40.7h74" stroke="rgba(255,255,255,.5)" stroke-width="1.3" stroke-linecap="round"/>
+  </g>
+</svg>
+{% endmacro %}
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <linearGradient id="docPage" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#eef0f3"/></linearGradient>
+  <linearGradient id="docFold" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#f4f5f7"/><stop offset="1" stop-color="#dcdfe5"/></linearGradient>
+  <linearGradient id="filesTile" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#eceef2"/></linearGradient>
+  <linearGradient id="filesBack" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#2b9bff"/><stop offset="1" stop-color="#0a74f5"/></linearGradient>
+  <linearGradient id="filesSheet" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#d6dbe2"/></linearGradient>
+  <linearGradient id="filesFront" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#1e90ff"/><stop offset=".55" stop-color="#0a7aff"/><stop offset="1" stop-color="#0064ee"/></linearGradient>
+  <filter id="filesShadow" x="-20%" y="-20%" width="140%" height="150%"><feDropShadow dx="0" dy="2.5" stdDeviation="2.5" flood-color="#0050c8" flood-opacity=".28"/></filter>
+</defs></svg>
+<main class="upload-wrap up2">
+  <div class="files-hero" aria-hidden="true">{{ files_icon() }}</div>
+  {% macro lockic() %}<svg class="lk-ic" viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="10.5" width="14" height="10" rx="2.5"/><path d="M8.5 10.5V8a3.5 3.5 0 017 0v2.5"/></svg>{% endmacro %}
+  {% macro msgs() %}{% if error %}<div class="alert" role="alert">{{ error }}</div>{% endif %}{% if notice %}<div class="ok-note" role="status">{{ notice }}</div>{% endif %}{% endmacro %}
+  {% macro back() %}{% if has_data %}<a class="up-back" href="/">‹ Back to dashboard</a>{% endif %}{% endmacro %}
+
+  {% if view == 'setup' %}
+  <h1 class="hero-title">Protect your data.</h1>
+  <p class="hero-sub">Set the admin passcode. Only people with it can replace or download the sales data.</p>
+  <form class="upload-card glass" action="/upload/setup" method="post" autocomplete="off">
+    {{ msgs() }}
+    <label class="pin-field">New passcode<input type="password" name="code" minlength="{{ min_len }}" autocomplete="new-password" required autofocus></label>
+    <label class="pin-field">Type it again<input type="password" name="again" minlength="{{ min_len }}" autocomplete="new-password" required></label>
+    <button type="submit" class="btn-primary block">{{ lockic() }}Save passcode</button>
+    <p class="upload-note">At least {{ min_len }} characters. It is stored only as a secure hash, never as text. You can set it here because this is the computer running the dashboard. If it is ever forgotten, delete <b>admin.json</b> in the data folder on this computer and set a new one.</p>
+  </form>
+  {{ back() }}
+
+  {% elif view == 'setup_remote' %}
+  <h1 class="hero-title">Upload is locked.</h1>
+  <p class="hero-sub">No admin passcode has been set yet.</p>
+  <div class="upload-card glass">
+    <p class="up-text">For safety, the passcode can only be set on the computer running the dashboard. Open <b>http://localhost:5000/upload</b> there, set it, then come back here and unlock with it.</p>
+  </div>
+  {{ back() }}
+
+  {% elif view == 'unlock' %}
+  <h1 class="hero-title">Data & upload.</h1>
+  <p class="hero-sub">Enter the admin passcode to replace or download the sales data.</p>
+  <form class="upload-card glass" action="/upload/unlock" method="post" autocomplete="off">
+    {{ msgs() }}
+    {% if lock_left %}<div class="alert" role="alert">Too many wrong passcodes. Try again in {{ lock_left }} minute{{ '' if lock_left == 1 else 's' }}.</div>{% endif %}
+    <label class="pin-field">Admin passcode<input type="password" name="code" autocomplete="current-password" required {{ 'disabled' if lock_left else 'autofocus' }}></label>
+    <button type="submit" class="btn-primary block" {{ 'disabled' if lock_left }}>{{ lockic() }}Unlock</button>
+    <p class="upload-note">Unlocks this browser for {{ unlock_min }} minutes. Viewing the dashboard never needs the passcode.</p>
+  </form>
+  {{ back() }}
+
+  {% elif view == 'manage' %}
+  <h1 class="hero-title">Data & upload.</h1>
+  <div class="up-status"><span class="up-open">{{ lockic() }}Unlocked · locks after {{ minutes_left }} min without use</span>
+    <form action="/upload/lock" method="post"><button type="submit" class="up-lockbtn">Lock now</button></form></div>
+  {{ msgs() }}
+  <ol class="up-steps" aria-label="Steps"><li class="on">Keep a copy</li><li class="on">Choose the sheet</li><li>Check &amp; confirm</li></ol>
+
+  <section class="upload-card glass up-sec">
+    <h2>Loaded now</h2>
+    {% if current %}
+    <p class="up-text"><b>{{ current.range or 'Sales data' }}</b><br>{{ '{:,}'.format(current.rows) }} rows{% if current.updated %} · uploaded {{ current.updated }}{% endif %}</p>
+    <div class="rw-links"><a class="rw-dl" href="/download/current">Download current data (CSV)</a>
+      {% if current.backup %}<a class="rw-dl ghost" href="/download/previous">Previous upload (CSV)</a>{% endif %}</div>
+    {% if current.backup %}
+    <form action="/upload/restore" method="post" class="up-restore" data-confirm="Switch back to the previous upload? The data loaded now becomes the backup, so you can switch again.">
+      <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="confirm" value="1">
+      <button type="submit" class="up-link">Restore the previous upload</button>
+    </form>{% endif %}
+    {% else %}<p class="up-text">No sales data is loaded yet.</p>{% endif %}
+  </section>
+
+  <form class="upload-card glass up-sec" action="/upload/check" method="post" enctype="multipart/form-data" id="uploadForm">
+    <h2>New sheet</h2>
+    <input type="hidden" name="csrf" value="{{ csrf }}">
     <label class="dropzone" id="dropzone" for="file">
-      <svg class="ic ic-lg"><use href="#i-upload"/></svg>
-      <span class="dz-title" id="dzTitle">Choose a file</span>
-      <span class="dz-sub" id="dzSub">or drag it here · .xlsx, .xls, .csv</span>
+      <span class="dz-doc" id="dzDoc">{{ files_icon('dz-files') }}{{ doc('FILE', '#8e8e93', 'dz-file', 'dzExt', 'dzBadge') }}</span>
+      <span class="dz-text">
+        <span class="dz-title" id="dzTitle">Drop the raw sales sheet here</span>
+        <span class="dz-sub" id="dzSub">Excel or CSV · up to 128 MB</span>
+      </span>
+      <span class="dz-browse" id="dzBrowse">Browse</span>
     </label>
     <input id="file" class="sr-only" type="file" name="file" accept=".xlsx,.xls,.csv" required>
-    <button type="submit" class="btn-primary block" id="launchBtn" disabled>Launch workspace</button>
+    <button type="submit" class="btn-primary block" id="launchBtn" disabled>Check this sheet</button>
+    <p class="upload-note">Nothing changes yet: the next step shows what is in the sheet and what would change. It needs <b>Date</b> and <b>Tentative DP</b> columns, and works best with <b>Family Name</b>, <b>Segment</b> and <b>Channel Name</b>.</p>
   </form>
-</main>
-</body></html>"""
 
-WORKSPACE_HTML = """<!doctype html>
-<html lang="en"><head><title>Analytics Pro</title>""" + HEAD + """</head>
-<body>
-<script>(function(){var m=null;try{m=localStorage.getItem('ap-mobile')}catch(e){}
-var mob=m===null?innerWidth<=768:m==='1';document.body.classList.add(mob?'mobile-mode':'desktop-mode');
-if(mob)document.body.classList.add('sidebar-collapsed');})();</script>
-""" + MACROS + """
-{{ sprite|safe }}
+  {% if log %}
+  <section class="upload-card glass up-sec">
+    <h2>Recent activity</h2>
+    <ul class="up-log">{% for e in log %}<li><b>{{ e.action|capitalize }}</b>{% if e.detail %} · {{ e.detail }}{% endif %}<small>{{ e.t }} · {{ e.ip }}</small></li>{% endfor %}</ul>
+  </section>
+  {% endif %}
 
-{% macro acc(title, badge, open=False, structural=False) %}
-<section class="acc{% if open %} open{% endif %}"{% if structural %} data-structural{% endif %}>
-  <button type="button" class="acc-head" aria-expanded="{{ 'true' if open else 'false' }}">
-    <span class="acc-title">{{ title }}</span>
-    <span class="badge" data-badge-for="{{ badge }}" hidden>0</span>
-    <svg class="ic chev"><use href="#i-chev"/></svg>
-  </button>
-  <div class="acc-panel"><div class="acc-inner"><div class="acc-body">{{ caller() }}</div></div></div>
-</section>
-{% endmacro %}
-
-{% macro checklist(name, items, ordered=False) %}
-{% set searchable = items|length > 7 %}
-<div class="tools{% if not searchable %} end{% endif %}">
-  {% if searchable %}<label class="search"><svg class="ic"><use href="#i-search"/></svg><input type="search" placeholder="Search" autocomplete="off" data-search="{{ name }}"></label>{% endif %}
-  <span class="tool-btns">
-    <button type="button" class="btn-micro" data-select="{{ name }}" data-on="1">All</button>
-    <button type="button" class="btn-micro" data-select="{{ name }}" data-on="0">Clear</button>
-  </span>
-</div>
-<div class="list" data-list="{{ name }}">
-  {% for it in items %}<label class="row" data-val="{{ it.name }}"><input type="checkbox" name="{{ name }}" value="{{ it.name }}"{% if it.checked %} checked{% endif %}><span class="box"></span><span class="label" title="{{ it.name }}">{{ it.name }}</span>{% if it.hint %}<em class="tag">{{ it.hint }}</em>{% endif %}{% if ordered %}<span class="ord"></span>{% endif %}</label>{% endfor %}
-</div>
-{% endmacro %}
-
-<header class="nav glass">
-  <div class="nav-left">
-    <button type="button" class="icon-btn only-mobile" id="sidebarToggle" aria-label="Show or hide controls" aria-expanded="false"><svg class="ic"><use href="#i-sliders"/></svg></button>
-    <span class="brand"><span class="brand-mark"></span>Analytics Pro</span>
-  </div>
-  {{ controls(True) }}
-</header>
-<div id="loadbar" aria-hidden="true"></div>
-
-<div class="app">
-  <aside class="sidebar glass" id="appSidebar">
-    <div class="sidebar-head">
-      <div class="head-row">
-        <h2>Controls</h2>
-        <button type="button" class="btn-text" id="resetBtn"><svg class="ic"><use href="#i-reset"/></svg>Reset</button>
-      </div>
-      <div class="sidebar-meta">{% if upload_time %}Updated {{ upload_time }}{% endif %}</div>
-    </div>
-
-    <form id="config-form" class="sidebar-scroll" autocomplete="off">
-      <h3 class="group-cap">View & Export</h3>
-      <div style="padding: 4px 8px 12px 8px;">
-        <div class="seg seg-text" id="viewSeg" data-n="3" role="radiogroup" aria-label="View" style="width: 100%; margin-bottom: 10px;">
-          <span class="seg-thumb"></span>
-          <input type="radio" id="view_pivot" name="view_mode_toggle" value="pivot" checked><label for="view_pivot">Pivot</label>
-          <input type="radio" id="view_raw" name="view_mode_toggle" value="raw"><label for="view_raw">Raw</label>
-          <input type="radio" id="view_chart" name="view_mode_toggle" value="chart"><label for="view_chart">Chart</label>
-        </div>
-        <div style="display: flex; gap: 6px;">
-          <button type="button" class="btn-primary" id="dlImage" style="flex: 1; height: 34px; font-size: 12px;"><svg class="ic" style="width:14px;height:14px"><use href="#i-image"/></svg>Image</button>
-          <button type="button" class="btn-primary" id="dlExcel" style="flex: 1; height: 34px; font-size: 12px;" disabled><svg class="ic" style="width:14px;height:14px"><use href="#i-sheet"/></svg>Excel</button>
-        </div>
-      </div>
-
-      <h3 class="group-cap">Period</h3>
-      {% call acc('Date range', '__period', True) %}
-        {% if ctx.date %}
-        <div class="anchor"><span>Relative to</span>
-          <div class="mini-seg" id="anchorSeg"><button type="button" data-anchor="today" class="on">Today</button><button type="button" data-anchor="data">Last data day</button></div>
-        </div>
-        <div class="chips">
-          <button type="button" class="chip" data-preset="today">Today</button>
-          <button type="button" class="chip" data-preset="yesterday">Yesterday</button>
-          <button type="button" class="chip" data-preset="last7">7 days</button>
-          <button type="button" class="chip" data-preset="last14">14 days</button>
-          <button type="button" class="chip" data-preset="last30">30 days</button>
-          <button type="button" class="chip" data-preset="last90">90 days</button>
-          <button type="button" class="chip" data-preset="thisweek">This week</button>
-          <button type="button" class="chip" data-preset="lastweek">Last week</button>
-          <button type="button" class="chip" data-preset="mtd">Month to date</button>
-          <button type="button" class="chip" data-preset="lastmonth">Last month</button>
-          <button type="button" class="chip" data-preset="qtd">Quarter to date</button>
-          <button type="button" class="chip" data-preset="lastqtr">Last quarter</button>
-          <button type="button" class="chip" data-preset="ytd">Year to date</button>
-          <button type="button" class="chip" data-preset="fytd">Fiscal YTD</button>
-          <button type="button" class="chip" data-preset="all">All time</button>
-        </div>
-        <div class="date-grid">
-          <div class="field"><label for="start_date">From</label><input type="date" name="start_date" id="start_date"></div>
-          <div class="field"><label for="end_date">To</label><input type="date" name="end_date" id="end_date"></div>
-        </div>
-        {% if ctx.weeks %}
-        <div class="sub-head"><span>Weeks <small>pick several</small></span>
-          <span class="tool-btns"><button type="button" class="btn-micro" data-latest="4">Last 4</button><button type="button" class="btn-micro" data-select="weeks" data-on="0">Clear</button></span></div>
-        <div class="wk-grid" data-list="weeks">
-          {% for w in ctx.weeks|reverse %}<label class="wk"><input type="checkbox" name="weeks" value="{{ w.key }}"><span class="wk-chip"><b>{{ w.label }}</b><small>{{ w.range }} ’{{ w.year }}</small></span></label>{% endfor %}
-        </div>
-        {% endif %}
-        {% if ctx.months %}
-        <div class="sub-head"><span>Months <small>pick several</small></span>
-          <span class="tool-btns"><button type="button" class="btn-micro" data-select="months" data-on="0">Clear</button></span></div>
-        <div class="mo-grid" data-list="months">
-          {% for m in ctx.months|reverse %}<label class="wk"><input type="checkbox" name="months" value="{{ m.key }}"><span class="wk-chip"><b>{{ m.label }}</b></span></label>{% endfor %}
-        </div>
-        {% endif %}
-        {% else %}<p class="muted">No date column was detected in this file.</p>{% endif %}
-      {% endcall %}
-
-      <h3 class="group-cap">Table</h3>
-      {% call acc('X axis · group by', 'index_cols', True, True) %}{{ checklist('index_cols', ctx.x_opts, True) }}{% endcall %}
-      {% call acc('Y axis · values', 'value_cols', True, True) %}{{ checklist('value_cols', ctx.y_opts, True) }}{% endcall %}
-      {% call acc('Measures', 'agg_funcs', True, True) %}
-        <div class="chips agg">
-          <label class="chip-check"><input type="checkbox" name="agg_funcs" value="sum" checked><span>Sum</span></label>
-          <label class="chip-check"><input type="checkbox" name="agg_funcs" value="count"><span>Count</span></label>
-          <label class="chip-check"><input type="checkbox" name="agg_funcs" value="mean"><span>Average</span></label>
-        </div>
-
-        <div class="list static">
-          <label class="row switch"><span class="label">Share %<small>Contribution to the total</small></span><input type="checkbox" name="share" value="1"><span class="track"><span class="knob"></span></span></label>
-          <label class="row switch"><span class="label">Growth %<small>Change versus previous row</small></span><input type="checkbox" name="growth" value="1"><span class="track"><span class="knob"></span></span></label>
-          <label class="row switch"><span class="label">Total column<small>Adds across several Y columns</small></span><input type="checkbox" name="row_total" value="1" checked><span class="track"><span class="knob"></span></span></label>
-        </div>
-      {% endcall %}
+  <details class="upload-card glass up-sec up-pass">
+    <summary><h2>Change passcode</h2></summary>
+    {% if env_pin %}<p class="up-text">The passcode now comes from the server's UPLOAD_PIN setting. Set one here to replace it.</p>{% elif pass_set %}<p class="up-text">Set {{ pass_set }}.</p>{% endif %}
+    <form action="/upload/passcode" method="post" autocomplete="off" class="up-passform">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <label class="pin-field">Current passcode<input type="password" name="old" autocomplete="current-password" required></label>
+      <label class="pin-field">New passcode<input type="password" name="code" minlength="{{ min_len }}" autocomplete="new-password" required></label>
+      <label class="pin-field">Type it again<input type="password" name="again" minlength="{{ min_len }}" autocomplete="new-password" required></label>
+      <button type="submit" class="btn-primary block">Change passcode</button>
+      <p class="upload-note">Every other browser that is unlocked gets locked.</p>
     </form>
-  </aside>
+  </details>
+  {{ back() }}
 
-  <div class="sidebar-resizer" id="sidebarResizer" role="separator" aria-orientation="vertical" title="Drag to resize · double-click to reset"></div>
-
-  <main class="main">
-    <div id="report-area">
-      <header class="report-head">
-        <h1 id="reportTitle" class="report-title">Build your report</h1>
-        <div class="report-meta">
-          <span class="period-pill" id="periodPill"><svg class="ic"><use href="#i-cal"/></svg><span id="periodText"></span></span>
-          <span class="pills" id="filterPills"></span>
-        </div>
-      </header>
-
-      <div id="kpi-banner" class="kpis" hidden></div>
-
-      <section id="spcReview" class="card review-card" hidden>
-        <div class="review-head">
-          <h3>SPC overview</h3>
-        </div>
-        <div class="review-grid">
-          <div class="review-panel">
-            <h4>Pros</h4>
-            <ul id="spcPros"></ul>
-          </div>
-          <div class="review-panel">
-            <h4>Cons</h4>
-            <ul id="spcCons"></ul>
-          </div>
-        </div>
-      </section>
-
-      <section id="tableCard" class="card table-card">
-        <div class="table-bar" id="table-bar" hidden><span id="statusText"></span><span class="no-export">Tap a header to sort</span></div>
-        <div id="table-wrapper" class="table-scroll"></div>
-      </section>
-
-      <section id="chartCard" class="card chart-card" hidden>
-        <div class="chart-bar">
-          <div class="legend" id="legend"></div>
-          <div class="chart-ctl no-export">
-            <div class="seg seg-mini" id="typeSeg" data-n="3" role="radiogroup" aria-label="Chart type">
-              <span class="seg-thumb"></span>
-              <input type="radio" name="ctype" id="ct_bar" value="bar" checked><label for="ct_bar">Bar</label>
-              <input type="radio" name="ctype" id="ct_line" value="line"><label for="ct_line">Line</label>
-              <input type="radio" name="ctype" id="ct_area" value="area"><label for="ct_area">Area</label>
-            </div>
-            <div class="seg seg-mini" id="sortSeg" data-n="2" role="radiogroup" aria-label="Sort">
-              <span class="seg-thumb"></span>
-              <input type="radio" name="csort" id="cs_nat" value="natural" checked><label for="cs_nat">Natural</label>
-              <input type="radio" name="csort" id="cs_val" value="value"><label for="cs_val">Highest</label>
-            </div>
-
-            <div class="chart-more">
-              <button type="button" class="btn-micro" id="chartMoreBtn" aria-haspopup="true" aria-expanded="false">More</button>
-              <div class="chart-more-menu glass" id="chartMoreMenu" role="menu">
-                <button type="button" class="chart-more-item" data-chart-mode="labels">
-                  <span>Toggle labels</span><span class="small" id="chartLabelState">On</span>
-                </button>
-                <button type="button" class="chart-more-item" data-chart-mode="top20">
-                  <span>Top 20</span><span class="small">View</span>
-                </button>
-                <button type="button" class="chart-more-item" data-chart-mode="top50">
-                  <span>Top 50</span><span class="small">View</span>
-                </button>
-                <button type="button" class="chart-more-item" data-chart-mode="all">
-                  <span>Show all</span><span class="small">Reset</span>
-                </button>
-                <button type="button" class="chart-more-item" data-chart-mode="reset">
-                  <span>Reset series</span><span class="small">All</span>
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-        <div id="chartBody" class="chart-body"></div>
-        <div class="chart-note" id="chartNote"></div>
-      </section>
-    </div>
-  </main>
-</div>
-<script id="boot" type="application/json">{{ ctx.boot_json|safe }}</script>
+  {% elif view == 'review' %}
+  <h1 class="hero-title">Check before replacing.</h1>
+  <div class="up-status"><span class="up-open">{{ lockic() }}Unlocked · locks after {{ minutes_left }} min without use</span>
+    <form action="/upload/lock" method="post"><button type="submit" class="up-lockbtn">Lock now</button></form></div>
+  {{ msgs() }}
+  <ol class="up-steps" aria-label="Steps"><li class="on">Keep a copy</li><li class="on">Choose the sheet</li><li class="on">Check &amp; confirm</li></ol>
+  <section class="upload-card glass up-sec">
+    <h2>{{ review.name }}</h2>
+    <p class="up-text up-fileinfo">{{ review.size }} · fingerprint {{ review.sha }}</p>
+    <div class="up-table-wrap"><table class="up-cmp">
+      <thead><tr><th></th>{% if review.cur %}<th>Loaded now</th>{% endif %}<th>This sheet</th></tr></thead>
+      <tbody>
+        {% for k, label in [('range', 'Dates'), ('days', 'Sales days'), ('ok_rows', 'Counted rows'), ('rows', 'All rows'), ('stores', 'Stores'), ('value', 'Value (Tentative DP)')] %}
+        <tr><th>{{ label }}</th>{% if review.cur %}<td>{{ review.cur[k] }}</td>{% endif %}<td><b>{{ review.new[k] }}</b></td></tr>
+        {% endfor %}
+      </tbody></table></div>
+    {% if review.warn %}<div class="replace-warn" role="note"><b>This sheet would lose data</b><ul>{% for w in review.warn %}<li>{{ w }}</li>{% endfor %}</ul></div>{% endif %}
+    {% if review.note %}<ul class="up-notes">{% for n in review.note %}<li>{{ n }}</li>{% endfor %}</ul>{% endif %}
+  </section>
+  <form class="upload-card glass up-sec" action="/upload/commit" method="post" id="commitForm">
+    <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="token" value="{{ stage.token }}">
+    {% if has_data %}
+    <h2>Replace the current data</h2>
+    <p class="up-text">All current sales data is replaced by this sheet on every page, for everyone. Targets are kept. The data loaded now stays as the backup until the next upload.</p>
+    <div class="rw-links"><a class="rw-dl ghost" href="/download/current">Download current data (CSV)</a></div>
+    <label class="rw-ack"><input type="checkbox" name="ack" value="1" id="ackRaw"><span>I have the raw data sheet saved</span></label>
+    <label class="pin-field"><span>Type <b>REPLACE</b> to confirm</span><input type="text" name="confirm" id="confirmText" autocomplete="off" autocapitalize="characters" spellcheck="false"></label>
+    <button type="submit" class="btn-primary block danger" id="commitBtn" disabled>Replace data</button>
+    {% else %}
+    <h2>Load this sheet</h2>
+    <button type="submit" class="btn-primary block" id="commitBtn">Load data and open dashboard</button>
+    {% endif %}
+  </form>
+  <form action="/upload/discard" method="post" class="up-cancel"><input type="hidden" name="csrf" value="{{ csrf }}">
+    <button type="submit" class="up-link">Cancel and keep the current data</button></form>
+  {% endif %}
+</main>
 </body></html>"""
 
 APP_CSS = r"""
 :root{
   color-scheme:light;
-  --glass:72;
+  --glass:30;
   --bg:#f2f2f7;--surface-base:#ffffff;--surface-solid:#ffffff;--table-bg:#ffffff;
   --nav-base:#fbfbfd;
   --hairline:rgba(60,60,67,.14);--hairline-strong:rgba(60,60,67,.3);
   --fill:rgba(120,120,128,.12);--fill-2:rgba(120,120,128,.07);--seg-thumb:#fff;
-  --label:#1d1d1f;--label-2:#515154;--label-3:#86868b;
+  --label:#1d1d1f;--label-2:#3f3f43;--label-3:#6e6e73;
   --blue:#0071e3;--blue-h:#0077ed;--blue-a:#006edb;--blue-tint:rgba(0,113,227,.1);--hl:rgba(0,113,227,.12);
   --green:#34c759;--pos:#1f8a3c;--neg:#d70015;
   --th-bg:rgba(246,246,250,.9);--foot-bg:#e9f2fe;
@@ -1175,7 +4687,7 @@ APP_CSS = r"""
   --bg:#000;--surface-base:#1c1c1e;--surface-solid:#1c1c1e;--table-bg:#1c1c1e;--nav-base:#161618;
   --hairline:rgba(255,255,255,.13);--hairline-strong:rgba(255,255,255,.28);
   --fill:rgba(120,120,128,.3);--fill-2:rgba(120,120,128,.16);--seg-thumb:#636366;
-  --label:#f5f5f7;--label-2:#c7c7cc;--label-3:#8e8e93;
+  --label:#f5f5f7;--label-2:#d1d1d6;--label-3:#aeaeb2;
   --blue:#2997ff;--blue-h:#4aa8ff;--blue-a:#1a85ec;--blue-tint:rgba(41,151,255,.2);--hl:rgba(41,151,255,.2);
   --green:#30d158;--pos:#32d74b;--neg:#ff453a;
   --th-bg:rgba(40,40,43,.92);--foot-bg:#112741;
@@ -1189,7 +4701,7 @@ APP_CSS = r"""
   --bg:#000;--surface-base:#1c1c1e;--surface-solid:#1c1c1e;--table-bg:#1c1c1e;--nav-base:#161618;
   --hairline:rgba(255,255,255,.13);--hairline-strong:rgba(255,255,255,.28);
   --fill:rgba(120,120,128,.3);--fill-2:rgba(120,120,128,.16);--seg-thumb:#636366;
-  --label:#f5f5f7;--label-2:#c7c7cc;--label-3:#8e8e93;
+  --label:#f5f5f7;--label-2:#d1d1d6;--label-3:#aeaeb2;
   --blue:#2997ff;--blue-h:#4aa8ff;--blue-a:#1a85ec;--blue-tint:rgba(41,151,255,.2);--hl:rgba(41,151,255,.2);
   --green:#30d158;--pos:#32d74b;--neg:#ff453a;
   --th-bg:rgba(40,40,43,.92);--foot-bg:#112741;
@@ -1246,50 +4758,16 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:26px;heigh
 input[type=range]::-moz-range-thumb{width:26px;height:26px;border:0;border-radius:50%;background:#fff;box-shadow:0 2px 6px rgba(0,0,0,.3)}
 input[type=range]:active::-webkit-slider-thumb{transform:scale(1.12)}
 
-.net-status{
-  display:inline-flex;
-  align-items:center;
-  gap:8px;
-  height:30px;
-  padding:0 10px 0 8px;
-  border-radius:999px;
-  background:color-mix(in srgb,var(--fill) 80%, transparent);
-  border:1px solid var(--hairline);
-  color:var(--label-2);
-  font-size:11px;
-  font-weight:600;
-  white-space:nowrap;
-  box-shadow:inset 0 1px 0 rgba(255,255,255,.18);
-}
-.net-dot{
-  width:8px;
-  height:8px;
-  border-radius:50%;
-  background:var(--green);
-  box-shadow:0 0 0 3px color-mix(in srgb,var(--green) 18%, transparent);
-}
-.net-dot.offline{
-  background:var(--neg);
-  box-shadow:0 0 0 3px color-mix(in srgb,var(--neg) 16%, transparent);
-}
-.net-text{font-weight:600}
-.net-sep{
-  width:1px;
-  height:12px;
-  background:var(--hairline-strong);
-  opacity:.7;
-}
-.net-status.offline{color:var(--neg)}
-@media (max-width: 860px){ .net-status{display:none} }
-
 .seg{--n:2;--i:0;position:relative;display:inline-grid;grid-auto-flow:column;grid-auto-columns:1fr;padding:2px;border-radius:12px;background:var(--fill);isolation:isolate}
 .seg[data-n="3"]{--n:3}
+.seg[data-n="4"]{--n:4}
 .seg:has(input:nth-of-type(2):checked){--i:1}
 .seg:has(input:nth-of-type(3):checked){--i:2}
+.seg:has(input:nth-of-type(4):checked){--i:3}
 .seg-thumb{position:absolute;z-index:-1;top:2px;bottom:2px;left:2px;width:calc((100% - 4px) / var(--n));border-radius:10px;background:var(--seg-thumb);box-shadow:0 3px 10px rgba(0,0,0,.14),0 1px 1px rgba(0,0,0,.08),inset 0 .5px 0 var(--spec);transform:translateX(calc(var(--i) * 100%));transition:transform .45s var(--ease)}
 .seg input{position:absolute;opacity:0;pointer-events:none}
 .seg label{display:flex;align-items:center;justify-content:center;gap:6px;border-radius:10px;font-size:13px;font-weight:500;color:var(--label-2);cursor:pointer;white-space:nowrap;transition:color .25s}
-.seg-text label{padding:7px 22px}
+.seg-text label{padding:7px 16px}
 .seg-icons label{width:34px;height:30px}
 .seg-icons{border-radius:15px}.seg-icons .seg-thumb{border-radius:13px}
 .seg-mini{border-radius:9px}.seg-mini .seg-thumb{border-radius:7px}
@@ -1588,13 +5066,33 @@ tr.hl-row td{background-image:linear-gradient(var(--hl),var(--hl))!important}
 .upload-wrap{max-width:540px;margin:0 auto;padding:calc(var(--nav-h) + 72px) 20px 48px;animation:rise .7s var(--ease) both}
 .hero-title{margin:0 0 10px;text-align:center;font-size:clamp(38px,8vw,60px);font-weight:700;letter-spacing:-.04em;line-height:1.04}
 .hero-sub{margin:0 0 34px;text-align:center;font-size:18px;color:var(--label-3)}
-.upload-card{display:grid;gap:16px;padding:26px;border-radius:32px;background:var(--surface);box-shadow:0 0 0 .5px var(--hairline),inset 0 1px 0 var(--spec),var(--shadow-1)}
-.dropzone{display:grid;justify-items:center;gap:6px;padding:40px 20px;border:1.5px dashed var(--hairline-strong);border-radius:22px;background:var(--fill-2);color:var(--label-3);text-align:center;cursor:pointer;transition:border-color .3s var(--ease),background .3s,transform .45s var(--spring)}
-.dropzone:hover{border-color:var(--blue);color:var(--blue)}
-.dropzone.drag{border-color:var(--blue);background:var(--blue-tint);color:var(--blue);transform:scale(1.02)}
-.dropzone.has-file{border-style:solid;border-color:var(--blue);background:var(--blue-tint);color:var(--blue)}
-.dz-title{margin-top:6px;font-size:17px;font-weight:600;color:var(--label);word-break:break-all}
+.upload-wrap{padding-top:calc(var(--nav-h) + 40px)}
+.files-hero{width:112px;height:112px;margin:0 auto 26px;filter:drop-shadow(0 2px 3px rgba(0,0,0,.12)) drop-shadow(0 14px 28px rgba(0,0,0,.22));transition:transform .6s var(--spring)}
+.upload-wrap:hover .files-hero{transform:translateY(-3px) scale(1.03)}
+.files-ic{display:block;width:100%;height:100%}
+.dz-doc .dz-files{width:56px;height:56px;filter:drop-shadow(0 1px 2px rgba(0,0,0,.14)) drop-shadow(0 4px 10px rgba(0,0,0,.14))}
+.dz-doc .dz-file,.dropzone.has-file .dz-doc .dz-files{display:none}
+.dropzone.has-file .dz-doc .dz-file{display:block}
+.doc-ic{display:block;width:64px;height:80px;filter:drop-shadow(0 1px 1px rgba(0,0,0,.12)) drop-shadow(0 6px 14px rgba(0,0,0,.16))}
+.upload-card{display:grid;gap:14px;padding:22px;border-radius:30px;background:var(--surface);box-shadow:0 0 0 .5px var(--hairline),inset 0 1px 0 var(--spec),var(--shadow-1)}
+.dropzone{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:16px;padding:18px 18px 18px 20px;border:1.5px dashed var(--hairline-strong);border-radius:22px;background:var(--fill-2);color:var(--label-3);cursor:pointer;transition:border-color .3s var(--ease),background .3s,transform .45s var(--spring)}
+.dropzone:hover{border-color:var(--blue)}
+.dropzone.drag{border-color:var(--blue);background:var(--blue-tint);transform:scale(1.02)}
+.dropzone.has-file{border-style:solid;border-color:var(--blue);background:var(--blue-tint)}
+.dz-doc{display:block;transition:transform .5s var(--spring)}
+.dz-doc .doc-ic{width:48px;height:60px}
+.dropzone:hover .dz-doc,.dropzone.drag .dz-doc{transform:translateY(-3px) rotate(-4deg)}
+.dropzone.has-file .dz-doc{animation:docPop .5s var(--spring)}
+@keyframes docPop{0%{transform:scale(.7)}100%{transform:none}}
+.dz-text{display:grid;gap:3px;min-width:0}
+.dz-title{font-size:16px;font-weight:600;color:var(--label);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dz-sub{font-size:13px}
+.dz-browse{height:32px;padding:0 14px;display:grid;place-items:center;border-radius:16px;background:var(--surface-solid);box-shadow:0 0 0 .5px var(--hairline),0 1px 2px rgba(0,0,0,.08);color:var(--blue);font-size:13px;font-weight:600}
+.pin-field{display:grid;gap:6px;font-size:13px;color:var(--label-3)}
+.pin-field input{height:42px;padding:0 14px;border:0;border-radius:12px;background:var(--fill);color:var(--label);font:inherit;font-size:16px}
+.upload-note{margin:2px 4px 0;font-size:12.5px;line-height:1.5;color:var(--label-3);text-align:center}
+.upload-note b{font-weight:600;color:var(--label-2)}
+@media (max-width:480px){.dropzone{grid-template-columns:auto minmax(0,1fr);gap:12px}.dz-browse{grid-column:1/-1}}
 .alert{padding:12px 14px;border-radius:14px;background:color-mix(in srgb,var(--neg) 12%,transparent);color:var(--neg);font-size:13px;font-weight:500}
 @keyframes rise{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:none}}
 
@@ -1638,11 +5136,73 @@ body.exporting .card{overflow:visible}
 body.exporting .kpis{overflow:visible}
 body.exporting .excel-table thead th,body.exporting .excel-table tfoot td,body.exporting .excel-table td:first-child,body.exporting .excel-table th:first-child{position:static}
 body.exporting .lg.off{display:none}
-body.exporting .table-scroll,body.exporting .plot-scroll{overflow:visible!important;max-height:none!important}
+body.exporting .table-scroll,body.exporting .plot-scroll{overflow:visible!important;max-height:none!important;height:auto!important;min-height:0!important}
 body.exporting .kpi{box-shadow:none!important;border:1px solid var(--hairline)!important}
 body.exporting .kpi.active{box-shadow:none!important;border:2px solid var(--blue)!important}
 body.exporting .chart-more-menu{display:none!important}
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{transition-duration:.01ms!important;animation-duration:.01ms!important}}
+"""
+
+APP_CSS += r"""
+/* upload: replacing the data is said plainly, with a way to keep the current sheet first */
+.replace-warn{margin:0 0 14px;padding:12px 14px;border-radius:14px;background:color-mix(in srgb,#ff9500 14%,transparent);
+  box-shadow:inset 0 0 0 .5px color-mix(in srgb,#ff9500 45%,transparent);text-align:left;font-size:13.5px;line-height:1.45;color:var(--label)}
+.replace-warn > b{display:block;font-size:14.5px;color:#c76a00}
+:root[data-theme=dark] .replace-warn > b{color:#ffb340}
+.replace-warn p{margin:4px 0 10px}
+.rw-links{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px}
+.rw-dl{display:inline-flex;align-items:center;height:34px;padding:0 14px;border-radius:17px;background:var(--blue,#0a84ff);color:#fff;font-weight:600;font-size:13.5px;text-decoration:none}
+.rw-dl.ghost{background:var(--fill);color:var(--label)}
+.rw-ack{display:flex;gap:10px;align-items:flex-start;font-weight:600;cursor:pointer}
+.rw-ack input{width:18px;height:18px;margin:2px 0 0;flex:none;accent-color:#ff9500}
+"""
+
+APP_CSS += r"""
+/* data & upload (secured) */
+.up2 .hero-title{margin-bottom:10px}
+.up2 .up-sec{margin-top:14px;gap:12px}
+.up2 .up-sec h2{margin:0;font-size:17px;font-weight:700;color:var(--label)}
+.up-text{margin:0;font-size:14px;line-height:1.5;color:var(--label-2)}
+.up-text b{color:var(--label)}
+.up-fileinfo{font-size:12.5px;color:var(--label-3);margin-top:-6px}
+.lk-ic{width:17px;height:17px;flex:none;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.up-status{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:0 0 12px;flex-wrap:wrap}
+.up-open{display:inline-flex;align-items:center;gap:6px;padding:6px 12px;border-radius:999px;font-size:13px;font-weight:600;
+  background:color-mix(in srgb,var(--green) 14%,transparent);color:var(--pos)}
+.up-lockbtn,.up-link{border:0;background:none;padding:6px 4px;font:inherit;font-size:14px;font-weight:600;color:var(--blue);cursor:pointer}
+.up-lockbtn:hover,.up-link:hover{text-decoration:underline}
+.up-steps{display:flex;gap:6px;margin:0 0 4px;padding:0;list-style:none;counter-reset:st}
+.up-steps li{flex:1;display:flex;align-items:center;gap:6px;padding:8px 10px;border-radius:12px;background:var(--fill-2);font-size:12.5px;font-weight:600;color:var(--label-3);counter-increment:st}
+.up-steps li::before{content:counter(st);display:grid;place-items:center;width:20px;height:20px;flex:none;border-radius:50%;background:var(--fill);font-size:11.5px}
+.up-steps li.on{color:var(--label)}
+.up-steps li.on::before{background:var(--blue);color:#fff}
+.up-table-wrap{overflow-x:auto;margin:0 -4px}
+.up-cmp{width:100%;border-collapse:collapse;font-size:13.5px}
+.up-cmp th,.up-cmp td{padding:8px 6px;text-align:right;border-bottom:.5px solid var(--hairline)}
+.up-cmp tbody th{white-space:nowrap}
+.up-cmp td{width:38%;overflow-wrap:anywhere}
+.up-cmp thead th{font-size:12px;font-weight:600;color:var(--label-3)}
+.up-cmp tbody th{text-align:left;font-weight:500;color:var(--label-2)}
+.up-cmp td{color:var(--label-2)} .up-cmp td b{color:var(--label)}
+.replace-warn ul,.up-notes{margin:6px 0 0;padding-left:18px;font-size:13.5px;line-height:1.5}
+.up-notes{color:var(--label-2);margin:0}
+.ok-note{padding:12px 14px;border-radius:14px;background:color-mix(in srgb,var(--green) 14%,transparent);color:var(--pos);font-size:13px;font-weight:500;margin:0 0 12px}
+.up2 > .alert{margin:0 0 12px}
+.btn-primary.danger{background:var(--neg);box-shadow:0 4px 14px color-mix(in srgb,var(--neg) 30%,transparent)}
+.up-log{margin:0;padding:0;list-style:none;display:grid;gap:8px}
+.up-log li{font-size:13px;line-height:1.4;color:var(--label-2)}
+.up-log li b{color:var(--label);font-weight:600}
+.up-log small{display:block;font-size:11.5px;color:var(--label-3)}
+.up-pass summary{list-style:none;cursor:pointer;display:flex;align-items:center;justify-content:space-between}
+.up-pass summary::-webkit-details-marker{display:none}
+.up-pass summary::after{content:'›';font-size:20px;color:var(--label-3);transition:transform .25s}
+.up-pass[open] summary::after{transform:rotate(90deg)}
+.up-passform{display:grid;gap:12px}
+.up-restore,.up-cancel{margin:0}
+.up-cancel{text-align:center;margin-top:10px}
+.up-back{display:block;width:max-content;margin:18px auto 0;font-size:14px;font-weight:600;color:var(--blue);text-decoration:none}
+.up-back:hover{text-decoration:underline}
+.upload-card .btn-primary .lk-ic{width:16px;height:16px}
 """
 
 APP_JS = r"""
@@ -1665,59 +5225,7 @@ function toast(msg){
   setTimeout(() => { t.classList.remove('in'); setTimeout(() => t.remove(), 400); }, 3200);
 }
 
-const saveDriveBtn = $('#saveDriveBtn');
-if (saveDriveBtn) {
-  saveDriveBtn.addEventListener('click', async () => {
-    if (!confirm('Save and sync the current master report to Google Drive?')) return;
-    toast('Syncing to Google Drive...');
-    const fd = buildParams('pivot');
-    try {
-      const res = await fetch('/save-to-drive', { method: 'POST', body: fd });
-      const data = await res.json();
-      if (data.status === 'success') {
-        toast('Master report successfully saved to Google Drive!');
-      } else {
-        alert('Failed to save to Drive: ' + (data.error || data.message || 'Unknown error'));
-      }
-    } catch (err) {
-      alert('Network error while saving to Google Drive.');
-    }
-  });
-}
 
-function fmtMb(v){
-  if (!Number.isFinite(v) || v <= 0) return '0MB/s';
-  if (v >= 1) return `${v.toFixed(1)}MB/s`;
-  return `${(v * 1024).toFixed(0)}KB/s`;
-}
-
-function setNetState(online, ping, up, down){
-  const dot = $('#netDot');
-  const text = $('#netText');
-  const pingEl = $('#netPing');
-  const speedEl = $('#netSpeed');
-  const wrap = $('#netStatus');
-
-  if (!dot || !text || !pingEl || !speedEl || !wrap) return;
-
-  dot.classList.toggle('offline', !online);
-  wrap.classList.toggle('offline', !online);
-  text.textContent = online ? 'Online' : 'Offline';
-  pingEl.textContent = `Ping ${ping || 0}ms`;
-  speedEl.textContent = `Up ${fmtMb(up || 0)} · Down ${fmtMb(down || 0)}`;
-}
-
-function updateNetworkInfo(){
-  const conn = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
-  const online = navigator.onLine;
-  const ping = conn && Number.isFinite(conn.rtt) ? Math.max(1, Math.round(conn.rtt)) : 0;
-  const downlink = conn && Number.isFinite(conn.downlink) ? conn.downlink : 0;
-  const uplink = conn && Number.isFinite(conn.downlink) ? conn.downlink * 0.25 : 0;
-  setNetState(online, ping, uplink, downlink);
-}
-window.addEventListener('online', updateNetworkInfo);
-window.addEventListener('offline', updateNetworkInfo);
-updateNetworkInfo();
 
 const themeNow = store.get('ap-theme') || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
 $$('#themeSeg input').forEach(i => {
@@ -1735,604 +5243,5451 @@ if (gRange) {
   gRange.addEventListener('input', () => { root.style.setProperty('--glass', gRange.value); store.set('ap-glass', gRange.value); paint(); });
 }
 
-const popovers = [['#glassBtn', '#glassPop']].map(([b, p]) => [$(b), $(p)]).filter(([b, p]) => b && p);
+const popovers = [['#glassBtn', '#glassPop'], ['#eodShareBtn', '#eodSharePop']].map(([b, p]) => [$(b), $(p)]).filter(([b, p]) => b && p);
 function closePops(except){ popovers.forEach(([b, p]) => { if (p !== except) { p.classList.remove('show'); b.setAttribute('aria-expanded', 'false'); } }); }
 popovers.forEach(([b, p]) => b.addEventListener('click', e => {
   e.stopPropagation(); const open = !p.classList.contains('show');
   closePops(open ? p : null); p.classList.toggle('show', open); b.setAttribute('aria-expanded', String(open));
 }));
 document.addEventListener('click', e => {
-  const insideGlass = e.target.closest('#glassBtn, #glassPop');
+  const insideGlass = e.target.closest('#glassBtn, #glassPop, #eodShareBtn');
   if (!insideGlass) closePops();
 });
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closePops(); });
 
 const dz = $('#dropzone');
 if (dz) {
-  const input = $('#file'), title = $('#dzTitle'), sub = $('#dzSub'), btn = $('#launchBtn');
-  const size = n => n > 1048576 ? (n / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(n / 1024)) + ' KB';
+  const input = $('#file'), title = $('#dzTitle'), sub = $('#dzSub'), btn = $('#launchBtn'), ack = $('#ackRaw');
+  const size = n => n > 1048576 ? (n / 1048576).toFixed(2) + ' MB' : Math.max(1, Math.round(n / 1024)) + ' KB';
+  const DOC_COLORS = { xlsx: '#1f8a4c', xls: '#34a853', csv: '#0a84ff' };
   const sync = () => {
     const f = input.files[0];
-    dz.classList.toggle('has-file', !!f);
-    title.textContent = f ? f.name : 'Choose a file';
-    sub.textContent = f ? size(f.size) + ' · ready to launch' : 'or drag it here · .xlsx, .xls, .csv';
-    btn.disabled = !f;
+    const ext = f ? (f.name.split('.').pop() || '').toLowerCase() : '';
+    dz.classList.remove('has-file'); void dz.offsetWidth; dz.classList.toggle('has-file', !!f);
+    $('#dzExt').textContent = f ? ext.toUpperCase().slice(0, 4) : 'FILE';
+    $('#dzBadge').setAttribute('fill', DOC_COLORS[ext] || '#8e8e93');
+    $('#dzBrowse').textContent = f ? 'Change' : 'Browse';
+    title.textContent = f ? f.name : 'Drop the raw sales sheet here';
+    sub.textContent = f ? size(f.size) + ' · ready to check' : 'Excel or CSV · up to 128 MB';
+    btn.disabled = !f || (ack && !ack.checked);
+    btn.title = f && ack && !ack.checked ? 'Tick the box above to confirm the raw data sheet is saved' : '';
   };
   input.addEventListener('change', sync);
+  if (ack) ack.addEventListener('change', sync);
   ['dragenter', 'dragover'].forEach(ev => dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.add('drag'); }));
   ['dragleave', 'drop'].forEach(ev => dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.remove('drag'); }));
   dz.addEventListener('drop', e => { if (e.dataTransfer.files.length) { input.files = e.dataTransfer.files; sync(); } });
-  $('#uploadForm').addEventListener('submit', () => { btn.classList.add('busy'); btn.textContent = 'Uploading…'; });
-}
-
-const form = $('#config-form');
-if (!form) return;
-
-const sw = $('#mobileSwitch');
-sw.checked = body.classList.contains('mobile-mode');
-sw.addEventListener('change', () => {
-  const on = sw.checked;
-  body.classList.toggle('mobile-mode', on); body.classList.toggle('desktop-mode', !on);
-  body.classList.toggle('sidebar-collapsed', on);
-  $('#sidebarToggle').setAttribute('aria-expanded', String(!on));
-  store.set('ap-mobile', on ? '1' : '0');
-  redrawSoon();
-});
-$('#sidebarToggle').addEventListener('click', e => {
-  const c = body.classList.toggle('sidebar-collapsed');
-  e.currentTarget.setAttribute('aria-expanded', String(!c));
-});
-
-const rz = $('#sidebarResizer');
-const savedW = store.get('ap-sidebar-w');
-if (savedW) root.style.setProperty('--sidebar-w', savedW + 'px');
-rz.addEventListener('pointerdown', e => { rz.setPointerCapture(e.pointerId); rz.classList.add('resizing'); body.style.cursor = 'col-resize'; body.style.userSelect = 'none'; });
-rz.addEventListener('pointermove', e => { if (rz.hasPointerCapture(e.pointerId)) root.style.setProperty('--sidebar-w', Math.min(560, Math.max(270, e.clientX - 12)) + 'px'); });
-const endResize = () => {
-  rz.classList.remove('resizing'); body.style.cursor = ''; body.style.userSelect = '';
-  const w = parseInt(getComputedStyle(root).getPropertyValue('--sidebar-w'), 10); if (w) store.set('ap-sidebar-w', w);
-  redrawSoon();
-};
-rz.addEventListener('pointerup', endResize); rz.addEventListener('pointercancel', endResize);
-rz.addEventListener('dblclick', () => { root.style.removeProperty('--sidebar-w'); store.set('ap-sidebar-w', ''); redrawSoon(); });
-
-const boot = JSON.parse($('#boot').textContent || '{}');
-const filterMap = boot.map || [];
-const tableWrap = $('#table-wrapper'), tableCard = $('#tableCard'), chartCard = $('#chartCard');
-const bar = $('#table-bar'), kpiEl = $('#kpi-banner'), chartBody = $('#chartBody');
-const dlExcel = $('#dlExcel');
-const dlImage = $('#dlImage');
-const spcReview = $('#spcReview');
-const spcPros = $('#spcPros');
-const spcCons = $('#spcCons');
-const view = () => $('input[name="view_mode_toggle"]:checked').value;
-const order = { index_cols: [], value_cols: [] };
-let data = null, dataMode = null, lastParams = null, ctrl = null, timer = null;
-let periodLabel = '', activePreset = null, activeKpi = null, kpis = [];
-const emptyBlock = (t, m, err) => `<div class="empty${err ? ' err' : ''}"><svg class="ic"><use href="#i-chart"/></svg><h3>${esc(t)}</h3><p>${m}</p></div>`;
-const PROMPT = emptyBlock('Build your report', 'Pick at least one <b>X column</b>, one <b>Y column</b> and one <b>measure</b> in the sidebar.');
-
-const checked = name => $$(`input[name="${name}"]:checked`);
-const isShown = r => !r || (r.dataset.casc !== '1' && r.dataset.srch !== '1');
-
-function syncOrder(name){
-  const cur = checked(name).map(i => i.value), set = new Set(cur);
-  order[name] = order[name].filter(v => set.has(v));
-  cur.forEach(v => { if (!order[name].includes(v)) order[name].push(v); });
-  $$(`[data-list="${name}"] .row`).forEach(r => {
-    const o = r.querySelector('.ord'); if (!o) return;
-    const n = order[name].indexOf(r.dataset.val); o.textContent = n >= 0 ? n + 1 : '';
+  $('#uploadForm').addEventListener('submit', e => {
+    if (ack && !ack.checked) { e.preventDefault(); ack.focus(); return; }
+    btn.classList.add('busy'); btn.textContent = 'Checking…';
   });
 }
-
-function updateBadges(){
-  const sd = $('#start_date'), ed = $('#end_date');
-  $$('[data-badge-for]').forEach(b => {
-    const k = b.dataset.badgeFor;
-    const n = k === '__period' ? (checked('weeks').length + checked('months').length || ((sd && sd.value) || (ed && ed.value) ? 1 : 0)) : checked(k).length;
-    const was = b.textContent; b.hidden = n === 0; b.textContent = n;
-    if (n && was !== String(n)) { b.style.animation = 'none'; void b.offsetWidth; b.style.animation = ''; }
-  });
+/* data & upload: the replace button waits for the tick and the typed word; confirm before a restore */
+const cf = $('#commitForm');
+if (cf) {
+  const t = $('#confirmText'), a = $('#ackRaw'), b = $('#commitBtn');
+  const ok = () => (!a || a.checked) && (!t || t.value.trim().toUpperCase() === 'REPLACE');
+  const sync = () => { b.disabled = !ok(); };
+  [t, a].forEach(x => x && ['input', 'change'].forEach(ev => x.addEventListener(ev, sync)));
+  sync();
+  cf.addEventListener('submit', e => { if (!ok()) { e.preventDefault(); return; } b.classList.add('busy'); b.textContent = 'Replacing…'; });
 }
+$$('form[data-confirm]').forEach(f => f.addEventListener('submit', e => { if (!confirm(f.dataset.confirm)) e.preventDefault(); }));
+/* the unlock runs out while the page sits idle: show the locked page then */
+const ulMin = parseInt(document.body.dataset.unlockMin || '', 10);
+if (ulMin) setTimeout(() => location.reload(), ulMin * 60000 + 5000);
 
-const parseISO = s => { const [y, m, d] = s.split('-').map(Number); return new Date(y, m - 1, d); };
-const iso = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-const addD = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x; };
-const monday = d => addD(d, -((d.getDay() + 6) % 7));
-const PRESETS = {
-  today: a => [a, a], yesterday: a => [addD(a, -1), addD(a, -1)],
-  last7: a => [addD(a, -6), a], last14: a => [addD(a, -13), a], last30: a => [addD(a, -29), a], last90: a => [addD(a, -89), a],
-  thisweek: a => [monday(a), a], lastweek: a => { const s = addD(monday(a), -7); return [s, addD(s, 6)]; },
-  mtd: a => [new Date(a.getFullYear(), a.getMonth(), 1), a],
-  lastmonth: a => [new Date(a.getFullYear(), a.getMonth() - 1, 1), new Date(a.getFullYear(), a.getMonth(), 0)],
-  qtd: a => [new Date(a.getFullYear(), Math.floor(a.getMonth() / 3) * 3, 1), a],
-  lastqtr: a => { const q = Math.floor(a.getMonth() / 3) * 3; return [new Date(a.getFullYear(), q - 3, 1), new Date(a.getFullYear(), q, 0)]; },
-  ytd: a => [new Date(a.getFullYear(), 0, 1), a],
-  fytd: a => { const y = a.getMonth() >= 3 ? a.getFullYear() : a.getFullYear() - 1; return [new Date(y, 3, 1), a]; }
-};
-const today0 = new Date(); today0.setHours(0, 0, 0, 0);
-const dmax = boot.dmax ? parseISO(boot.dmax) : null;
-let anchor = dmax && (today0 - dmax) > 3 * 864e5 ? 'data' : 'today';
-function paintAnchor(){ $$('#anchorSeg button').forEach(b => b.classList.toggle('on', b.dataset.anchor === anchor)); }
-paintAnchor();
-
-function clearWM(){ $$('input[name="weeks"], input[name="months"]').forEach(i => { i.checked = false; }); }
-function clearDates(){ const s = $('#start_date'), e = $('#end_date'); if (s) { s.value = ''; e.value = ''; } }
-function setActiveChip(key){ activePreset = key; $$('.chip').forEach(c => c.classList.toggle('active', c.dataset.preset === key && key !== 'all')); }
-function applyPreset(key){
-  clearWM(); setActiveChip(key);
-  const chip = $(`.chip[data-preset="${key}"]`); periodLabel = key === 'all' ? '' : (chip ? chip.textContent : '');
-  if (key === 'all') { clearDates(); return; }
-  const a = anchor === 'data' && dmax ? dmax : today0;
-  const [s, e] = PRESETS[key](a);
-  $('#start_date').value = iso(s); $('#end_date').value = iso(e);
-}
-
-function buildParams(server){
-  const fd = new FormData(form);
-  ['index_cols', 'value_cols'].forEach(n => { fd.delete(n); order[n].forEach(v => fd.append(n, v)); });
-  fd.append('view_mode', server); fd.append('period_label', periodLabel);
-  return fd;
-}
-function schedule(delay = 90){ clearTimeout(timer); timer = setTimeout(update, delay); }
-
-async function update(){
-  const server = view() === 'raw' ? 'raw' : 'pivot';
-  const fd = buildParams(server);
-  $$('[data-structural]').forEach(el => el.classList.toggle('is-disabled', server === 'raw'));
-  updateBadges();
-  if (server === 'pivot' && (!fd.getAll('index_cols').length || !fd.getAll('value_cols').length || !fd.getAll('agg_funcs').length)) {
-    if (ctrl) ctrl.abort();
-    body.classList.remove('loading'); data = null; lastParams = null; dataMode = server; render(); return;
-  }
-  if (ctrl) ctrl.abort();
-  const mine = ctrl = new AbortController();
-  body.classList.add('loading'); tableCard.classList.add('updating'); chartCard.classList.add('updating');
-  try {
-    const res = await fetch('/calculate', { method: 'POST', body: fd, signal: mine.signal });
-    const d = await res.json();
-    data = res.ok ? d : { error: d.error || 'Unknown error' };
-    dataMode = server; lastParams = res.ok ? new URLSearchParams(fd).toString() : null;
-    render();
-  } catch (err) {
-    if (err.name === 'AbortError') return;
-    data = { error: 'Could not reach the server. Please try again.' }; lastParams = null; render();
-  } finally {
-    if (mine === ctrl) { body.classList.remove('loading'); tableCard.classList.remove('updating'); chartCard.classList.remove('updating'); }
-  }
-}
-
-function renderReview(payload){
-  const review = payload && payload.spc_review ? payload.spc_review : { pros: [], cons: [] };
-  const has = review.pros.length || review.cons.length;
-  spcReview.hidden = !has;
-  if (!has) return;
-  spcPros.innerHTML = review.pros.map(item => `
-    <li>
-      <strong>${esc(item.label)}</strong>
-      <div class="meta">
-        <span class="chip-share">${esc(item.share)}</span>
-        <span>${esc(item.value)}</span>
-      </div>
-    </li>
-  `).join('');
-  spcCons.innerHTML = review.cons.map(item => `
-    <li>
-      <strong>${esc(item.label)}</strong>
-      <div class="meta">
-        <span class="chip-share">${esc(item.share)}</span>
-        <span>${esc(item.value)}</span>
-      </div>
-    </li>
-  `).join('');
-}
-
-function setHead(title, period, filters){
-  $('#reportTitle').textContent = title; document.title = title + ' · Analytics Pro';
-  $('#periodText').textContent = period || ''; $('#periodPill').hidden = !period;
-  $('#filterPills').innerHTML = (filters || []).map(([k, v]) => `<span class="pill"><b>${esc(k)}</b> ${esc(v)}</span>`).join('');
-}
-
-function render(){
-  const mode = view(), d = data;
-  tableCard.hidden = mode === 'chart'; chartCard.hidden = mode !== 'chart';
-  dlExcel.disabled = !(d && !d.error && lastParams);
-  dlImage.disabled = !(d && !d.error);
-
-  const block = html => {
-    kpiEl.hidden = true; bar.hidden = true; tableWrap.innerHTML = html; chartBody.innerHTML = html; $('#legend').innerHTML = ''; $('#chartNote').textContent = ''; kpis = []; activeKpi = null; spcReview.hidden = true;
-  };
-  if (!d) { setHead('Build your report', boot.all, []); block(PROMPT); return; }
-  if (d.error) { setHead('Something went wrong', '', []); block(emptyBlock('Something went wrong', esc(d.error), true)); return; }
-  setHead(d.title, d.period, d.filters);
-
-  const prevLabel = kpis[activeKpi] && kpis[activeKpi].label;
-  kpis = d.kpis || [];
-  activeKpi = Math.max(-1, kpis.findIndex(k => k.label === prevLabel)); if (activeKpi < 0) activeKpi = null;
-  kpiEl.hidden = !kpis.length;
-  kpiEl.innerHTML = kpis.map((k, i) => `<button type="button" class="kpi${k.cols && k.cols.length ? '' : ' static'}" data-i="${i}"><span class="kpi-label">${esc(k.label)}</span><span class="kpi-val" title="${esc(k.value)}">${esc(k.value)}</span><span class="kpi-sub">${esc(k.sub || '')}</span></button>`).join('');
-
-  renderReview(d);
-
-  if (mode === 'chart') { drawLegend(); drawChart(true); }
-  else {
-    bar.hidden = false; $('#statusText').textContent = d.status || '';
-    tableWrap.innerHTML = d.table_html;
-    $$('tbody tr', tableWrap).forEach((tr, i) => { tr.dataset.o = i; });
-    addResizers();
-  }
-  applyHighlight();
-}
-
-const hlStyle = document.head.appendChild(document.createElement('style'));
-kpiEl.addEventListener('click', e => {
-  const b = e.target.closest('.kpi'); if (!b) return;
-  const i = +b.dataset.i; if (!kpis[i].cols || !kpis[i].cols.length) return;
-  activeKpi = activeKpi === i ? null : i; applyHighlight();
-});
-function applyHighlight(){
-  const k = activeKpi != null ? kpis[activeKpi] : null;
-  $$('.kpi', kpiEl).forEach((b, i) => b.classList.toggle('active', i === activeKpi));
-  const tbl = $('.excel-table', tableWrap);
-  let css = '';
-  if (tbl) {
-    tbl.classList.toggle('hl', !!k);
-    if (k) {
-      const nidx = Math.max(+tbl.dataset.nidx || 0, 1);
-      const sel = k.cols.map(c => `:nth-child(${c + 1})`).join(',');
-      css = `.excel-table.hl :is(td,th):not(:nth-child(-n+${nidx})){color:var(--label-3)!important}` +
-            `.excel-table.hl td:not(:nth-child(-n+${nidx})) span{opacity:.5}` +
-            `.excel-table.hl :is(td,th):is(${sel}){color:var(--label)!important;background-image:linear-gradient(var(--hl),var(--hl))}` +
-            `.excel-table.hl th:is(${sel}){color:var(--blue)!important}` +
-            `.excel-table.hl td:is(${sel}) span{opacity:1}`;
-    }
-  }
-  hlStyle.textContent = css;
-  const set = k ? new Set(k.cols) : null;
-  const match = !!(set && chartData && chartData.series.some(s => set.has(s.col)));
-  chartBody.classList.toggle('hl', match);
-  $$('.ser', chartBody).forEach(g => g.classList.toggle('on', !!set && set.has(+g.dataset.col)));
-  if (match) {
-    const need = chartData.series.map((s, i) => set.has(s.col) && hidden.has(i) ? i : -1).filter(i => i >= 0);
-    if (need.length) { need.forEach(i => hidden.delete(i)); drawLegend(); drawChart(false); }
-  }
-}
-
-form.addEventListener('submit', e => e.preventDefault());
-form.addEventListener('change', e => {
-  const t = e.target, n = t.name;
-  if (n === 'weeks' || n === 'months') {
-    $$(`input[name="${n === 'weeks' ? 'months' : 'weeks'}"]`).forEach(i => { i.checked = false; });
-    clearDates(); setActiveChip(null); periodLabel = '';
-  } else if (t.type === 'date') { clearWM(); setActiveChip(null); periodLabel = ''; }
-  if (n === 'index_cols' || n === 'value_cols') syncOrder(n);
-  schedule();
-});
-form.addEventListener('input', e => {
-  const q = e.target.dataset && e.target.dataset.search; if (!q) return;
-  const needle = e.target.value.trim().toLowerCase();
-  $$('.row', $(`[data-list="${q}"]`)).forEach(r => { r.dataset.srch = r.dataset.val.toLowerCase().includes(needle) ? '0' : '1'; });
-});
-form.addEventListener('click', e => {
-  const head = e.target.closest('.acc-head');
-  if (head) { const open = head.parentElement.classList.toggle('open'); head.setAttribute('aria-expanded', String(open)); return; }
-  const sel = e.target.closest('[data-select]');
-  if (sel) {
-    const on = sel.dataset.on === '1', name = sel.dataset.select;
-    $$(`input[name="${name}"]`).forEach(i => { if (!on || isShown(i.closest('.row'))) i.checked = on; });
-    if (name === 'weeks' || name === 'months') { clearDates(); setActiveChip(null); periodLabel = ''; }
-    if (name === 'index_cols' || name === 'value_cols') syncOrder(name);
-    schedule(0); return;
-  }
-  const lat = e.target.closest('[data-latest]');
-  if (lat) {
-    const n = +lat.dataset.latest; clearDates(); setActiveChip(null); periodLabel = ''; $$('input[name="months"]').forEach(i => { i.checked = false; });
-    $$('input[name="weeks"]').forEach((i, k) => { i.checked = k < n; }); schedule(0); return;
-  }
-  const chip = e.target.closest('.chip');
-  if (chip) { applyPreset(chip.dataset.preset); schedule(0); return; }
-  const an = e.target.closest('[data-anchor]');
-  if (an) { anchor = an.dataset.anchor; paintAnchor(); if (activePreset && activePreset !== 'all') { applyPreset(activePreset); schedule(0); } }
-});
-$$('input[name="view_mode_toggle"]').forEach(r => r.addEventListener('change', () => {
-  const server = view() === 'raw' ? 'raw' : 'pivot';
-  if (server !== dataMode) { activeKpi = null; update(); } else { updateBadges(); render(); }
-  $$('[data-structural]').forEach(el => el.classList.toggle('is-disabled', server === 'raw'));
-}));
-
-$('#resetBtn').addEventListener('click', () => {
-  form.reset(); setActiveChip(null); periodLabel = ''; activeKpi = null;
-  $$('.row').forEach(r => { delete r.dataset.casc; delete r.dataset.srch; });
-  $$('[data-search]').forEach(i => { i.value = ''; });
-  order.index_cols = []; order.value_cols = []; syncOrder('index_cols'); syncOrder('value_cols');
-  $('#view_pivot').checked = true; schedule(0);
-});
-
-function addResizers(){
-  $$('.excel-table th', tableWrap).forEach(th => { if (!th.querySelector('.resizer')) th.appendChild(Object.assign(document.createElement('div'), { className: 'resizer' })); });
-}
-const MON = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
-function sortKey(text, numeric){
-  const t = text.trim();
-  if (numeric) { const m = t.replace(/,/g, '').match(/-?\d+(\.\d+)?/); if (!m) return -Infinity; const v = parseFloat(m[0]); return /↓/.test(t) ? -Math.abs(v) : v; }
-  const d = t.match(/^(\d{1,2})[ -]([A-Za-z]{3})[ -](\d{2,4})$/);
-  if (d) { const y = +d[3] < 100 ? 2000 + +d[3] : +d[3]; return new Date(y, MON[d[2].toLowerCase()], +d[1]).getTime(); }
-  return t.toLowerCase();
-}
-tableWrap.addEventListener('click', e => {
-  const th = e.target.closest('th'); if (!th || e.target.closest('.resizer')) return;
-  const table = th.closest('table'), ci = th.cellIndex, tb = table.tBodies[0];
-  const dir = th.dataset.dir === 'asc' ? 'desc' : th.dataset.dir === 'desc' ? '' : 'asc';
-  $$('th', table).forEach(h => { delete h.dataset.dir; }); if (dir) th.dataset.dir = dir;
-  const numeric = th.classList.contains('num'), rows = Array.from(tb.rows);
-  if (!dir) rows.sort((a, b) => a.dataset.o - b.dataset.o);
-  else {
-    const keys = new Map(rows.map(r => [r, sortKey(r.cells[ci].textContent, numeric)]));
-    rows.sort((a, b) => { const x = keys.get(a), y = keys.get(b); const c = x < y ? -1 : x > y ? 1 : 0; return dir === 'asc' ? c : -c; });
-  }
-  const frag = document.createDocumentFragment(); rows.forEach(r => frag.appendChild(r)); tb.appendChild(frag);
-});
-tableWrap.addEventListener('pointerdown', e => {
-  const h = e.target.closest('.resizer'); if (!h) return;
-  const th = h.parentElement, sx = e.clientX, sw0 = th.offsetWidth;
-  h.setPointerCapture(e.pointerId);
-  const move = ev => { th.style.width = th.style.minWidth = Math.max(60, sw0 + ev.clientX - sx) + 'px'; };
-  const up = () => { h.removeEventListener('pointermove', move); h.removeEventListener('pointerup', up); };
-  h.addEventListener('pointermove', move); h.addEventListener('pointerup', up);
-  e.preventDefault(); e.stopPropagation();
-});
-
-let ctype = 'bar', csort = 'natural', hidden = new Set(), chartData = null, chartSig = '', chartX = '', redrawT = null, uid = 0;
-let chartLabelVisible = true;
-let chartMaxRows = null;
-
-const fmtFull = v => v == null ? '–' : (Math.abs(v) < 100 && v % 1 !== 0 ? v.toLocaleString('en-IN', { maximumFractionDigits: 2 }) : Math.round(v).toLocaleString('en-IN'));
-const trim1 = n => String(Math.round(n * 10) / 10);
-const fmtAxis = v => { const a = Math.abs(v); return a >= 1e7 ? trim1(v / 1e7) + ' Cr' : a >= 1e5 ? trim1(v / 1e5) + ' L' : a >= 1e3 ? trim1(v / 1e3) + 'K' : trim1(v); };
-function niceTicks(lo, hi, n = 5){
-  if (hi === lo) hi = lo + 1;
-  const raw = (hi - lo) / n, mag = Math.pow(10, Math.floor(Math.log10(raw))), nm = raw / mag;
-  const step = (nm <= 1 ? 1 : nm <= 2 ? 2 : nm <= 2.5 ? 2.5 : nm <= 5 ? 5 : 10) * mag;
-  const out = []; for (let v = Math.floor(lo / step) * step; v <= Math.ceil(hi / step) * step + step / 2; v += step) out.push(+v.toFixed(10));
-  return out;
-}
-function monoPath(p){
-  const n = p.length; if (n < 2) return `M${p[0][0]},${p[0][1]}`;
-  const dx = [], m = [], t = new Array(n);
-  for (let i = 0; i < n - 1; i++) { dx[i] = p[i + 1][0] - p[i][0]; m[i] = (p[i + 1][1] - p[i][1]) / dx[i]; }
-  t[0] = m[0]; t[n - 1] = m[n - 2];
-  for (let i = 1; i < n - 1; i++) t[i] = m[i - 1] * m[i] <= 0 ? 0 : (m[i - 1] + m[i]) / 2;
-  for (let i = 0; i < n - 1; i++) {
-    if (m[i] === 0) { t[i] = 0; t[i + 1] = 0; continue; }
-    const a = t[i] / m[i], b = t[i + 1] / m[i], s = a * a + b * b;
-    if (s > 9) { const k = 3 / Math.sqrt(s); t[i] = k * a * m[i]; t[i + 1] = k * b * m[i]; }
-  }
-  let d = `M${p[0][0]},${p[0][1]}`;
-  for (let i = 0; i < n - 1; i++) { const h = dx[i] / 3; d += `C${p[i][0] + h},${p[i][1] + t[i] * h} ${p[i + 1][0] - h},${p[i + 1][1] - t[i + 1] * h} ${p[i + 1][0]},${p[i + 1][1]}`; }
-  return d;
-}
-function drawLegend(){
-  const c = chartData; $('#legend').innerHTML = c ? c.series.map((s, i) => `<button type="button" class="lg${hidden.has(i) ? ' off' : ''}" data-i="${i}" title="Show or hide"><i style="background:var(--c${i % 8 + 1})"></i>${esc(s.name)}</button>`).join('') : '';
-}
-$('#legend').addEventListener('click', e => {
-  const b = e.target.closest('.lg'); if (!b) return; const i = +b.dataset.i;
-  if (hidden.has(i)) hidden.delete(i); else if (chartData.series.length - hidden.size > 1) hidden.add(i);
-  drawLegend(); drawChart(false); applyHighlight();
-});
-$$('input[name="ctype"]').forEach(r => r.addEventListener('change', () => { ctype = r.value; drawChart(true); applyHighlight(); }));
-$$('input[name="csort"]').forEach(r => r.addEventListener('change', () => { csort = r.value; drawChart(true); applyHighlight(); }));
-const redrawSoon = () => { clearTimeout(redrawT); redrawT = setTimeout(() => { if (!chartCard.hidden && chartData) { drawChart(false); applyHighlight(); } }, 160); };
-window.addEventListener('resize', redrawSoon);
-
-const chartMoreBtn = $('#chartMoreBtn');
-const chartMoreMenu = $('#chartMoreMenu');
-if (chartMoreBtn && chartMoreMenu) {
-  chartMoreBtn.addEventListener('click', (e) => {
-    e.stopPropagation();
-    const open = !chartMoreMenu.classList.contains('show');
-    chartMoreMenu.classList.toggle('show', open);
-    chartMoreBtn.setAttribute('aria-expanded', String(open));
-  });
-  document.addEventListener('click', (e) => {
-    if (!e.target.closest('#chartMoreBtn') && !e.target.closest('#chartMoreMenu')) {
-      chartMoreMenu.classList.remove('show');
-      chartMoreBtn.setAttribute('aria-expanded', 'false');
-    }
-  });
-  document.querySelectorAll('[data-chart-mode]').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const mode = btn.dataset.chartMode;
-      if (mode === 'labels') {
-        chartLabelVisible = !chartLabelVisible;
-        document.getElementById('chartLabelState').textContent = chartLabelVisible ? 'On' : 'Off';
-        drawChart(false);
-      }
-      if (mode === 'top20') { chartMaxRows = 20; drawChart(false); }
-      if (mode === 'top50') { chartMaxRows = 50; drawChart(false); }
-      if (mode === 'all') { chartMaxRows = null; drawChart(false); }
-      if (mode === 'reset') {
-        hidden = new Set();
-        chartSig = '';
-        chartX = '';
-        drawLegend();
-        drawChart(false);
-      }
-      chartMoreMenu.classList.remove('show');
-      chartMoreBtn.setAttribute('aria-expanded', 'false');
-    });
-  });
-}
-
-function drawChart(animate){
-  const d = data && data.chart;
-  if (!d || !d.series.length || !d.labels.length) {
-    chartData = null;
-    chartBody.innerHTML = emptyBlock('Nothing to chart', 'Choose at least one X column and a measure.', false);
-    $('#chartNote').textContent = '';
-    return;
-  }
-
-  const sig = d.series.map(s => s.name).join('|');
-  if (sig !== chartSig) {
-    chartSig = sig; hidden = new Set(); const a = d.series[0].agg;
-    d.series.forEach((s, i) => { if (s.agg !== a || i >= 4) hidden.add(i); });
-    drawLegendFor(d);
-  }
-  if (d.x_title !== chartX) {
-    chartX = d.x_title; ctype = d.is_time ? 'line' : 'bar'; csort = 'natural';
-    $(`#ct_${ctype}`).checked = true; $('#cs_nat').checked = true;
-  }
-  chartData = d; drawLegend();
-  $('#chartNote').textContent = d.note || '';
-
-  let idx = d.labels.map((_, i) => i);
-  const labelsAll = idx.map(i => d.labels[i]);
-  if (chartMaxRows && labelsAll.length > chartMaxRows) {
-    idx = idx.slice(0, chartMaxRows);
-  }
-
-  const mobile = body.classList.contains('mobile-mode');
-  const vis = d.series.map((s, i) => i).filter(i => !hidden.has(i));
-  if (csort === 'value') {
-    const s = d.series[vis[0]];
-    idx.sort((a, b) => (s.values[b] ?? -Infinity) - (s.values[a] ?? -Infinity));
-  }
-  const labels = idx.map(i => d.labels[i]);
-  const ser = vis.map(i => ({ i, s: d.series[i], v: idx.map(k => d.series[i].values[k]) }));
-  const n = labels.length, ns = ser.length;
-  const H = mobile ? 300 : 380, m = { t: 22, r: 12, l: 8 };
-  const longest = Math.max(...labels.map(l => l.length));
-  const rotate = n > 6 || longest > 10; m.b = rotate ? 92 : 44;
-  const avail = Math.max(chartBody.clientWidth - 70, 240);
-  const minStep = ctype === 'bar' ? Math.max(38, ns * 15 + 22) : 36;
-  const step = Math.max((avail - m.l - m.r) / n, minStep), plotW = step * n, W = m.l + plotW + m.r;
-  const all = ser.flatMap(x => x.v).filter(v => v != null);
-  const ticks = niceTicks(Math.min(0, ...all), Math.max(0, ...all));
-  const y0 = ticks[0], y1 = ticks[ticks.length - 1], ph = H - m.t - m.b;
-  const Y = v => m.t + (1 - (v - y0) / (y1 - y0)) * ph, X = i => m.l + step * (i + .5);
-  const id = ++uid;
-
-  let ya = `<svg class="yaxis" width="54" height="${H}" aria-hidden="true">`;
-  ticks.forEach(t => { ya += `<text x="46" y="${Y(t) + 4}" text-anchor="end">${fmtAxis(t)}</text>`; });
-  ya += '</svg>';
-
-  let s = `<svg class="plot${animate ? ' anim' : ''}" width="${W}" height="${H}" role="img" aria-label="${esc(d.x_title)}">`;
-  if (ctype === 'area') s += '<defs>' + ser.map(x => `<linearGradient id="g${id}_${x.i}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--c${x.i % 8 + 1})" stop-opacity=".45"/><stop offset="1" stop-color="var(--c${x.i % 8 + 1})" stop-opacity=".02"/></linearGradient>`).join('') + '</defs>';
-  ticks.forEach(t => { s += `<line class="${t === 0 ? 'zero' : 'grid'}" x1="0" x2="${W}" y1="${Y(t)}" y2="${Y(t)}"/>`; });
-  s += '<rect class="band" id="band" y="0" height="' + H + '" width="' + step + '" rx="8"/><line class="rule" id="rule" y1="' + m.t + '" y2="' + (H - m.b) + '"/>';
-  const every = Math.ceil((rotate ? 17 : 70) / step);
-  labels.forEach((l, i) => {
-    if (i % every) return;
-    const t = l.length > 18 ? l.slice(0, 17) + '…' : l;
-    if (chartLabelVisible) {
-      s += rotate ? `<text class="xtick" transform="translate(${X(i) + 4},${H - m.b + 16}) rotate(-38)" text-anchor="end">${esc(t)}</text>` : `<text class="xtick" x="${X(i)}" y="${H - m.b + 20}" text-anchor="middle">${esc(t)}</text>`;
-    }
-  });
-  const showVals = ctype === 'bar' && n * ns <= 14;
-  ser.forEach(x => {
-    s += `<g class="ser" data-col="${x.s.col}" style="--sc:var(--c${x.i % 8 + 1})">`;
-    if (ctype === 'bar') {
-      const gw = Math.min(step * .72, ns * 44), bw = gw / ns;
-      x.v.forEach((v, i) => {
-        if (v == null) return; const j = ser.indexOf(x), bx = X(i) - gw / 2 + j * bw + (ns > 1 ? 1 : 0), top = Y(Math.max(v, 0)), bot = Y(Math.min(v, 0));
-        s += `<rect class="bar" style="--k:${i}" x="${bx}" y="${top}" width="${Math.max(bw - (ns > 1 ? 2 : 0), 2)}" height="${Math.max(bot - top, 1.5)}" rx="${Math.min(6, bw / 2)}"/>`;
-        if (showVals) s += `<text class="vlabel" x="${bx + (bw - 2) / 2}" y="${top - 6}">${fmtAxis(v)}</text>`;
-      });
-    } else {
-      const pts = x.v.map((v, i) => v == null ? null : [X(i), Y(v)]).filter(Boolean);
-      if (pts.length) {
-        const path = monoPath(pts);
-        if (ctype === 'area') s += `<path class="area" d="${path}L${pts[pts.length - 1][0]},${Y(0)}L${pts[0][0]},${Y(0)}Z" fill="url(#g${id}_${x.i})"/>`;
-        s += `<path class="line" pathLength="1" d="${path}"/>`;
-        if (n <= 60) pts.forEach(p => { s += `<circle class="dot" cx="${p[0]}" cy="${p[1]}" r="3.5"/>`; });
-        x.v.forEach((v, i) => { if (v != null) s += `<circle class="hdot" data-s="${x.i}" data-i="${i}" cx="${X(i)}" cy="${Y(v)}" r="5.5"/>`; });
-      }
-    }
-    s += '</g>';
-  });
-  s += `<rect class="hit" id="hit" x="0" y="0" width="${W}" height="${H}"/></svg>`;
-  chartBody.innerHTML = `${ya}<div class="plot-scroll">${s}</div><div class="tip" id="tip"></div>`;
-
-  const hit = $('#hit'), band = $('#band'), rule = $('#rule'), tip = $('#tip'), scroller = $('.plot-scroll', chartBody);
-  const hdots = $$('.hdot', chartBody);
-  const hide = () => { band.style.opacity = 0; rule.style.opacity = 0; tip.classList.remove('show'); hdots.forEach(c => { c.style.opacity = 0; }); };
-  hit.addEventListener('pointermove', e => {
-    const r = hit.getBoundingClientRect(), i = Math.min(n - 1, Math.max(0, Math.floor((e.clientX - r.left - m.l) / step)));
-    if (ctype === 'bar') { band.setAttribute('x', m.l + step * i); band.style.opacity = 1; rule.style.opacity = 0; }
-    else { rule.setAttribute('x1', X(i)); rule.setAttribute('x2', X(i)); rule.style.opacity = 1; band.style.opacity = 0; }
-    hdots.forEach(c => { c.style.opacity = +c.dataset.i === i ? 1 : 0; });
-    tip.innerHTML = `<div class="tip-title">${esc(labels[i])}</div>` + ser.map(x => `<div class="tip-row"><i style="background:var(--c${x.i % 8 + 1})"></i><span>${esc(x.s.name)}</span><b>${fmtFull(x.v[i])}</b></div>`).join('');
-    const cb = chartBody.getBoundingClientRect(); let left = e.clientX - cb.left + 16;
-    if (left + tip.offsetWidth > cb.width - 6) left = e.clientX - cb.left - tip.offsetWidth - 16;
-    tip.style.left = Math.max(4, left) + 'px'; tip.classList.add('show');
-  });
-  hit.addEventListener('pointerleave', hide);
-  scroller.scrollLeft = 0;
-}
-function drawLegendFor(d){ chartData = d; drawLegend(); }
-
-let d2i = null;
-const loadD2I = () => d2i || (d2i = new Promise((ok, fail) => {
-  const s = document.createElement('script');
-  s.src = 'https://cdnjs.cloudflare.com/ajax/libs/dom-to-image/2.6.0/dom-to-image.min.js';
-  s.onload = ok; s.onerror = () => { d2i = null; fail(new Error('load')); }; document.head.appendChild(s);
-}));
-
-dlImage.addEventListener('click', async () => {
-  const area = $('#report-area'), mode = view();
-  const titleText = ($('#reportTitle').textContent || 'Report').replace(/[^A-Za-z0-9]+/g, '_').replace(/^_|_$/g, '').slice(0, 70) || 'Report';
-  const fileName = `${titleText}_${mode}.png`;
-
-  try {
-    await loadD2I();
-    body.classList.add('exporting');
-    if (mode === 'chart') { drawChart(false); applyHighlight(); }
-    await sleep(260);
-
-    const rect = area.getBoundingClientRect();
-    const scale = Math.max(1.5, Math.min(2.5, 1800 / Math.max(rect.width, 1)));
-    const width = Math.max(1200, Math.ceil(rect.width * scale));
-    const height = Math.max(900, Math.ceil(rect.height * scale));
-    const bg = getComputedStyle(body).backgroundColor;
-
-    const blob = await domtoimage.toBlob(area, {
-      bgcolor: bg,
-      cacheBust: true,
-      width,
-      height,
-      style: {
-        transform: `scale(${scale})`,
-        transformOrigin: 'top left',
-        width: `${rect.width}px`,
-        height: `${rect.height}px`
-      }
-    });
-
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = fileName;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 2000);
-
-    toast('Image saved');
-  } catch (err) {
-    console.error(err);
-    toast('Could not export the image. Please try again.');
-  } finally {
-    area.style.width = '';
-    body.classList.remove('exporting');
-    if (mode === 'chart') { drawChart(false); applyHighlight(); }
-  }
-});
-
-syncOrder('index_cols'); syncOrder('value_cols'); updateBadges(); update();
 })();
 """
 
-ASSET_VERSION = hashlib.md5((APP_CSS + APP_JS).encode()).hexdigest()[:8]
+OVERVIEW_HTML = """<!doctype html>
+<html lang="en"><head><title>Sales Overview</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<script>(function(){try{var d=document.documentElement,t=localStorage.getItem('ap-theme'),v=localStorage.getItem('ap-view');if(t!=='light'&&t!=='dark'){t=matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';localStorage.setItem('ap-theme',t);}if(v!=='phone'&&v!=='desktop'){v=Math.min(screen.width||9999,innerWidth||9999)<700?'phone':'desktop';localStorage.setItem('ap-view',v);}d.dataset.theme=t;if(v==='phone'||v==='desktop'){d.dataset.view=v;if(v==='desktop'){var m=document.querySelector('meta[name=viewport]');if(m)m.setAttribute('content','width=1200, viewport-fit=cover');}}}catch(e){}})();</script>
+<link rel="stylesheet" href="/assets/ov.css?v={{ asset_v }}">
+<script src="/assets/xp.js?v={{ asset_v }}" defer></script>
+<script src="/assets/ov.js?v={{ asset_v }}" defer></script>
+</head><body>
+<header class="top" id="top">
+  <div class="bar">
+    <h1 id="title">All Stores</h1>
+    <div class="menu">
+      <button type="button" class="pill" id="storeBtn" aria-haspopup="menu" aria-expanded="false">Stores</button>
+      <div class="ctx" id="storeMenu" role="menu"></div>
+    </div>
+  </div>
+  <div class="datenav">
+    <button type="button" class="arrow" id="prevBtn" aria-label="Previous"><svg viewBox="0 0 24 24"><path d="M14 7l-5 5 5 5"/></svg></button>
+    <span id="navLabel">&nbsp;</span>
+    <button type="button" class="arrow" id="nextBtn" aria-label="Next"><svg viewBox="0 0 24 24"><path d="M10 7l5 5-5 5"/></svg></button>
+  </div>
+</header>
+
+<main class="wrap" id="wrap">
+  <div class="seg seg6" id="modeSeg" data-i="0" role="tablist" aria-label="Period">
+    <span class="thumb"></span>
+    <button type="button" role="tab" data-mode="day">Day</button>
+    <button type="button" role="tab" data-mode="week">Week</button>
+    <button type="button" role="tab" data-mode="month">Month</button>
+    <button type="button" role="tab" data-mode="quarter">Qtr</button>
+    <button type="button" role="tab" data-mode="year">Year</button>
+    <button type="button" role="tab" data-mode="all">All</button>
+  </div>
+  <div class="seg seg2 metric" id="metricSeg" data-i="0" role="tablist" aria-label="Measure">
+    <span class="thumb"></span>
+    <button type="button" role="tab" data-metric="v">Value</button>
+    <button type="button" role="tab" data-metric="q">Units</button>
+  </div>
+  <div class="seg seg2 metric base" id="baseSeg" data-i="0" role="tablist" aria-label="Compare with">
+    <span class="thumb"></span>
+    <button type="button" role="tab" data-base="prev">vs Previous</button>
+    <button type="button" role="tab" data-base="ly">vs Last Year</button>
+  </div>
+  <div class="grp-toggles">
+    <label class="tg"><input type="checkbox" id="optSP"><span>SP combined</span></label>
+    <label class="tg"><input type="checkbox" id="optFF"><span>Foldables grouped</span></label>
+  </div>
+
+  <p class="err" id="err" hidden></p>
+
+  <div id="periodView" class="layout masonry">
+    <div class="b-sales">
+      <div class="sec-head"><h2 id="salesHead">Sales</h2><button type="button" class="link latest">Show Latest</button></div>
+      <div class="chips secseg" data-sec="sales" role="group" aria-label="Segment for this section" hidden></div>
+      <section class="card" id="salesCard">
+        <div class="card-label" id="salesLabel">&nbsp;</div>
+        <div class="big"><span id="salesValue">–</span><span class="chg" id="salesChange"></span></div>
+        <div class="chart" id="mainChart"></div>
+        <div class="chart" id="subChart"></div>
+        <div class="legend" id="legend"></div>
+        <div class="kv" id="salesRows"></div>
+      </section>
+      <p class="foot updated"></p>
+    </div>
+
+    <div class="b-kpi">
+      <div id="planBlock">
+        <div class="sec-head"><h2 id="planHead">Month-end Projection · SP</h2><button type="button" class="link" id="targetBtn">Set Target</button></div>
+        <section class="card" id="planCard">
+          <form class="tgt-form" id="targetForm" hidden>
+            <p class="tgt-title" id="targetTitle"></p>
+            <div class="tgt-grid">
+              <label>Value target<input type="text" inputmode="numeric" id="tgtV" placeholder="e.g. 1,68,00,950" autocomplete="off"></label>
+              <label>Units target<input type="text" inputmode="numeric" id="tgtQ" placeholder="e.g. 150" autocomplete="off"></label>
+            </div>
+            <div class="tgt-actions"><button type="button" class="link" id="tgtCancel">Cancel</button><button type="button" class="link danger" id="tgtClear">Clear</button><button type="submit" class="pill-btn">Save</button></div>
+          </form>
+          <div id="planBody"></div>
+        </section>
+      </div>
+      <div class="sec-head"><h2>Sales Drivers</h2><span class="sub-note">units, price, pace and team</span></div>
+      <div class="chips secseg" data-sec="kpis" role="group" aria-label="Segment for this section" hidden></div>
+      <section class="kpis" id="kpis"></section>
+    </div>
+
+    <div class="b-compare">
+      <div class="sec-head"><h2>Breakdown vs Past Periods</h2><span class="sec-acts"><button type="button" class="link" id="cmpSortBtn">Sort by change</button><button type="button" class="link" id="cmpView">Show List</button></span></div>
+      <div class="chips secseg" data-sec="cmp" role="group" aria-label="Segment for Compare and Mix Change" hidden></div>
+      <p class="sub-note left" id="compareNote"></p>
+      <div class="chips" id="dimChips"></div>
+      <div class="chips sub" id="famSegChips" hidden></div>
+      <section class="card table-card" id="compareTableCard"><div class="tscroll"><table class="cmp" id="compareTable"></table></div></section>
+      <section class="card list" id="compareList"></section>
+      <div class="sec-head"><h2>Share Shift</h2><span class="sub-note" id="mixNote"></span></div>
+      <section class="card list" id="mixList"></section>
+    </div>
+
+  </div>
+
+  <div id="allView" hidden>
+    <div class="sec-head"><h2>All Periods</h2><button type="button" class="link latest">Show Latest</button></div>
+    <section class="tiles" id="periodTiles"></section>
+    <p class="foot updated"></p>
+    <div class="grid2">
+      <div><div class="sec-head"><h2 id="monthHead">Month</h2></div><section class="card"><div class="chart" id="allMonthChart"></div><div class="legend" id="allMonthLegend"></div></section></div>
+      <div><div class="sec-head"><h2 id="yearHead">Year</h2></div><section class="card"><div class="chart" id="allYearChart"></div><div class="legend" id="allYearLegend"></div></section></div>
+    </div>
+    <div class="sec-head"><h2>Compare Across Periods</h2><span class="sub-note" id="allNote"></span></div>
+    <div class="chips" id="allDimChips"></div>
+    <section class="card table-card"><div class="tscroll"><table class="cmp" id="allTable"></table></div></section>
+  </div>
+
+  <div id="periodsBlock">
+    <div class="sec-head"><h2>Period History</h2><span class="sub-note" id="pNote"></span></div>
+    <div class="chips secseg" data-sec="per" role="group" aria-label="Segment for this section" hidden></div>
+    <div class="chips" id="pGran">
+      <button type="button" data-gran="day">Day-wise</button><button type="button" data-gran="week">Week-wise</button>
+      <button type="button" data-gran="month">Month-wise</button><button type="button" data-gran="quarter">Quarter-wise</button>
+      <button type="button" data-gran="year">Year-wise</button>
+    </div>
+    <section class="card table-card"><div class="tscroll"><table class="cmp ptable" id="pTable"></table></div></section>
+  </div>
+</main>
+<div class="tip" id="tip" role="tooltip" hidden></div>
+</body></html>"""
+
+OV_CSS = r"""
+:root{--bg:#f2f2f7;--card:#fff;--label:#000;--label2:rgba(60,60,67,.8);--label3:rgba(60,60,67,.5);--sep:rgba(60,60,67,.18);--fill:rgba(120,120,128,.12);
+--thumb:#fff;--blue:#007aff;--cyan:#32ade6;--c1:#007aff;--c2:#30b0c7;--c3:#ff9500;--c4:#af52de;--c5:#ff2d55;--c6:#34c759;--other:#c7c7cc;--gbar:#d1d1d6;--avg:#34c759;--grid:rgba(60,60,67,.22);
+--up:#248a3d;--up-bg:rgba(52,199,89,.14);--down:#d70015;--down-bg:rgba(255,59,48,.12);
+--menu:rgba(250,250,252,.82);--shadow:0 10px 40px rgba(0,0,0,.18)}
+:root[data-theme=dark]{--bg:#000;--card:#1c1c1e;--label:#fff;--label2:rgba(235,235,245,.78);--label3:rgba(235,235,245,.5);--sep:rgba(84,84,88,.55);--fill:rgba(118,118,128,.24);
+--thumb:#636366;--blue:#0a84ff;--cyan:#64d2ff;--c1:#0a84ff;--c2:#40c8e0;--c3:#ff9f0a;--c4:#bf5af2;--c5:#ff375f;--c6:#30d158;--other:#636366;--gbar:#3a3a3c;--avg:#30d158;--grid:rgba(235,235,245,.22);
+--up:#30d158;--up-bg:rgba(48,209,88,.16);--down:#ff453a;--down-bg:rgba(255,69,58,.16);
+--menu:rgba(44,44,46,.8);--shadow:0 10px 40px rgba(0,0,0,.6)}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#000;--card:#1c1c1e;--label:#fff;--label2:rgba(235,235,245,.78);--label3:rgba(235,235,245,.5);--sep:rgba(84,84,88,.55);--fill:rgba(118,118,128,.24);
+--thumb:#636366;--blue:#0a84ff;--cyan:#64d2ff;--c1:#0a84ff;--c2:#40c8e0;--c3:#ff9f0a;--c4:#bf5af2;--c5:#ff375f;--c6:#30d158;--other:#636366;--gbar:#3a3a3c;--avg:#30d158;--grid:rgba(235,235,245,.22);
+--up:#30d158;--up-bg:rgba(48,209,88,.16);--down:#ff453a;--down-bg:rgba(255,69,58,.16);
+--menu:rgba(44,44,46,.8);--shadow:0 10px 40px rgba(0,0,0,.6)}}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--label);font:15px/1.3 -apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased}
+button{font:inherit;color:inherit;border:0;background:none;padding:0;cursor:pointer}
+a{color:inherit;text-decoration:none}
+svg{display:block}
+[hidden]{display:none!important}
+
+header.top{position:fixed;top:0;left:0;right:0;z-index:20;background:color-mix(in srgb,var(--bg) 78%,transparent);-webkit-backdrop-filter:saturate(180%) blur(20px);backdrop-filter:saturate(180%) blur(20px);transition:box-shadow .2s}
+header.top.scrolled{box-shadow:0 .5px 0 var(--sep)}
+header.top{padding-top:env(safe-area-inset-top)}
+.bar,.datenav{max-width:1120px;margin:0 auto;padding:0 max(16px,calc(env(safe-area-inset-right) + 8px)) 0 max(16px,calc(env(safe-area-inset-left) + 8px))}
+.bar{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:12px;height:56px}
+.bar h1{margin:0;text-align:left;font-size:19px;font-weight:700;letter-spacing:-.01em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.circ{width:36px;height:36px;border-radius:50%;display:grid;place-items:center;background:var(--fill)}
+.app-badge{width:36px;height:36px;border-radius:10px;background:linear-gradient(145deg,#64d2ff,#0a84ff 55%,#5e5ce6);box-shadow:inset 0 1px 0 rgba(255,255,255,.4),0 3px 8px rgba(10,132,255,.35)}
+.circ svg,.arrow svg,.chev{fill:none;stroke:currentColor;stroke-width:2.6;stroke-linecap:round;stroke-linejoin:round}
+.circ svg{width:20px;height:20px}
+.pill{height:36px;padding:0 14px 0 16px;border-radius:18px;background:color-mix(in srgb,var(--blue) 14%,transparent);color:var(--blue);font-size:14px;font-weight:600;display:inline-flex;align-items:center;gap:6px}
+.pill::after{content:"";width:7px;height:7px;border-right:2px solid currentColor;border-bottom:2px solid currentColor;transform:translateY(-2px) rotate(45deg);opacity:.8}
+.pill[aria-expanded=true]{background:var(--blue);color:#fff}
+.menu{position:relative}
+.ctx{position:absolute;right:0;top:48px;min-width:230px;max-height:60vh;overflow:auto;padding:6px 0;border-radius:16px;background:var(--menu);-webkit-backdrop-filter:blur(30px) saturate(180%);backdrop-filter:blur(30px) saturate(180%);box-shadow:var(--shadow),0 0 0 .5px var(--sep);
+transform-origin:top right;transform:scale(.6);opacity:0;visibility:hidden;transition:transform .35s cubic-bezier(.3,1.4,.5,1),opacity .2s,visibility 0s .35s}
+.ctx.show{transform:none;opacity:1;visibility:visible;transition:transform .35s cubic-bezier(.3,1.4,.5,1),opacity .2s}
+.share-pop button{display:grid;grid-template-columns:22px 1fr;align-items:center;width:100%;min-height:42px;padding:8px 16px 8px 12px;border-radius:10px;text-align:left;font-size:16px}
+.share-pop button:hover{background:var(--fill)}
+.datenav{display:flex;align-items:center;justify-content:center;gap:14px;height:40px}
+.datenav span{min-width:200px;text-align:center;font-size:15px;font-weight:600}
+.arrow{width:26px;height:26px;border-radius:50%;display:grid;place-items:center;background:var(--blue);color:#fff;transition:transform .2s}
+.arrow svg{width:16px;height:16px;stroke-width:3}
+.arrow:active{transform:scale(.88)}
+.arrow:disabled{background:var(--fill);color:var(--label3);cursor:default}
+
+.wrap{max-width:1120px;margin:0 auto;padding:6px 16px calc(48px + env(safe-area-inset-bottom));transition:opacity .2s}
+/* loading: the page stays as it is; a thin line under the top bar shows work in progress (only if it takes a moment) */
+.wrap.loading::before{content:"";position:fixed;left:0;right:0;top:var(--hdr-h,96px);z-index:19;height:2px;pointer-events:none;background:linear-gradient(90deg,transparent,var(--blue,#0a84ff),transparent) 0 0/35% 100% no-repeat;opacity:0;animation:loadIn .2s ease .35s forwards,loadSlide 1.1s ease-in-out .35s infinite}
+@keyframes loadIn{to{opacity:1}}
+@keyframes loadSlide{0%{background-position:-40% 0}100%{background-position:140% 0}}
+@media (prefers-reduced-motion:reduce){.wrap.loading::before{animation:loadIn .2s ease .35s forwards}}
+.seg{position:relative;display:grid;grid-template-columns:repeat(var(--n),1fr);height:34px;padding:2px;margin:6px auto 4px;max-width:640px;border-radius:9px;background:var(--fill)}
+.seg5{--n:5}.seg6{--n:6}.seg2{--n:2}
+.seg button{position:relative;z-index:1;font-size:13px;font-weight:600}
+.seg .thumb{position:absolute;top:2px;bottom:2px;left:2px;width:calc((100% - 4px) / var(--n));border-radius:7px;background:var(--thumb);box-shadow:0 3px 8px rgba(0,0,0,.12),0 0 0 .5px rgba(0,0,0,.04);
+transform:translateX(calc(var(--i,0) * 100%));transition:transform .35s cubic-bezier(.3,1.2,.5,1)}
+.seg.metric{max-width:220px;height:30px;margin-top:10px}
+.seg.metric button{font-size:12px}
+
+.sec-head{display:flex;justify-content:space-between;align-items:baseline;gap:10px;margin:24px 4px 8px}
+.sec-head h2{margin:0;font-size:17px;font-weight:600}
+.sub-note{font-size:12px;color:var(--label2);text-align:right}
+.link{color:var(--blue);font-size:15px;font-weight:500}
+.card{background:var(--card);border-radius:16px;padding:14px 16px}
+.card-label{font-size:14px;color:var(--label2)}
+.big{display:flex;align-items:baseline;justify-content:space-between;flex-wrap:wrap;gap:4px 10px;margin:2px 0 6px}
+.big>span:first-child{font-size:32px;font-weight:700;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+.chg{display:inline-flex;align-items:center;gap:6px;font-size:13px;color:var(--label2);white-space:nowrap}
+.foot{margin:8px 4px 0;font-size:12px;color:var(--label2)}
+.err{margin:16px 0 0;padding:12px 14px;border-radius:12px;background:var(--down-bg);font-size:14px}
+
+.gc{display:inline-flex;align-items:center;justify-content:center;min-width:70px;gap:2px;height:20px;padding:0 7px;border-radius:10px;font-size:12px;font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap;background:var(--fill);color:var(--label2)}
+.gc.up{background:var(--up-bg);color:var(--up)}
+.gc.down{background:var(--down-bg);color:var(--down)}
+.gc.new{background:color-mix(in srgb,var(--blue) 16%,transparent);color:var(--blue)}
+
+.chart{position:relative;margin:12px 0 2px;padding-right:38px}
+.plot{position:relative;height:var(--h,100px)}
+.hl{position:absolute;left:0;right:0;border-top:1px solid var(--grid)}
+.hl.avg{border-top:1.5px dashed var(--avg)}
+.vl{position:absolute;top:0;bottom:0;border-left:1px dotted var(--grid)}
+.yl{position:absolute;right:-38px;width:34px;transform:translateY(-50%);font-size:10px;color:var(--label2)}
+.yl.avg{color:var(--avg)}
+.cols{position:absolute;inset:0;display:flex;align-items:flex-end}
+.colw{flex:1;height:100%;display:flex;align-items:flex-end;justify-content:center}
+.stack{width:var(--bw,62%);display:flex;flex-direction:column-reverse;border-radius:3px 3px 0 0;overflow:hidden;transition:height .45s cubic-bezier(.3,1,.4,1)}
+.stack i{display:block;width:100%}
+.colw:hover .stack{filter:brightness(1.12)}
+.xl{display:flex;margin-top:4px;font-size:10px;color:var(--label2)}
+.xl span{flex:1;text-align:center;white-space:nowrap}
+.xl.left span{text-align:left}
+
+.legend{display:grid;grid-template-columns:repeat(auto-fill,minmax(96px,1fr));gap:10px 12px;margin-top:12px}
+.legend div{min-width:0}
+.legend small{display:block;font-size:13px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.legend b{font-size:14px;font-weight:500;font-variant-numeric:tabular-nums}
+.kv{margin-top:12px}
+.kv div{display:flex;justify-content:space-between;gap:12px;padding:11px 0;border-top:.5px solid var(--sep);font-size:15px}
+.kv b{font-weight:500;color:var(--label2);text-align:right}
+
+.kpis{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.kpi{background:var(--card);border-radius:14px;padding:12px 14px;display:grid;gap:4px;min-width:0}
+.kpi small{font-size:12px;color:var(--label2)}
+.kpi b{font-size:20px;font-weight:700;letter-spacing:-.01em;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.kpi .pv{font-size:11px;color:var(--label2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+.chips{display:flex;gap:8px;overflow-x:auto;margin:0 0 10px;padding:0 2px 2px;scrollbar-width:none}
+.chips::-webkit-scrollbar{display:none}
+.chips button{flex:none;height:30px;padding:0 14px;border-radius:15px;background:var(--fill);font-size:13px;font-weight:600}
+.chips button.on{background:color-mix(in srgb,var(--blue,#0a84ff) 15%,transparent);color:var(--blue,#0a84ff);box-shadow:inset 0 0 0 .5px color-mix(in srgb,var(--blue,#0a84ff) 35%,transparent)}
+
+.list{padding:4px 0}
+.row{display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;align-items:center;gap:10px 12px;width:100%;min-height:58px;padding:8px 14px 8px 16px;text-align:left;position:relative}
+.row+.row::before{content:"";position:absolute;top:0;left:58px;right:0;border-top:.5px solid var(--sep)}
+.row.tool{grid-template-columns:minmax(0,1fr) auto auto;min-height:48px}
+.row.tool+.row.tool::before{left:16px}
+.row:active{background:var(--fill)}
+.aside{font-size:15px;color:var(--label2)}
+.chev{width:14px;height:14px;color:var(--label3);stroke-width:3;transition:transform .2s}
+.ico{width:30px;height:30px;border-radius:7px;display:grid;place-items:center;color:#fff;font-size:11px;font-weight:700;letter-spacing:-.02em}
+.meta{min-width:0;display:grid;gap:5px}
+.meta .name{font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.track{display:flex;align-items:center;gap:6px}
+.track i{height:4px;border-radius:2px;background:var(--label3);min-width:4px;transition:width .45s cubic-bezier(.3,1,.4,1)}
+.track small{font-size:11px;color:var(--label2);white-space:nowrap;font-variant-numeric:tabular-nums}
+.detail{grid-column:2/-1;display:none;gap:3px 14px;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));font-size:12.5px;color:var(--label2);padding-bottom:2px}
+.detail b{color:var(--label);font-weight:600}
+.row.open .detail{display:grid}
+.row.open .chev{transform:rotate(90deg)}
+.more{display:block;padding:10px 16px 8px;color:var(--blue);font-size:15px}
+.empty-row{padding:16px;color:var(--label2);font-size:14px}
+.delta{font-size:13px;font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap}
+.delta.up{color:var(--up)}.delta.down{color:var(--down)}
+
+.tiles{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.tile{background:var(--card);border-radius:16px;padding:14px;text-align:left;display:grid;gap:4px;min-width:0;transition:transform .3s cubic-bezier(.3,1.3,.5,1)}
+.tile:active{transform:scale(.97)}
+.tile small{font-size:13px;color:var(--label2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tile .tl{font-size:15px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tile b{font-size:26px;font-weight:700;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+.tile .tm{display:flex;flex-wrap:wrap;align-items:center;gap:6px;font-size:12px;color:var(--label2)}
+.grid2{display:grid;gap:0 20px}
+
+.table-card{padding:0;overflow:hidden}
+.tscroll{overflow-x:auto}
+.cmp{width:100%;border-collapse:collapse;font-size:14px;min-width:560px}
+.cmp th{position:sticky;top:0;padding:12px 12px 8px;text-align:right;font-size:12px;font-weight:600;color:var(--label2);white-space:nowrap}
+.cmp th:first-child,.cmp td:first-child{text-align:left;position:sticky;left:0;background:var(--card);z-index:1}
+.cmp td{padding:9px 12px;border-top:.5px solid var(--sep);text-align:right;vertical-align:top;font-variant-numeric:tabular-nums;white-space:nowrap}
+.cmp td:first-child{max-width:170px;overflow:hidden;text-overflow:ellipsis;font-weight:500}
+.cmp td .gc{margin-top:3px}
+.cmp td div{display:flex;flex-direction:column;align-items:flex-end}
+.cmp tfoot td{padding:0}
+
+.seg.base{max-width:300px;margin-top:8px}
+.prog{position:relative;height:10px;border-radius:5px;background:var(--fill);margin:10px 0 4px;overflow:visible}
+.prog i{position:absolute;left:0;top:0;bottom:0;border-radius:5px;background:var(--blue);max-width:100%;transition:width .45s cubic-bezier(.3,1,.4,1)}
+.prog i.done{background:var(--up)}
+.prog b{position:absolute;top:-4px;bottom:-4px;width:2px;border-radius:1px;background:var(--label)}
+.prog-legend{display:flex;justify-content:space-between;font-size:11.5px;color:var(--label2)}
+.plan-big{display:flex;align-items:baseline;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.plan-big b{font-size:26px;font-weight:700;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+.plan-big span{font-size:13px;color:var(--label2)}
+.plan-empty{font-size:14px;color:var(--label2);margin:10px 0 2px}
+.plan-scope{font-size:12.5px;line-height:1.4;color:var(--label2);margin:6px 0 0}
+.stack{position:relative}
+.stack .bv{position:absolute;left:50%;bottom:100%;transform:translateX(-50%);margin-bottom:3px;font-size:10px;font-weight:700;color:var(--label2);white-space:nowrap;pointer-events:none}
+.kv .beat b{display:flex!important;flex-direction:column;align-items:flex-end;gap:1px;text-align:right}
+#compareTable td small.sub{display:block;font-size:11px;font-weight:500;color:var(--label2)}
+.beat b small{display:block;font-size:11.5px;font-weight:500;color:var(--label2)}
+.beat b.muted{color:var(--label2);font-weight:500}
+.plan-more{display:block;margin:10px 2px 0;font-size:13px;font-weight:600;color:var(--blue,#0a84ff);text-decoration:none}
+.plan-more:hover{text-decoration:underline}
+.sec-acts{display:inline-flex;gap:14px;align-items:center}
+.sec-acts .link.on{color:var(--label)}
+.tgt-form{display:grid;gap:10px;margin-bottom:12px;padding-bottom:12px;border-bottom:.5px solid var(--sep)}
+.tgt-title{margin:0;font-size:14px;font-weight:600}
+.tgt-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.tgt-grid label{display:grid;gap:4px;font-size:12px;color:var(--label2)}
+.tgt-grid input{height:38px;padding:0 10px;border:0;border-radius:10px;background:var(--fill);color:var(--label);font:inherit;font-size:15px}
+.tgt-grid input:focus{outline:2px solid var(--blue)}
+.tgt-actions{display:flex;justify-content:flex-end;align-items:center;gap:18px}
+.link.danger{color:var(--down)}
+.pill-btn{height:34px;padding:0 18px;border-radius:17px;background:var(--blue);color:#fff;font-weight:600}
+.pp{display:inline-flex;align-items:center;justify-content:center;min-width:64px;height:20px;padding:0 7px;border-radius:10px;font-size:12px;font-weight:600;font-variant-numeric:tabular-nums;background:var(--fill);color:var(--label2);white-space:nowrap}
+.pp.up{background:var(--up-bg);color:var(--up)}.pp.down{background:var(--down-bg);color:var(--down)}
+.seg.single{--n:1}.seg.single button[data-base=ly]{display:none}
+.grp-toggles{display:flex;justify-content:center;gap:8px;margin:10px 0 0}
+.ptable td:first-child small{display:block;font-weight:400;font-size:11px;color:var(--label2);margin-top:2px}
+.segtag{display:inline-block;margin-left:6px;padding:1px 7px;border-radius:7px;background:var(--fill);font-size:10.5px;font-weight:600;color:var(--label2);vertical-align:1px}
+.cmp td .segtag{display:inline-block}
+.chips.sub{margin-top:-4px}
+.chips.sub button{height:26px;font-size:12px;padding:0 11px}
+.ptable .pbar{height:4px;border-radius:2px;background:var(--fill);margin-top:6px;position:relative;min-width:110px}
+.ptable .pbar i{position:absolute;left:0;top:0;bottom:0;border-radius:2px;background:var(--blue)}
+.ptable td .bc{display:flex;flex-direction:column;align-items:flex-end;gap:3px}
+.ptable td .bc small{font-size:10.5px;color:var(--label3)}
+.ptable td .bc span.row2{display:flex;align-items:center;gap:6px}
+.sub-note.left{margin:-4px 4px 10px;text-align:left}
+.kpi .cl{display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--label2);white-space:nowrap;overflow:hidden}
+.kpi .cl em{font-style:normal;font-weight:600;color:var(--label)}
+.kv div{align-items:center}
+.kv span small{display:block;font-size:11px;color:var(--label2)}
+.kv b{display:inline-flex;align-items:center;gap:8px}
+.cmp th small{display:block;font-weight:400;font-size:10.5px;color:var(--label3)}
+.cmp td.sh{color:var(--label2)}
+.colw{cursor:pointer}
+.colw.hot .stack{filter:brightness(1.18);outline:2px solid color-mix(in srgb,var(--label) 35%,transparent);outline-offset:1px}
+.tip{position:fixed;z-index:50;min-width:170px;max-width:260px;padding:10px 12px;border-radius:12px;background:var(--menu);-webkit-backdrop-filter:blur(24px) saturate(180%);backdrop-filter:blur(24px) saturate(180%);
+box-shadow:var(--shadow),0 0 0 .5px var(--sep);font-size:12.5px;pointer-events:none}
+.tip h4{margin:0 0 2px;font-size:12px;font-weight:600;color:var(--label2)}
+.tip .tv{font-size:20px;font-weight:700;font-variant-numeric:tabular-nums}
+.tip .tl{display:flex;justify-content:space-between;gap:10px;margin-top:3px;font-variant-numeric:tabular-nums}
+.tip .tl i{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:6px}
+.tip .ly{margin-top:6px;padding-top:6px;border-top:.5px solid var(--sep);display:flex;justify-content:space-between;align-items:center;gap:8px;color:var(--label2)}
+@media (min-width:760px){
+  .kpis{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .tiles{grid-template-columns:repeat(auto-fit,minmax(190px,1fr))}
+  .grid2{grid-template-columns:1fr 1fr}
+}
+@media (min-width:1000px){
+  .layout{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(0,1fr);gap:0 24px;align-items:start}
+  .layout.masonry{grid-auto-rows:4px;grid-auto-flow:row dense;row-gap:0}
+  .kpis{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .b-tools{max-width:calc((100% - 24px) / 2.35)}
+}
+@media (max-width:380px){.datenav span{min-width:160px}.big>span:first-child{font-size:28px}.seg button{font-size:12px}}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+"""
+
+OV_JS = r"""
+(function(){
+const $ = s => document.querySelector(s);
+const $$ = s => Array.from(document.querySelectorAll(s));
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const store = {
+  get(k){ try { return localStorage.getItem(k); } catch (e) { return null; } },
+  set(k, v){ try { localStorage.setItem(k, v); } catch (e) {} }
+};
+const MODES = ['day', 'week', 'month', 'quarter', 'year', 'all'];
+const PERIOD_END = { month: 'Month-end', quarter: 'Quarter-end', year: 'Year-end' };
+const CAT_VARS = ['var(--c1)', 'var(--c2)', 'var(--c3)', 'var(--c4)', 'var(--c5)', 'var(--c6)'];
+const SEG_FIXED = { sp: 0, flagship: 0, innovative: 1, tab: 2, npc: 3, wearables: 4, accessories: 5 };
+const TOP_SEGS = 6;
+/* each segment keeps the same colour on every page; unknown segments take the free colours in order */
+function segVar(name, cats){
+  const f = SEG_FIXED[String(name).toLowerCase()];
+  if (f != null) return CAT_VARS[f];
+  const used = new Set(cats.map(c => SEG_FIXED[String(c).toLowerCase()]).filter(x => x != null));
+  const free = CAT_VARS.map((_, i) => i).filter(i => !used.has(i));
+  const k = cats.filter(c => SEG_FIXED[String(c).toLowerCase()] == null).indexOf(name);
+  return k >= 0 && k < free.length ? CAT_VARS[free[k]] : 'var(--other)';
+}
+const ICON_COLORS = ['#0a84ff', '#30d158', '#ff9f0a', '#ff375f', '#bf5af2', '#40c8e0', '#5e5ce6', '#ff453a', '#32ade6', '#ffd60a'];
+const LIST_FIRST = 8, TABLE_FIRST = 15;
+
+let saved = {};
+try { saved = JSON.parse(store.get('ov-state') || '{}'); } catch (e) {}
+const st = {
+  mode: MODES.includes(saved.mode) ? saved.mode : 'month',
+  metric: saved.metric === 'q' ? 'q' : 'v',
+  base: saved.base === 'ly' ? 'ly' : 'prev',
+  table: saved.table !== false,
+  sel: window.StorePicker ? StorePicker.saved() : [], dim: saved.dim || 'fam', date: null, more: {},
+  sp: saved.sp === true, ff: saved.ff !== false, pgran: saved.pgran || 'month', famSeg: '',
+  secSeg: saved.secSeg && typeof saved.secSeg === 'object' ? saved.secSeg : {},   /* each units section's own segment ('' = all) */
+  cmpSort: saved.cmpSort === 'chg' ? 'chg' : ''   /* Compare: by value, or biggest change first */
+};
+const scopeQ = q => { st.sel.forEach(s => q.append('store', s)); return q; };
+let data = null, ctrl = null;
+
+/* numbers: no currency symbol, Indian grouping, compact as K / L / Cr */
+const trimNum = n => n.toFixed(2);
+function compact(v){
+  if (window.AP_FULL) return Math.round(v || 0).toLocaleString('en-IN');   // Quick settings: full numbers
+  const a = Math.abs(v || 0), s = v < 0 ? '-' : '';
+  if (a >= 1e7) return s + trimNum(a / 1e7) + 'Cr';
+  if (a >= 1e5) return s + trimNum(a / 1e5) + 'L';
+  if (a >= 1e3) return s + trimNum(a / 1e3) + 'K';
+  return s + Math.round(a);
+}
+const full = v => Math.round(v || 0).toLocaleString('en-IN');
+const isV = () => st.metric === 'v';
+const mi = () => (isV() ? 0 : 1);
+const fmtM = v => (isV() ? compact(v) : full(v));
+const fmtFullM = v => (isV() ? full(v) : full(v) + ' units');
+const asp = (v, q) => (q ? v / q : 0);
+/* comparison baselines come from the server per page: prev (LMTD…), pp (LLMTD), lm (LMSD), ly (LYS…) */
+const baseKeys = () => (data && data.mode === 'all' ? ['prev', 'ly'] : ((data && data.bases) || []).map(b => b.key));
+const base = () => { const k = baseKeys(); return k.includes(st.base) ? st.base : (k[0] || 'prev'); };
+const baseInfo = k => (data.bases || []).find(b => b.key === k) || { code: '', range: '' };
+const pair = (r, k) => (k === 'cur' ? [r.v, r.q] : ((r.b && r.b[k]) || [0, 0]));
+const rv = (r, k) => (r ? pair(r, k)[mi()] || 0 : 0);
+const sv = s => (s ? (isV() ? s.v : s.q) : 0);
+const statOf = (d, k) => (k === 'cur' ? d.cur : (d.bstats || {})[k]);
+
+function niceMax(v){
+  if (!(v > 0)) return 1;
+  const p = Math.pow(10, Math.floor(Math.log10(v))), m = v / p;
+  return [1, 1.2, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10].find(x => m <= x) * p;
+}
+function hashColor(s){ let h = 0; for (const c of s) h = (h * 31 + c.charCodeAt(0)) | 0; return ICON_COLORS[Math.abs(h) % ICON_COLORS.length]; }
+function initials(s){
+  const ff = s.match(/\b(?:fold|flip)\s*(\d+)/i);
+  if (ff) return 'FF' + ff[1];
+  const words = s.replace(/^(samsung\s+)?(galaxy\s+)?/i, '').trim().split(/\s+/).map(w => w.replace(/[^A-Za-z0-9+]/g, '')).filter(Boolean);
+  const w = words.find(x => /\d/.test(x)) || words[0] || '?';
+  const wi = words.indexOf(w);
+  if (/^\d+$/.test(w) && wi > 0) return (words[wi - 1][0] + w).slice(0, 3).toUpperCase();
+  if (/^\d/.test(w)) return w.slice(0, 3).toUpperCase();
+  if (!/\d/.test(w) && words.length > 1) return (words[0][0] + words[1][0]).toUpperCase();
+  const tail = (w.match(/\d+|\+$/) || [''])[0];
+  return (w.slice(0, tail ? 1 : 2) + tail).slice(0, 3).toUpperCase();
+}
+function growth(cur, prev){
+  if (!prev) return cur ? { cls: 'new', txt: 'New' } : { cls: '', txt: '–' };
+  const p = (cur - prev) / prev * 100, a = Math.abs(p);
+  if (a < 0.05) return { cls: '', txt: '0.00%' };
+  return { cls: p > 0 ? 'up' : 'down', txt: (p > 0 ? '↑' : '↓') + a.toFixed(2) + '%' };
+}
+const chip = (cur, prev) => { const g = growth(cur, prev); return `<span class="gc ${g.cls}">${g.txt}</span>`; };
+
+/* ---------- charts ---------- */
+const charts = {};
+function topSegs(cols, n){
+  const tot = {};
+  cols.forEach(c => Object.entries(c.segs).forEach(([s, a]) => { tot[s] = (tot[s] || 0) + a[mi()]; }));
+  return Object.entries(tot).sort((a, b) => b[1] - a[1]).filter(x => x[1] > 0).slice(0, n).map(x => x[0]);
+}
+function legendHtml(cols, cats){
+  const tot = {}; let all = 0;
+  cols.forEach(c => Object.entries(c.segs).forEach(([s, a]) => { tot[s] = (tot[s] || 0) + a[mi()]; all += a[mi()]; }));
+  const out = cats.map((s, i) => `<div><small style="color:${segVar(s, cats)}">${esc(s)}</small><b>${fmtM(tot[s] || 0)}</b></div>`);
+  const other = all - cats.reduce((a, s) => a + (tot[s] || 0), 0);
+  if (other > 0.5) out.push(`<div><small style="color:var(--label2)">Other</small><b>${fmtM(other)}</b></div>`);
+  return out.join('');
+}
+function chart(el, cols, o){
+  const cats = o.cats, n = cols.length, m = mi();
+  const stacks = cols.map(c => {
+    const parts = cats.map(s => (c.segs[s] || [0, 0])[m]);
+    const total = Object.values(c.segs).reduce((a, x) => a + x[m], 0);
+    return { parts, other: total - parts.reduce((a, b) => a + b, 0), total };
+  });
+  const live = stacks.filter((s, i) => !cols[i].future);
+  const avg = o.avg === false ? 0 : (live.length ? live.reduce((a, s) => a + s.total, 0) / live.length : 0);
+  const max = niceMax(Math.max(avg, ...stacks.map(s => s.total)));
+  const pct = v => Math.max(0, Math.min(100, v / max * 100));
+  let h = `<div class="plot" style="--h:${o.height || 100}px"><div class="hl" style="top:0"></div><div class="hl" style="top:100%"></div>`;
+  h += `<span class="yl" style="top:0">${fmtM(max)}</span><span class="yl" style="top:100%">0</span>`;
+  if (avg > 0 && window.AP_AVG !== false) h += `<div class="hl avg" style="top:${100 - pct(avg)}%"></div><span class="yl avg" style="top:${100 - pct(avg)}%">avg</span>`;
+  const showVals = window.AP_LABELS && cols.length <= 16;   // values on bars, where there is room for them
+  const shortV = v => { const a = Math.abs(v); return !isV() ? String(Math.round(v)) : a >= 1e7 ? (a / 1e7).toFixed(1) + 'Cr' : a >= 1e5 ? (a / 1e5).toFixed(1) + 'L' : a >= 1e3 ? (a / 1e3).toFixed(1) + 'K' : String(Math.round(v)); };
+  (o.ticks || []).forEach(i => { h += `<div class="vl" style="left:${i / n * 100}%"></div>`; });
+  h += `<div class="cols" style="--bw:${o.bw || '62%'}">`;
+  stacks.forEach((s, i) => {
+    const gray = o.sel && cols[i].key !== o.sel;
+    let inner = '';
+    if (!gray && s.total > 0) {
+      inner = s.parts.map((v, j) => `<i style="height:${v / s.total * 100}%;background:${segVar(cats[j], cats)}"></i>`).join('');
+      if (s.other > 0) inner += `<i style="height:${s.other / s.total * 100}%;background:var(--other)"></i>`;
+    }
+    h += `<div class="colw" data-chart="${el.id}" data-i="${i}"><div class="stack" style="height:${pct(s.total)}%;${gray ? 'background:var(--gbar)' : ''}">${showVals && s.total > 0 ? `<span class="bv">${shortV(s.total)}</span>` : ''}${inner}</div></div>`;
+  });
+  h += `</div></div><div class="xl${o.left ? ' left' : ''}">${cols.map((c, i) => `<span>${o.labelAt(c, i)}</span>`).join('')}</div>`;
+  el.innerHTML = h;
+  charts[el.id] = { cols, cats, stacks, avg };
+  return avg;
+}
+const plainLabel = c => c.label;
+const everySeventh = (c, i) => (i % 7 === 0 ? c.label : '');
+
+/* pop-up for a chart bar: total, segment split, last year's same day / month */
+const tip = $('#tip');
+let tipFor = null;
+function showTip(col, x, y){
+  const c = charts[col.dataset.chart]; if (!c) return;
+  const i = +col.dataset.i, cd = c.cols[i], s = c.stacks[i], m = mi();
+  const segs = Object.entries(cd.segs).map(([k, a]) => [k, a[m]]).filter(x => x[1] > 0).sort((a, b) => b[1] - a[1]);
+  const colorOf = k => (c.cats.includes(k) ? segVar(k, c.cats) : 'var(--other)');
+  const ly = cd.ly ? cd.ly[m] : 0;
+  const other = isV() ? Object.values(cd.segs).reduce((a, x) => a + x[1], 0) : Object.values(cd.segs).reduce((a, x) => a + x[0], 0);
+  tip.innerHTML = `<h4>${esc(cd.title || cd.label)}</h4>
+    <div class="tv">${cd.future ? 'No data yet' : fmtFullM(s.total)}</div>
+    ${cd.future ? '' : `<div class="tl" style="color:var(--label2)"><span>${isV() ? 'Units' : 'Value'}</span><span>${full(other)}</span></div>`}
+    ${segs.slice(0, 6).map(([k, v]) => `<div class="tl"><span><i style="background:${colorOf(k)}"></i>${esc(k)}</span><span>${fmtM(v)}</span></div>`).join('')}
+    ${c.avg > 0 ? `<div class="tl" style="color:var(--avg)"><span>Average</span><span>${fmtM(c.avg)}</span></div>` : ''}
+    <div class="ly"><span>Last year ${ly ? fmtM(ly) : '–'}</span>${ly || s.total ? chip(s.total, ly) : ''}</div>`;
+  tip.hidden = false;
+  const r = tip.getBoundingClientRect();
+  let left = x + 14, top = y - r.height - 12;
+  if (left + r.width > innerWidth - 8) left = x - r.width - 14;
+  if (top < 8) top = y + 16;
+  tip.style.left = Math.max(8, left) + 'px'; tip.style.top = Math.max(8, Math.min(top, innerHeight - r.height - 8)) + 'px';
+  if (tipFor && tipFor !== col) tipFor.classList.remove('hot');
+  col.classList.add('hot'); tipFor = col;
+}
+function hideTip(){ tip.hidden = true; if (tipFor) tipFor.classList.remove('hot'); tipFor = null; }
+document.addEventListener('pointermove', e => {
+  if (e.pointerType === 'touch') return;
+  const col = e.target.closest && e.target.closest('.colw');
+  if (col) showTip(col, e.clientX, e.clientY); else if (tipFor) hideTip();
+});
+window.addEventListener('scroll', () => { if (tipFor) hideTip(); }, { passive: true });
+
+/* ---------- lists & tables ---------- */
+function listRows(el, rows, key, opts = {}){
+  if (!rows.length) { el.innerHTML = `<div class="empty-row">${opts.empty || 'No sales in this period.'}</div>`; return; }
+  const b = base(), open = st.more[key], limit = opts.limit || LIST_FIRST;
+  const shown = open ? rows : rows.slice(0, limit);
+  const metric = opts.metric || (r => rv(r, 'cur'));
+  const max = Math.max(...rows.map(r => Math.abs(metric(r)))) || 1;
+  el.innerHTML = shown.map(r => {
+    const mval = metric(r);
+    const share = opts.total ? ` · ${(rv(r, 'cur') / opts.total * 100).toFixed(2)}%` : '';
+    const right = opts.right ? opts.right(r) : chip(rv(r, 'cur'), rv(r, b));
+    const line = (lab, k) => { const p = pair(r, k); return `<span>${esc(lab)} <b>${full(p[0])}</b> · ${full(p[1])} units${k !== 'cur' ? ' ' + chip(rv(r, 'cur'), rv(r, k)) : ''}</span>`; };
+    const bp = pair(r, b);
+    return `<button type="button" class="row">
+      <span class="ico" style="background:${opts.color ? opts.color(r) : hashColor(r.name)}">${esc(initials(r.name))}</span>
+      <span class="meta"><span class="name">${esc(r.name)}${st.dim === 'fam' && data.fam_seg && data.fam_seg[r.name] ? ` <small class="segtag">${esc(data.fam_seg[r.name])}</small>` : ''}</span><span class="track"><i style="width:${Math.max(2, Math.abs(mval) / max * 70)}%"></i><small>${opts.short ? opts.short(r) : fmtM(mval)}${share}</small></span></span>
+      ${right}
+      <svg class="chev" viewBox="0 0 24 24"><path d="M10 6l6 6-6 6"/></svg>
+      <span class="detail">${line(data.codes.cur, 'cur')}${data.bases.map(x => line(x.code, x.key)).join('')}<span>ASP <b>${full(asp(r.v, r.q))}</b> ${chip(asp(r.v, r.q), asp(bp[0], bp[1]))}</span></span></button>`;
+  }).join('') + (rows.length > limit && !open ? `<button type="button" class="more" data-more="${key}">Show More (${rows.length - limit})</button>` : '');
+}
+
+function compareTable(el, rows, key, total){
+  const bases = data.bases, open = st.more[key];
+  const shown = open ? rows : rows.slice(0, TABLE_FIRST);
+  const dimLabel = (data.dims.find(x => x.key === st.dim) || {}).label || '';
+  const th = (code, range) => `<th>${esc(code)}<small>${esc(range || '')}</small></th>`;
+  const bk = base(), btot = sv(statOf(data, bk));
+  const shareDelta = x => {
+    if (!total || !btot) return '–';
+    const dpp = rv(x, 'cur') / total * 100 - rv(x, bk) / btot * 100;
+    return `<span class="pp ${dpp > 0.05 ? 'up' : dpp < -0.05 ? 'down' : ''}">${dpp > 0 ? '+' : ''}${dpp.toFixed(2)}pp</span>`;
+  };
+  // to beat the whole previous period (for the chosen comparison) while this one is still running
+  const bt = data.beat && data.beat.bases[bk] && data.beat.bases[bk].ok ? data.beat.bases[bk] : null, left = bt ? data.beat.days_left : 0;
+  const fullOf = x => (x.f && x.f[bk] ? x.f[bk][mi()] || 0 : 0);
+  const beatCell = x => { const now = rv(x, 'cur'), full = fullOf(x);
+    if (!full) return '–';
+    if (now >= full) return `<span class="pp up">✓ ${now > full ? '+' + fmtM(now - full) : 'level'}</span>`;
+    return `${fmtM(full - now)}${left ? `<small class="sub">${perDayFmt((full - now) / left)}/day</small>` : ''}`; };
+  el.innerHTML = `<thead><tr><th>${esc(dimLabel)}<small>${isV() ? 'value' : 'units'}</small></th>${th(data.codes.cur, data.ranges.cur)}${bt ? `<th>To beat ${esc(bt.code)}<small>${esc(bt.range)}</small></th>` : ''}
+    ${bases.map(b => `${th(b.code, b.range)}<th>Gr%<small>vs ${esc(b.code)}</small></th>`).join('')}<th>Share<small>${esc(data.codes.cur)}</small></th><th>Share Δ<small>vs ${esc(baseInfo(bk).code)}</small></th></tr></thead>
+    <tbody>${shown.map(x => `<tr><td title="${esc(x.name)}">${esc(x.name)}${st.dim === 'fam' && (data.fam_seg || {})[x.name] ? `<small class="segtag">${esc(data.fam_seg[x.name])}</small>` : ''}</td><td>${fmtM(rv(x, 'cur'))}</td>${bt ? `<td>${beatCell(x)}</td>` : ''}
+      ${bases.map(b => `<td>${fmtM(rv(x, b.key))}</td><td>${chip(rv(x, 'cur'), rv(x, b.key))}</td>`).join('')}<td class="sh">${total ? (rv(x, 'cur') / total * 100).toFixed(2) + '%' : '–'}</td><td>${shareDelta(x)}</td></tr>`).join('')}</tbody>
+    ${rows.length > TABLE_FIRST && !open ? `<tfoot><tr><td colspan="${4 + bases.length * 2 + (bt ? 1 : 0)}"><button type="button" class="more" data-more="${key}">Show More (${rows.length - TABLE_FIRST})</button></td></tr></tfoot>` : ''}`;
+}
+
+function chipsHtml(el, dims){
+  if (!dims.some(x => x.key === st.dim)) st.dim = dims.some(x => x.key === 'fam') ? 'fam' : (dims[0] || {}).key;
+  el.innerHTML = dims.map(x => `<button type="button" data-dim="${x.key}" class="${x.key === st.dim ? 'on' : ''}">${esc(x.label)}</button>`).join('');
+}
+
+/* ---------- period page ---------- */
+function renderPeriod(d, only){
+  const c = d.codes, b = base(), cur = d.cur, bcode = baseInfo(b).code;
+  const want = k => !only || only === k;   // one section redrawn from its own segment's data, or all of them
+  const cats = topSegs(d.mode === 'day' ? d.chart2.filter(x => x.key === d.sel) : d.chart, TOP_SEGS);
+  if (want('sales')) {
+  $('#salesHead').textContent = isV() ? 'Sales Value' : 'Units Sold';
+  $('#salesLabel').textContent = `${c.cur} · ${d.sub}`;
+  $('#salesValue').textContent = fmtM(sv(cur));
+  $('#salesValue').title = fmtFullM(sv(cur));
+  $('#salesChange').innerHTML = `${chip(sv(cur), sv(statOf(d, b)))}<span>vs ${esc(bcode)}</span>`;
+
+  const cfg = {
+    day: { labelAt: plainLabel, ticks: [0, 1, 2, 3, 4, 5, 6, 7], height: 96, sel: d.sel },
+    week: { labelAt: plainLabel, ticks: [0, 1, 2, 3, 4, 5, 6, 7], height: 130 },
+    month: { labelAt: everySeventh, ticks: [0, 7, 14, 21, 28], height: 130, bw: '58%', left: true },
+    quarter: { labelAt: plainLabel, ticks: d.chart.map((x, i) => (x.label ? i : -1)).filter(i => i >= 0), height: 130, left: true },
+    year: { labelAt: plainLabel, ticks: [0, 3, 6, 9, 12], height: 130 },
+  }[d.mode];
+  const avg = chart($('#mainChart'), d.chart, { ...cfg, cats });
+  $('#subChart').hidden = d.mode !== 'day';
+  if (d.mode === 'day') chart($('#subChart'), d.chart2, { cats, labelAt: everySeventh, ticks: [0, 7, 14, 21, 28], height: 84, bw: '58%', left: true, avg: false });
+  $('#legend').innerHTML = legendHtml(d.mode === 'day' ? d.chart2.filter(x => x.key === d.sel) : d.chart, cats);
+
+  let rows = `<div><span>${esc(c.cur)}<small>${esc(d.ranges.cur)}</small></span><b>${fmtM(sv(cur))}</b></div>` +
+    d.bases.map(x => `<div><span>${esc(x.code)}<small>${esc(x.range)}</small></span><b>${fmtM(sv(statOf(d, x.key)))}${chip(sv(cur), sv(statOf(d, x.key)))}</b></div>`).join('');
+  if (d.mode !== 'day') rows += `<div><span>Daily average<small>${cur.days} selling days</small></span><b>${fmtM(cur.days ? sv(cur) / cur.days : 0)}</b></div>`;
+  else rows += `<div><span>Week average</span><b>${fmtM(avg)}</b></div>`;
+  rows += beatRows(d, b);
+  $('#salesRows').innerHTML = rows;
+  }
+  if (!only) renderPlan(d);   // the SP target block always uses the full figures
+
+  if (want('kpis')) {
+  const hasSpc = d.dims.some(x => x.key === 'spc');
+  const perDay = s => (s && s.days ? sv(s) / s.days : 0);
+  const perSpc = s => (s && s.spc ? sv(s) / s.spc : 0);
+  const aspOf = s => (s ? asp(s.v, s.q) : 0);
+  const kpis = [   // the Sales card above already shows the chosen measure, so only the other one is a tile
+    isV() ? null : ['Value', s => s ? s.v : 0, compact],
+    isV() ? ['Units', s => s ? s.q : 0, full] : null,
+    ['Avg Selling Price', aspOf, compact],
+    [isV() ? 'Value per Selling Day' : 'Units per Selling Day', perDay, fmtM],
+    hasSpc ? ['Active SPCs', s => s ? s.spc : 0, full] : null,
+    ['Models Sold', s => s ? s.fam : 0, full],
+    !d.store && d.stores.length > 1 ? ['Stores Selling', s => s ? s.store : 0, full] : null,
+    hasSpc ? [isV() ? 'Value per SPC' : 'Units per SPC', perSpc, fmtM] : null,
+  ].filter(Boolean);
+  const cl = (x, f, fmt) => { const s = statOf(d, x.key); return `<span class="cl">${esc(x.code)} <em>${fmt(f(s))}</em> ${chip(f(cur), f(s))}</span>`; };
+  $('#kpis').innerHTML = kpis.map(([k, f, fmt]) => `<div class="kpi"><small>${esc(k)} · ${esc(c.cur)}</small><b>${fmt(f(cur))}</b>${d.bases.map(x => cl(x, f, fmt)).join('')}</div>`).join('');
+  }
+  if (!want('cmp')) return;
+  chipsHtml($('#dimChips'), d.dims);
+  const dimLabel = (d.dims.find(x => x.key === st.dim) || {}).label || '';
+  const famSeg = d.fam_seg || {};
+  const segsOfFams = st.dim === 'fam' ? Array.from(new Set((d.dim.fam || []).map(r => famSeg[r.name]).filter(Boolean))) : [];
+  if (st.famSeg && !segsOfFams.includes(st.famSeg)) st.famSeg = '';
+  $('#famSegChips').hidden = !segsOfFams.length;
+  $('#famSegChips').innerHTML = segsOfFams.length ? ['', ...segsOfFams].map(x => `<button type="button" data-famseg="${esc(x)}" class="${st.famSeg === x ? 'on' : ''}">${x ? esc(x) : 'All segments'}</button>`).join('') : '';
+  const all = (d.dim[st.dim] || []).slice().sort((a, x) => rv(x, 'cur') - rv(a, 'cur')).filter(r => rv(r, 'cur') || d.bases.some(x => rv(r, x.key)))
+    .filter(r => st.dim !== 'fam' || !st.famSeg || famSeg[r.name] === st.famSeg);
+  if (st.cmpSort === 'chg') all.sort((a, x) => (rv(x, 'cur') - rv(x, b)) - (rv(a, 'cur') - rv(a, b)));   // biggest gain first, biggest drop last
+  $('#cmpSortBtn').textContent = st.cmpSort === 'chg' ? `Sorted by change vs ${bcode}` : 'Sort by change';
+  $('#cmpSortBtn').classList.toggle('on', st.cmpSort === 'chg');
+  const curRows = all.filter(r => rv(r, 'cur') > 0);
+  const btn = d.beat && d.beat.bases[b] && d.beat.bases[b].ok ? d.beat.bases[b] : null;
+  $('#compareNote').textContent = `${dimLabel}-wise ${isV() ? 'value' : 'units'} · ${[c.cur, ...d.bases.map(x => x.code)].join(' vs ')}${btn ? ` · To beat ${btn.code}: all of ${btn.range}, ${d.beat.days_left} day${d.beat.days_left === 1 ? '' : 's'} left` : ''}`;
+  $('#cmpView').textContent = st.table ? 'Show List' : 'Show Table';
+  $('#compareTableCard').hidden = !st.table; $('#compareList').hidden = st.table;
+  const segColor = r => (cats.includes(r.name) ? segVar(r.name, cats) : '#8e8e93');
+  if (st.table) compareTable($('#compareTable'), all, 'tbl-' + st.dim, sv(cur));
+  else listRows($('#compareList'), curRows, 'cmp-' + st.dim, { total: sv(cur), color: st.dim === 'seg' ? segColor : null });
+
+  renderMix(d, all, b, bcode, segColor);
+
+}
+
+/* ---------- growth: what it takes to beat the whole previous period while this one is still running ---------- */
+const perDayFmt = v => (isV() ? compact(v) : v.toFixed(1));
+function beatRows(d, b){
+  const bt = d.beat && d.beat.bases[b];
+  if (!bt) return '';
+  const name = { week: 'week', month: 'month', quarter: 'quarter', year: 'year' }[d.mode] || 'period';
+  if (!bt.ok) return `<div class="beat"><span>To beat ${esc(bt.code)}<small>${esc(bt.range)}</small></span><b class="muted">Data not available</b></div>`;
+  const now = sv(d.cur), full = sv(bt), left = d.beat.days_left, need = full - now;
+  const pace = d.beat.days_gone ? now / d.beat.days_gone * (d.beat.days_gone + left) : now;
+  const goal = need > 0
+    ? `<div class="beat"><span>To beat ${esc(bt.code)}<small>${esc(bt.range)} · ${fmtM(full)}</small></span><b>${fmtM(need)} more${left ? `<small>${perDayFmt(need / left)} a day for ${left} day${left === 1 ? '' : 's'}</small>` : ''}</b></div>`
+    : `<div class="beat"><span>${esc(bt.code)} beaten<small>${esc(bt.range)} · ${fmtM(full)}</small></span><b><span class="pp up">✓ +${fmtM(-need)}</span></b></div>`;
+  return goal + `<div class="beat"><span>At this pace<small>end of the ${name}</small></span><b>${fmtM(pace)} ${chip(pace, full)}</b></div>`;
+}
+
+/* ---------- run rate, projection, target ---------- */
+const pct1 = x => (isFinite(x) ? x.toFixed(2) : '–') + '%';
+function planNumbers(p, cur){
+  const full_ = !(p.months > 1 && p.months_set < p.months);  // achievement only when every month has a target
+  const now = sv(p.sp || cur), tgt = p.target && full_ ? (isV() ? p.target.v : p.target.q) : null;  // targets are SP only
+  const rr = p.days_data ? now / p.days_data : 0;
+  const proj = now + rr * p.days_left;
+  // several stores: achievement uses the sales of only the stores that have a target (p.sp_target)
+  const tnow = p.sp_target ? sv(p.sp_target) : now, trr = p.days_data ? tnow / p.days_data : 0, tproj = tnow + trr * p.days_left;
+  const o = { now, tgt, rr, proj, tnow, trr, gone: p.days_elapsed / p.days_total * 100, partialTargets: !full_ && p.months_set > 0 };
+  if (tgt) {
+    o.ach = tnow / tgt * 100; o.projAch = tproj / tgt * 100;
+    o.bal = Math.max(0, tgt - tnow);
+    o.req = p.days_left ? o.bal / p.days_left : null;
+  }
+  return o;
+}
+function renderPlan(d){
+  const p = d.plan;
+  $('#planBlock').hidden = !p;
+  if (!p) return;
+  const n = planNumbers(p, d.cur), endWord = PERIOD_END[d.mode];
+  $('#targetBtn').hidden = !p.editable;
+  $('#targetBtn').textContent = n.tgt || (p.target && (p.target.v || p.target.q)) ? 'Edit Target' : 'Set Target';
+  const metricWord = isV() ? 'value' : 'units';
+  let h = `<div class="plan-big"><b>${fmtM(n.proj)}</b><span>Projected ${endWord.toLowerCase()} SP ${metricWord}</span></div>`, h2 = '';
+  const rows = [
+    ['SP ' + metricWord + ' so far', fmtM(n.now)],
+    ['Days', `${p.days_elapsed} of ${p.days_total}${p.days_left ? ` · ${p.days_left} left` : ' · complete'}`],
+    [p.days_data < p.days_elapsed ? `Run rate per day (sheet starts ${new Date(p.data_from + 'T00:00:00').toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })}, ${p.days_data} days)` : 'Run rate per day', fmtM(n.rr)],
+  ];
+  if (n.tgt) {
+    const doneCls = n.ach >= 100 ? ' done' : '';
+    h += `<div class="prog" title="Achieved ${pct1(n.ach)} · time gone ${pct1(n.gone)}"><i class="${doneCls.trim()}" style="width:${Math.min(100, n.ach)}%"></i><b style="left:${Math.min(100, n.gone)}%"></b></div>
+      <div class="prog-legend"><span>Achieved ${pct1(n.ach)}</span><span>Time gone ${pct1(n.gone)}</span></div>
+      ${p.target_stores != null && p.target_stores < p.scope_stores ? `<p class="plan-scope">Achievement counts only the ${p.target_stores.toLocaleString('en-IN')} store${p.target_stores === 1 ? '' : 's'} with a target; the other ${(p.scope_stores - p.target_stores).toLocaleString('en-IN')} have none yet.</p>` : ''}`;
+    const projCls = n.projAch >= 100 ? 'up' : 'down';
+    if (p.target_stores != null) {   // several stores: say whose target this is, and their own sales
+      rows.push([`Stores with a target`, `${p.target_stores.toLocaleString('en-IN')} of ${p.scope_stores.toLocaleString('en-IN')}`]);
+      rows.push([`Target (${p.target_stores === 1 ? 'that store' : 'those stores'})`, fmtM(n.tgt)]);
+      rows.push([`SP ${metricWord} of ${p.target_stores === 1 ? 'that store' : 'those stores'}`, fmtM(n.tnow)]);
+    } else rows.push(['Target' + (p.summed ? ' (sum of stores)' : '') + (p.months > 1 ? ` (${p.months_set} of ${p.months} months set)` : ''), fmtM(n.tgt)]);
+    rows.push([`Projected achievement`, `<span class="pp ${projCls}">${pct1(n.projAch)}</span>`]);
+    if (d.mode === 'month') h2 = `<a class="plan-more" href="/targets">Balance, required run rate and SPC targets on Target vs Achievement ›</a>`;
+  } else {
+    h += `<p class="plan-empty">${p.editable ? `No ${metricWord} target set for ${esc(d.label)}. Tap Set Target to track achievement and the run rate you need.`
+      : p.months > 1 ? `Targets are set per month on the Month page. ${p.months_set} of ${p.months} months here have one; achievement shows once all ${p.months} do.`
+      : `Targets are set store by store. Pick one store at the top to set its target; ${esc(d.store_label || 'All Stores')} adds up the stores' targets once they are set.`}</p>`;
+  }
+  h += `<div class="kv">${rows.map(([k, v]) => `<div><span>${esc(k)}</span><b>${v}</b></div>`).join('')}</div>` + h2;
+  $('#planBody').innerHTML = h;
+}
+function openTargetForm(){
+  const p = data && data.plan; if (!p) return;
+  $('#targetTitle').textContent = `SP target for ${data.label} · ${data.store_label}`;
+  $('#tgtV').value = p.target && p.target.v != null && !p.summed ? full(p.target.v) : '';
+  $('#tgtQ').value = p.target && p.target.q != null && !p.summed ? full(p.target.q) : '';
+  $('#targetForm').hidden = false; $('#tgtV').focus();
+}
+async function saveTarget(v, q){
+  try {
+    const res = await fetch('/api/target', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ store: data.store, month: data.plan.month, v, q }) });
+    const out = await res.json();
+    if (!res.ok) { alert(out.error || 'Could not save the target.'); return; }
+    $('#targetForm').hidden = true; load();
+  } catch (e) { alert('Could not reach the server. Please try again.'); }
+}
+
+/* ---------- mix change: share now vs share in the comparison period ---------- */
+function renderMix(d, rows, b, bcode, segColor){
+  const totNow = sv(d.cur), totBase = sv(statOf(d, b));
+  const dimLabel = (d.dims.find(x => x.key === st.dim) || {}).label || '';
+  $('#mixNote').textContent = `${dimLabel} share of ${isV() ? 'value' : 'units'} · ${d.codes.cur} vs ${bcode}`;
+  const el = $('#mixList');
+  if (!totNow || !totBase) { el.innerHTML = `<div class="empty-row">No ${esc(bcode)} sales to compare the mix with.</div>`; return; }
+  const mix = rows.map(r => ({ ...r, sn: rv(r, 'cur') / totNow * 100, sb: rv(r, b) / totBase * 100 }))
+    .map(r => ({ ...r, dpp: r.sn - r.sb })).sort((x, y) => Math.abs(y.dpp) - Math.abs(x.dpp));
+  const ppChip = r => `<span class="pp ${r.dpp > 0.05 ? 'up' : r.dpp < -0.05 ? 'down' : ''}">${r.dpp > 0 ? '+' : ''}${r.dpp.toFixed(2)}pp</span>`;
+  listRows(el, mix, 'mix-' + st.dim, { metric: r => r.sn, right: ppChip, short: r => `${r.sn.toFixed(2)}% · was ${r.sb.toFixed(2)}%`,
+    color: st.dim === 'seg' ? segColor : null });
+}
+
+/* ---------- all-in-one page ---------- */
+function planLine(p){
+  if (!p.plan) return '';
+  const n = planNumbers(p.plan, p.cur);
+  const ach = n.tgt ? ` · Ach ${pct1(n.ach)} <span class="pp ${n.projAch >= 100 ? 'up' : 'down'}">proj ${pct1(n.projAch)}</span>` : '';
+  return `<span class="tm"><span>${PERIOD_END[p.mode]} ${fmtM(n.proj)}</span>${ach}</span>`;
+}
+function renderAll(d){
+  const b = st.base;
+  $('#periodTiles').innerHTML = d.periods.map(p => {
+    const c = p.cur;
+    const line = x => `<span class="tm"><span>${esc(x.code)} ${fmtM(sv(p.bstats[x.key]))}</span>${chip(sv(c), sv(p.bstats[x.key]))}</span>`;
+    return `<button type="button" class="tile" data-goto="${p.mode}">
+      <span class="tl">${esc(p.codes.cur)} · ${esc(p.label)}</span><small>${esc(p.ranges.cur)}</small>
+      <b>${fmtM(sv(c))}</b>${p.bases.map(line).join('')}${planLine(p)}
+      <span class="tm"><span>${isV() ? full(c.q) + ' units' : compact(c.v) + ' value'}</span><span>· ASP ${compact(asp(c.v, c.q))}</span></span></button>`;
+  }).join('');
+  $('#monthHead').textContent = d.charts.month_label; $('#yearHead').textContent = d.charts.year_label;
+  const mc = topSegs(d.charts.month, TOP_SEGS), yc = topSegs(d.charts.year, TOP_SEGS);
+  chart($('#allMonthChart'), d.charts.month, { cats: mc, labelAt: everySeventh, ticks: [0, 7, 14, 21, 28], height: 120, bw: '58%', left: true });
+  chart($('#allYearChart'), d.charts.year, { cats: yc, labelAt: plainLabel, ticks: [0, 3, 6, 9, 12], height: 120 });
+  $('#allMonthLegend').innerHTML = legendHtml(d.charts.month, mc);
+  $('#allYearLegend').innerHTML = legendHtml(d.charts.year, yc);
+
+  chipsHtml($('#allDimChips'), d.dims);
+  const order = ['day', 'week', 'month', 'quarter', 'year'];
+  const per = Object.fromEntries(d.periods.map(p => [p.mode, p]));
+  const keyFor = m => (per[m].bases.some(x => x.key === b) ? b : 'prev');
+  $('#allNote').textContent = 'growth vs ' + order.map(m => per[m].bases.find(x => x.key === keyFor(m)).code).join(' / ');
+  const cell = (r, m) => { const a = r.p[m]; if (!a) return [0, 0]; const i = mi(); return [a.c[i], (a.b[keyFor(m)] || [0, 0])[i]]; };
+  const rows = (d.table[st.dim] || []).slice().sort((a, x) => cell(x, 'month')[0] - cell(a, 'month')[0] || cell(x, 'year')[0] - cell(a, 'year')[0]);
+  const key = 'all-' + st.dim, open = st.more[key];
+  const shown = open ? rows : rows.slice(0, TABLE_FIRST);
+  $('#allTable').innerHTML = `<thead><tr><th>${esc((d.dims.find(x => x.key === st.dim) || {}).label || '')}<small>${isV() ? 'value' : 'units'}</small></th>${order.map(m => `<th>${esc(per[m].codes.cur)}<small>${esc(per[m].ranges.cur)}</small></th>`).join('')}</tr></thead>
+    <tbody>${shown.map(r => `<tr><td title="${esc(r.name)}">${esc(r.name)}</td>${order.map(m => { const [c, p] = cell(r, m); return `<td><div><span>${c ? fmtM(c) : '–'}</span>${chip(c, p)}</div></td>`; }).join('')}</tr>`).join('')}</tbody>
+    ${rows.length > TABLE_FIRST && !open ? `<tfoot><tr><td colspan="6"><button type="button" class="more" data-more="${key}">Show More (${rows.length - TABLE_FIRST})</button></td></tr></tfoot>` : ''}`;
+}
+
+function render(){
+  const d = data;
+  hideTip();
+  $('#err').hidden = !d.error; if (d.error) { $('#err').textContent = d.error; return; }
+  $('#title').textContent = d.store_label || 'All Stores';
+  $('#navLabel').textContent = d.label;
+  $('#prevBtn').disabled = !d.can_prev; $('#nextBtn').disabled = !d.can_next;
+  $$('.latest').forEach(x => { x.hidden = d.is_latest; });
+  const dt = s => new Date(s + 'T00:00:00').toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+  $$('.updated').forEach(p => { p.textContent = `${d.updated ? 'Updated ' + d.updated + ' · ' : ''}data ${dt(d.dmin)} – ${dt(d.dmax)}`; });
+  const all = d.mode === 'all';
+  $('#periodView').hidden = all; $('#allView').hidden = !all;
+  const opts = all ? [['prev', 'vs Previous'], ['ly', 'vs Last Year']] : d.bases.map(x => [x.key, 'vs ' + x.code]);
+  const bs = $('#baseSeg');
+  bs.style.setProperty('--n', opts.length);
+  bs.style.maxWidth = (opts.length * 130) + 'px';
+  bs.innerHTML = '<span class="thumb"></span>' + opts.map(([k, t]) => `<button type="button" role="tab" data-base="${k}">${esc(t)}</button>`).join('');
+  syncSegs();
+  if (all) renderAll(d); else renderPeriod(d);
+  paintSecSegs();
+  if (!all) applySecSegs();
+  renderMenu();
+  if (pdata) renderPeriods();
+  if (window.addExportButtons) window.addExportButtons();
+}
+
+/* ---------- sales by period ---------- */
+const PBASE_HEAD = { prev: 'vs Previous', lm: 'vs Last Month', pp: 'vs 2 Months Ago', ly: 'vs Last Year' };
+let pdata = null, pctrl = null;
+async function loadPeriods(){
+  if (pctrl) pctrl.abort();
+  const mine = pctrl = new AbortController();
+  const q = scopeQ(new URLSearchParams({ gran: st.pgran, sp: st.sp ? '1' : '0', ff: st.ff ? '1' : '0' }));
+  if (st.secSeg.per) q.set('seg', st.secSeg.per);
+  try {
+    const res = await fetch('/api/periods?' + q, { signal: mine.signal });
+    pdata = await res.json();
+    renderPeriods();
+  } catch (e) { if (e.name !== 'AbortError') { pdata = { error: 'Could not load the period list.' }; renderPeriods(); } }
+}
+function renderPeriods(){
+  $$('#pGran [data-gran]').forEach(b => b.classList.toggle('on', b.dataset.gran === st.pgran));
+  const el = $('#pTable');
+  if (!pdata || pdata.error) { el.innerHTML = `<tbody><tr><td>${esc((pdata && pdata.error) || 'Loading…')}</td></tr></tbody>`; return; }
+  const rows = pdata.rows, key = 'per-' + st.pgran, open = st.more[key], LIMIT = 12;
+  const shown = open ? rows : rows.slice(0, LIMIT);
+  const keys = rows.length ? rows[0].bases.map(b => b.key) : [];
+  const mv = r => (isV() ? r.v : r.q);
+  const max = Math.max(1, ...rows.map(mv));
+  $('#pNote').textContent = `${rows.length} ${st.pgran === 'day' ? 'days' : st.pgran + 's'} · ${st.secSeg.per ? st.secSeg.per + ' · ' : ''}${isV() ? 'value' : 'units'} growth`;
+  el.innerHTML = `<thead><tr><th>Period</th><th>Value</th><th>Units</th><th>ASP</th>${keys.map(k => `<th>${PBASE_HEAD[k] || k}</th>`).join('')}</tr></thead>
+    <tbody>${shown.map(r => `<tr><td>${esc(r.label)}<small>${esc(r.range)}${r.partial ? ' · to date' : ''}</small><div class="pbar"><i style="width:${mv(r) / max * 100}%"></i></div></td>
+      <td><b>${compact(r.v)}</b></td><td>${full(r.q)}</td><td>${r.q ? compact(r.v / r.q) : '–'}</td>
+      ${r.bases.map(b => { const bv = isV() ? b.v : b.q; return `<td><div class="bc"><small>${esc(b.code)} · ${esc(b.range)}</small><span class="row2">${bv ? fmtM(bv) : '–'} ${chip(mv(r), bv)}</span></div></td>`; }).join('')}</tr>`).join('')}</tbody>
+    ${rows.length > LIMIT && !open ? `<tfoot><tr><td colspan="${4 + keys.length}"><button type="button" class="more" data-more="${key}">Show More (${rows.length - LIMIT})</button></td></tr></tfoot>` : ''}`;
+}
+$('#pGran').addEventListener('click', e => { const b = e.target.closest('[data-gran]'); if (b && b.dataset.gran !== st.pgran) { st.pgran = b.dataset.gran; save(); loadPeriods(); } });
+
+function syncSegs(){
+  $('#modeSeg').style.setProperty('--i', MODES.indexOf(st.mode));
+  $('#metricSeg').style.setProperty('--i', isV() ? 0 : 1);
+  $('#baseSeg').style.setProperty('--i', data && !data.error ? Math.max(0, baseKeys().indexOf(base())) : 0);
+  $$('#modeSeg button').forEach(x => x.setAttribute('aria-selected', String(x.dataset.mode === st.mode)));
+  $$('#metricSeg button').forEach(x => x.setAttribute('aria-selected', String(x.dataset.metric === st.metric)));
+}
+
+/* ---------- a segment chooser on each units section ---------- */
+const SEC_SEGS = ['sales', 'kpis', 'cmp'];   // drawn by renderPeriod; 'per' (Sales by Period) has its own request
+const segCache = new Map();
+let lastQ = '';
+const segChoices = () => { const rows = (data && !data.error && data.dim && data.dim.seg) || [];
+  const now = rows.filter(r => rv(r, 'cur') > 0).sort((a, x) => rv(x, 'cur') - rv(a, 'cur')).map(r => r.name);
+  return now.length ? now : ((data && data.segments) || []); };   /* the period's segments, or every segment sold (All mode) */
+function paintSecSegs(){
+  const segs = segChoices(), allMode = !data || data.error || data.mode === 'all';
+  $$('.secseg').forEach(el => {
+    const k = el.dataset.sec;
+    if (st.secSeg[k] && k !== 'per' && !segs.includes(st.secSeg[k])) st.secSeg[k] = '';
+    const curSeg = st.secSeg[k] || '';
+    const list = curSeg && !segs.includes(curSeg) ? [...segs, curSeg] : segs;
+    el.hidden = list.length < 2 || (allMode && k !== 'per');
+    el.innerHTML = ['', ...list].map(x => `<button type="button" data-secseg="${esc(x)}" class="${curSeg === x ? 'on' : ''}">${x ? esc(x) : 'All'}</button>`).join('');
+  });
+}
+function segData(seg){
+  const key = lastQ + '|' + seg;
+  if (!segCache.has(key)) {
+    if (segCache.size > 40) segCache.clear();
+    segCache.set(key, fetch('/api/overview?' + lastQ + '&seg=' + encodeURIComponent(seg)).then(r => r.json()).catch(() => null));
+  }
+  return segCache.get(key);
+}
+async function applySecSegs(only){
+  if (!data || data.error || data.mode === 'all') return;
+  const q = lastQ;
+  for (const k of (only ? [only] : SEC_SEGS)) {
+    const seg = st.secSeg[k];
+    if (!seg) { if (only) renderPeriod(data, k); continue; }
+    const el = document.querySelector(`.secseg[data-sec="${k}"]`); if (el) el.classList.add('busy');
+    const dd = await segData(seg);
+    if (el) el.classList.remove('busy');
+    if (q !== lastQ || !dd || dd.error) continue;   // the period changed meanwhile, or the segment had no data
+    renderPeriod(dd, k);
+  }
+}
+document.addEventListener('click', e => {
+  const b = e.target.closest('[data-secseg]'); if (!b) return;
+  const k = b.closest('.secseg').dataset.sec;
+  st.secSeg[k] = b.dataset.secseg; save(); paintSecSegs();
+  if (k === 'per') loadPeriods(); else applySecSegs(k);
+});
+
+function renderMenu(){
+  StorePicker.mount({ stores: (data && data.stores) || [], selected: st.sel, onChange: sel => { st.sel = sel; st.more = {}; load(); } });
+}
+
+function save(){ store.set('ov-state', JSON.stringify({ mode: st.mode, metric: st.metric, base: st.base, table: st.table, dim: st.dim, sp: st.sp, ff: st.ff, pgran: st.pgran, secSeg: st.secSeg, cmpSort: st.cmpSort })); }
+
+async function load(){
+  save(); syncSegs();
+  if (ctrl) ctrl.abort();
+  const mine = ctrl = new AbortController();
+  $('#wrap').classList.add('loading');
+  const q = scopeQ(new URLSearchParams({ mode: st.mode, sp: st.sp ? '1' : '0', ff: st.ff ? '1' : '0' }));
+  if (st.date) q.set('date', st.date);
+  try {
+    const res = await fetch('/api/overview?' + q, { signal: mine.signal });
+    data = await res.json();
+    if (!data.error) { st.date = data.date; st.sel = data.scope || []; q.set('date', data.date); }
+    lastQ = q.toString();
+    render();
+    loadPeriods();
+  } catch (e) {
+    if (e.name !== 'AbortError') { data = { error: 'Could not reach the server. Please try again.' }; render(); }
+  } finally {
+    if (mine === ctrl) $('#wrap').classList.remove('loading');
+  }
+}
+
+function shift(dir){
+  if (!data || data.error) return;
+  if (dir < 0 ? !data.can_prev : !data.can_next) return;
+  st.date = dir < 0 ? data.prev_date : data.next_date;
+  st.more = {};
+  load();
+}
+const rerender = () => { save(); syncSegs(); if (data && !data.error) render(); };
+
+$('#prevBtn').addEventListener('click', () => shift(-1));
+$('#nextBtn').addEventListener('click', () => shift(1));
+$$('.latest').forEach(x => x.addEventListener('click', () => { st.date = null; load(); }));
+$('#modeSeg').addEventListener('click', e => {
+  const t = e.target.closest('button[data-mode]');
+  if (!t || t.dataset.mode === st.mode) return;
+  st.mode = t.dataset.mode; st.more = {}; load();
+});
+$('#metricSeg').addEventListener('click', e => {
+  const t = e.target.closest('button[data-metric]');
+  if (t && t.dataset.metric !== st.metric) { st.metric = t.dataset.metric; st.more = {}; rerender(); }
+});
+$('#baseSeg').addEventListener('click', e => {
+  const t = e.target.closest('button[data-base]');
+  if (t && t.dataset.base !== st.base) { st.base = t.dataset.base; rerender(); }
+});
+$('#cmpView').addEventListener('click', () => { st.table = !st.table; rerender(); });
+$('#cmpSortBtn').addEventListener('click', () => { st.cmpSort = st.cmpSort === 'chg' ? '' : 'chg'; save(); rerender(); });
+$('#optSP').checked = st.sp; $('#optFF').checked = st.ff;
+$('#optSP').addEventListener('change', e => { st.sp = e.target.checked; st.more = {}; load(); });
+$('#optFF').addEventListener('change', e => { st.ff = e.target.checked; st.more = {}; load(); });
+$('#targetBtn').addEventListener('click', openTargetForm);
+$('#tgtCancel').addEventListener('click', () => { $('#targetForm').hidden = true; });
+$('#tgtClear').addEventListener('click', () => { if (confirm('Remove the target for this month?')) saveTarget(null, null); });
+$('#targetForm').addEventListener('submit', e => {
+  e.preventDefault();
+  const v = $('#tgtV').value.trim(), q = $('#tgtQ').value.trim();
+  if (!v && !q) { $('#tgtV').focus(); return; }
+  saveTarget(v || null, q || null);
+});
+document.addEventListener('click', e => {
+  const t = e.target;
+  const col = t.closest('.colw');
+  if (col) { const r = col.getBoundingClientRect(); if (tipFor === col) hideTip(); else showTip(col, r.left + r.width / 2, r.top + 10); return; }
+  if (tipFor) hideTip();
+  const dim = t.closest('[data-dim]');
+  if (dim) { st.dim = dim.dataset.dim; rerender(); return; }
+  const fs = t.closest('[data-famseg]');
+  if (fs) { st.famSeg = fs.dataset.famseg; st.more = {}; rerender(); return; }
+  const m = t.closest('[data-more]');
+  if (m) { st.more[m.dataset.more] = true; render(); return; }
+  const g = t.closest('[data-goto]');
+  if (g) { st.mode = g.dataset.goto; st.more = {}; window.scrollTo({ top: 0, behavior: 'smooth' }); load(); return; }
+  const r = t.closest('.list .row:not(.tool)');
+  if (r) r.classList.toggle('open');
+});
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') hideTip();
+  if (!e.target.closest || e.target.closest('input,textarea,select')) return;
+  if (e.key === 'ArrowLeft') shift(-1);
+  if (e.key === 'ArrowRight') shift(1);
+});
+['#salesCard', '#periodTiles'].forEach(sel => {
+  let x0 = null, y0 = null;
+  const el = $(sel);
+  el.addEventListener('touchstart', e => { x0 = e.touches[0].clientX; y0 = e.touches[0].clientY; }, { passive: true });
+  el.addEventListener('touchend', e => {
+    if (x0 == null) return;
+    const dx = e.changedTouches[0].clientX - x0, dy = e.changedTouches[0].clientY - y0;
+    if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5) { hideTip(); shift(dx < 0 ? 1 : -1); }
+    x0 = null;
+  });
+});
+const top = $('#top');
+const onScroll = () => top.classList.toggle('scrolled', window.scrollY > 4);
+window.addEventListener('scroll', onScroll, { passive: true }); onScroll();
+
+syncSegs();
+load();
+})();
+"""
+
+TARGETS_HTML = """<!doctype html>
+<html lang="en"><head><title>Target vs Achievement</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<script>(function(){try{var d=document.documentElement,t=localStorage.getItem('ap-theme'),v=localStorage.getItem('ap-view');if(t!=='light'&&t!=='dark'){t=matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';localStorage.setItem('ap-theme',t);}if(v!=='phone'&&v!=='desktop'){v=Math.min(screen.width||9999,innerWidth||9999)<700?'phone':'desktop';localStorage.setItem('ap-view',v);}d.dataset.theme=t;if(v==='phone'||v==='desktop'){d.dataset.view=v;if(v==='desktop'){var m=document.querySelector('meta[name=viewport]');if(m)m.setAttribute('content','width=1200, viewport-fit=cover');}}}catch(e){}})();</script>
+<link rel="stylesheet" href="/assets/ov.css?v={{ asset_v }}">
+<script src="/assets/xp.js?v={{ asset_v }}" defer></script>
+<script src="/assets/tg.js?v={{ asset_v }}" defer></script>
+</head><body>
+<header class="top" id="top">
+  <div class="bar">
+    <h1 id="title">All Stores</h1>
+    <div class="menu">
+      <button type="button" class="pill" id="storeBtn" aria-haspopup="menu" aria-expanded="false">Stores</button>
+      <div class="ctx" id="storeMenu" role="menu"></div>
+    </div>
+  </div>
+  <div class="datenav">
+    <button type="button" class="arrow" id="prevBtn" aria-label="Previous month"><svg viewBox="0 0 24 24"><path d="M14 7l-5 5 5 5"/></svg></button>
+    <span id="navLabel">&nbsp;</span>
+    <button type="button" class="arrow" id="nextBtn" aria-label="Next month"><svg viewBox="0 0 24 24"><path d="M10 7l5 5-5 5"/></svg></button>
+  </div>
+</header>
+
+<main class="wrap tgt-page" id="wrap">
+  <div class="seg seg2 metric" id="metricSeg" role="tablist" aria-label="Measure">
+    <span class="thumb"></span>
+    <button type="button" role="tab" data-metric="v">Value</button>
+    <button type="button" role="tab" data-metric="q">Units</button>
+  </div>
+  <p class="err" id="err" hidden></p>
+
+  <div class="sec-head"><h2 id="setHead">Targets</h2><span class="sub-note" id="setNote"></span></div>
+  <section class="card tgt-set" id="setCard">
+    <div class="tgt-eq">
+      <label><span id="tVlab">Value target</span><input type="text" inputmode="numeric" id="tV" placeholder="e.g. 1,68,00,950" autocomplete="off"></label>
+      <label><span id="tQlab">Units target</span><input type="text" inputmode="numeric" id="tQ" placeholder="e.g. 150" autocomplete="off"></label>
+    </div>
+    <div class="tgt-opts">
+      <label class="tg" id="splitWrap"><input type="checkbox" id="splitEq" checked><span>Split equally across&nbsp;<b id="spcN">0</b>&nbsp;SPCs</span></label>
+      <span class="grow"></span>
+      <button type="button" class="pill-btn" id="saveTop" disabled>Save</button>
+    </div>
+    <p class="tg-hint" id="setHint"></p>
+  </section>
+
+  <div class="sec-head"><h2 id="achHead">Achievement</h2><span class="sub-note" id="achNote"></span></div>
+  <section class="card" id="achCard"></section>
+
+  <div id="storeAch">
+    <div class="sec-head"><h2>Stores</h2><span class="sub-note">tap a column to sort</span></div>
+    <section class="card table-card"><div class="tscroll"><table class="cmp" id="storeTable"></table></div></section>
+  </div>
+
+  <div id="spcAch">
+    <div class="sec-head"><h2>SPC Target Tracker</h2><button type="button" class="link" id="editSpc">Edit SPC targets</button></div>
+    <section class="card table-card" id="spcAchCard"><div class="tscroll"><table class="cmp" id="spcAchTable"></table></div></section>
+    <div id="spcEdit" hidden>
+      <div class="chips">
+        <button type="button" id="splitV">Split value target equally</button>
+        <button type="button" id="splitQ">Split units target equally</button>
+        <button type="button" id="addSpc">+ Add SPC</button>
+        <button type="button" id="clearSpc">Clear SPC targets</button>
+      </div>
+      <section class="card table-card"><div class="tscroll"><table class="cmp tg-table" id="spcTable"></table></div></section>
+      <p class="tg-hint" id="spcHint"></p>
+      <div class="savebar" id="saveBar">
+        <span id="saveState">No changes</span>
+        <span><button type="button" class="link" id="cancelSpc">Cancel</button>
+        <button type="button" class="pill-btn" id="saveBtn" disabled>Save SPC targets</button></span>
+      </div>
+    </div>
+  </div>
+
+  <div id="storeIns">
+    <div class="sec-head"><h2>Store Insights</h2><span class="sub-note" id="storeInsNote"></span></div>
+    <section class="card swf" id="storeSwf"></section>
+  </div>
+  <div id="spcIns">
+    <div class="sec-head"><h2>SPC Insights</h2><span class="sub-note">strengths, weaknesses and focus items · furthest behind first</span></div>
+    <div class="chips" id="spcInsPick"></div>
+    <div id="spcSwf"></div>
+  </div>
+  <div id="prodAch">
+    <div class="sec-head"><h2>Product-wise Target Contribution</h2><span class="sub-note" id="prodNote"></span></div>
+    <div class="chips" id="prodPick"></div>
+    <section class="card table-card"><div class="tscroll"><table class="cmp" id="prodTable"></table></div></section>
+  </div>
+  <p class="foot" id="updated"></p>
+</main>
+</body></html>"""
+
+TG_CSS = r"""
+.tgt-page .metric{margin-top:10px}
+.segpick{justify-content:center;flex-wrap:wrap;margin:10px 0 0}
+.tg-hint{margin:10px 0 0;font-size:12.5px;color:var(--label2)}
+.tg-hint.warn{color:var(--down)}
+.tgt-set{display:grid;gap:12px}
+.tgt-eq{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.tgt-eq label{display:grid;gap:6px;min-width:0;font-size:12px;font-weight:600;color:var(--label2)}
+.tgt-eq input{width:100%;min-width:0;height:46px;padding:0 14px;border:0;border-radius:12px;background:var(--fill);color:var(--label);font:inherit;font-size:20px;font-weight:700;font-variant-numeric:tabular-nums}
+.tgt-eq input:focus{outline:2px solid var(--blue)}
+.tgt-eq input:disabled{opacity:.6}
+.tgt-opts{display:flex;align-items:center;flex-wrap:wrap;gap:10px 14px}
+.tgt-opts .grow{flex:1}
+.tgt-opts .tg span b{font-weight:700}
+.tg-table input{width:100%;min-width:96px;height:34px;padding:0 10px;border:0;border-radius:9px;background:var(--fill);color:var(--label);font:inherit;font-size:14px;text-align:right}
+.tg-table input:focus{outline:2px solid var(--blue)}
+.tg-table td{vertical-align:middle}
+.tg-table td small{display:block;font-size:11px;color:var(--label2);font-weight:400}
+.savebar{position:sticky;bottom:calc(10px + env(safe-area-inset-bottom));z-index:5;display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:14px;padding:10px 12px 10px 16px;border-radius:16px;
+background:var(--menu);-webkit-backdrop-filter:blur(24px) saturate(180%);backdrop-filter:blur(24px) saturate(180%);box-shadow:var(--shadow),0 0 0 .5px var(--sep);font-size:13.5px;color:var(--label2)}
+.savebar span:last-child{display:flex;align-items:center;gap:14px}
+.savebar.dirty>span:first-child{color:var(--label);font-weight:600}
+.pill-btn:disabled{opacity:.4;cursor:default}
+.ach-top{display:flex;align-items:baseline;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.ach-top b{font-size:34px;font-weight:700;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+.ach-top span{font-size:13px;color:var(--label2)}
+.mini{height:4px;border-radius:2px;background:var(--fill);margin-top:5px;position:relative;min-width:80px}
+.mini i{position:absolute;left:0;top:0;bottom:0;border-radius:2px;background:var(--blue);max-width:100%}
+.mini i.done{background:var(--up)}
+.cmp th[data-sort]{cursor:pointer}
+.cmp th[data-sort].on{color:var(--blue)}
+.ok90{color:var(--up);font-weight:600}
+.swf{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;padding:14px}
+.swf-col{border-radius:14px;padding:12px 14px;background:color-mix(in srgb,var(--c) 7%,var(--card));box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--c) 20%,transparent)}
+.swf-col h3{margin:0 0 10px;display:flex;align-items:center;gap:8px;font-size:13px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:color-mix(in srgb,var(--c) 80%,var(--label))}
+.swf-col h3 i{width:22px;height:22px;border-radius:7px;display:grid;place-items:center;font-style:normal;font-size:12px;color:#fff;background:var(--c)}
+.swf-col h3 em{margin-left:auto;font-style:normal;font-size:11px;font-weight:700;color:var(--label2)}
+.swf-col ol{margin:0;padding:0;list-style:none;display:grid;gap:9px}
+.swf-col li{font-size:13.5px;line-height:1.45;color:var(--label);padding-left:12px;position:relative}
+.swf-col li::before{content:"";position:absolute;left:0;top:.6em;width:5px;height:5px;border-radius:50%;background:var(--c)}
+.swf-col li small{display:block;margin-top:2px;font-size:12px;color:var(--label2)}
+.swf-col .none{color:var(--label3);font-size:13px}
+.swf-s{--c:#34c759}.swf-w{--c:#ff3b30}.swf-f{--c:#0a84ff}
+.spc-swf{margin-bottom:12px}
+.spc-swf .swf{padding:0 14px 14px}
+.spc-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:14px 16px 12px}
+.spc-head b{font-size:17px;font-weight:700}
+.spc-head .pp{font-size:12px}
+.spc-head .meta{margin-left:auto;font-size:12.5px;color:var(--label2);font-variant-numeric:tabular-nums}
+.verdict{font-size:11px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;padding:3px 8px;border-radius:999px;color:#fff;background:var(--vc)}
+#spcInsPick,#prodPick{margin-bottom:10px}
+@media (max-width:900px){.swf{grid-template-columns:1fr}}
+@media (max-width:420px){.tgt-eq input{font-size:17px;height:44px}}
+html[data-view=phone] .swf{grid-template-columns:1fr}
+"""
+
+TG_JS = r"""
+(function(){
+const $ = s => document.querySelector(s);
+const $$ = s => Array.from(document.querySelectorAll(s));
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const store = {
+  get(k){ try { return localStorage.getItem(k); } catch (e) { return null; } },
+  set(k, v){ try { localStorage.setItem(k, v); } catch (e) {} }
+};
+const trimNum = n => n.toFixed(2);
+function compact(v){
+  if (window.AP_FULL) return Math.round(v || 0).toLocaleString('en-IN');   // Quick settings: full numbers
+  const a = Math.abs(v || 0), s = v < 0 ? '-' : '';
+  if (a >= 1e7) return s + trimNum(a / 1e7) + 'Cr';
+  if (a >= 1e5) return s + trimNum(a / 1e5) + 'L';
+  if (a >= 1e3) return s + trimNum(a / 1e3) + 'K';
+  return s + Math.round(a);
+}
+const full = v => Math.round(v || 0).toLocaleString('en-IN');
+const parse = s => { const t = String(s || '').replace(/[,\s]/g, ''); if (!t) return null; const n = Number(t); return isFinite(n) && n >= 0 ? n : NaN; };
+const pct = x => (isFinite(x) ? x.toFixed(2) + '%' : '–');
+
+let saved = {};
+try { saved = JSON.parse(store.get('tg-state') || '{}'); } catch (e) {}
+const st = { metric: saved.metric === 'q' ? 'q' : 'v', month: null, seg: '',   /* targets are SP as a whole: no segment split */
+  sel: StorePicker.saved(), sort: saved.sort || 'ach', extra: [], editing: false };
+let data = null, dirty = false, topDirty = false;
+const isV = () => st.metric === 'v';
+const fmtM = v => (isV() ? compact(v) : full(v));
+const tv = t => (t ? t[st.metric] : null);
+const STORE_LEVEL = 90, SPC_LEVEL = 80, LEVEL = STORE_LEVEL;   /* "required for": 90% of a store target, 80% of an SPC target, value and units */
+
+function save(){ store.set('tg-state', JSON.stringify({ metric: st.metric, sort: st.sort, seg: st.seg })); }
+function syncSegs(){ $('#metricSeg').style.setProperty('--i', isV() ? 0 : 1); }
+function setDirty(on){
+  dirty = on;
+  $('#saveBar').classList.toggle('dirty', on);
+  $('#saveState').textContent = on ? 'Unsaved changes' : 'No changes';
+  $('#saveBtn').disabled = !on;
+}
+const confirmLeave = () => (!dirty && !topDirty) || confirm('You have unsaved target changes. Discard them?');
+function toast(msg){
+  const t = document.createElement('div');
+  t.textContent = msg;
+  t.style.cssText = 'position:fixed;left:50%;bottom:90px;transform:translateX(-50%);padding:10px 16px;border-radius:14px;background:var(--menu);color:var(--label);-webkit-backdrop-filter:blur(24px) saturate(180%);backdrop-filter:blur(24px) saturate(180%);box-shadow:0 8px 28px rgba(0,0,0,.16),0 0 0 .5px var(--sep);font-size:14px;font-weight:600;z-index:60';
+  document.body.appendChild(t); setTimeout(() => t.remove(), 1800);
+}
+async function post(body){
+  const res = await fetch('/api/targets', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const out = await res.json();
+  if (!res.ok) throw new Error(out.error || 'Could not save.');
+  return out;
+}
+
+/* ---------- target boxes on top: store (or segment) value and qty, split equally across SPCs ---------- */
+function equalSplit(total, n, whole){
+  if (!(total > 0) || !n) return [];
+  if (whole) { const b = Math.floor(total / n), r = Math.round(total - b * n); return Array.from({ length: n }, (_, i) => b + (i < r ? 1 : 0)); }
+  const b = Math.floor(total / n), r = Math.round(total - b * n);
+  return Array.from({ length: n }, (_, i) => b + (i < r ? 1 : 0));
+}
+function renderTop(d){
+  const seg = d.seg, ed = d.editable;
+  const own = seg ? (d.seg_targets || {})[seg] : d.store_target_own;
+  const shown = seg ? (d.seg_targets || {})[seg] : (d.store_target_own || d.store_total_target);
+  $('#setHead').textContent = seg ? `Set ${seg} Target` : 'Set SP Target';
+  $('#setNote').textContent = `${d.store_label} · ${d.label} · smartphones only`;
+  $('#tVlab').textContent = (seg ? seg + ' ' : 'SP ') + 'value target';
+  $('#tQlab').textContent = (seg ? seg + ' ' : 'SP ') + 'units target';
+  $('#tV').value = shown && shown.v != null ? full(shown.v) : '';
+  $('#tQ').value = shown && shown.q != null ? full(shown.q) : '';
+  $('#tV').disabled = $('#tQ').disabled = !ed;
+  const n = d.spcs.length;
+  $('#spcN').textContent = n;
+  $('#splitWrap').hidden = !ed || !!seg || !d.has_spc || !n;
+  $('#splitEq').checked = true;   /* split equally is the default; untick only for a one-off */
+  $('#saveTop').hidden = !ed;
+  let hint = '';
+  if (!ed) hint = `Pick one store at the top to set its target.`;
+  else if (seg) hint = `SPC targets for ${seg} follow the segment's share of the SP target${d.store_total_target && d.store_total_target.v ? ` (${pct((d.seg_ratio.v || 0) * 100)} of value)` : ''}.`;
+  else if (!own && d.store_total_target) hint = d.store_target_source === 'spc' ? 'Showing the SPC targets added up; type a store target to replace it.' : 'Showing the stores\' targets added up; type an All Stores target to set your own.';
+  else if (n) hint = `Saving with "Split equally" gives each of the ${n} SPCs the same share; edit single SPCs below.`;
+  $('#setHint').textContent = hint;
+  topDirty = false; $('#saveTop').disabled = true;
+}
+async function saveTop(){
+  const d = data, v = parse($('#tV').value), q = parse($('#tQ').value);
+  if ([v, q].some(Number.isNaN)) { alert('Targets must be numbers (commas are fine).'); return; }
+  const body = { month: d.month, store: d.store };
+  if (d.seg) { body.seg = { [d.seg]: { v, q } }; body.seg_merge = true; }
+  else {
+    body.store_target = { v, q };
+    if ($('#splitEq').checked && !$('#splitWrap').hidden && d.spcs.length) {
+      const names = d.spcs.map(r => r.name), sv = equalSplit(v, names.length), sq = equalSplit(q, names.length, true);
+      body.spc = Object.fromEntries(names.map((n, i) => [n, { v: sv.length ? sv[i] : null, q: sq.length ? sq[i] : null }]));
+    }
+  }
+  $('#saveTop').disabled = true;
+  try { await post(body); topDirty = false; await load(); toast('Targets saved'); }
+  catch (e) { alert(e.message || 'Could not reach the server. Please try again.'); $('#saveTop').disabled = false; }
+}
+
+/* ---------- SPC target editor (opened from the SPC-wise table) ---------- */
+function renderEdit(d){
+  const rows = d.spcs.map(x => ({ name: x.name, t: x.own_t, a: x.a })).concat(st.extra.map(n => ({ name: n, t: null, a: { v: 0, q: 0 }, isNew: true })));
+  $('#spcTable').innerHTML = `<thead><tr><th>SPC<small>SP sales so far</small></th><th>Value target</th><th>Units target</th></tr></thead>
+    <tbody>${rows.map(r => `<tr data-spc="${esc(r.name)}"><td>${esc(r.name)}<small>${r.isNew ? 'new' : compact(r.a.v) + ' · ' + full(r.a.q) + ' units'}</small></td>
+      <td><input type="text" inputmode="numeric" data-f="v" value="${r.t && r.t.v != null ? full(r.t.v) : ''}" aria-label="${esc(r.name)} value target"></td>
+      <td><input type="text" inputmode="numeric" data-f="q" value="${r.t && r.t.q != null ? full(r.t.q) : ''}" aria-label="${esc(r.name)} units target"></td></tr>`).join('')}</tbody>
+    <tfoot><tr><td>SPC total</td><td id="sumV"></td><td id="sumQ"></td></tr></tfoot>`;
+  updateSums(); setDirty(false);
+}
+const spcInputs = () => $$('#spcTable tbody tr').map(tr => ({ name: tr.dataset.spc, v: tr.querySelector('[data-f=v]'), q: tr.querySelector('[data-f=q]') }));
+function updateSums(){
+  let sv = 0, sq = 0, any = false;
+  spcInputs().forEach(r => { const v = parse(r.v.value), q = parse(r.q.value); if (v > 0) { sv += v; any = true; } if (q > 0) { sq += q; any = true; } });
+  if ($('#sumV')) { $('#sumV').textContent = any ? full(sv) : '–'; $('#sumQ').textContent = any ? full(sq) : '–'; }
+  const stT = data && (data.store_target_own || null), msgs = [];
+  if (any && stT && stT.v > 0 && Math.abs(sv - stT.v) > 0.5) msgs.push(`SPC value targets add up to ${full(sv)}; the store target is ${full(stT.v)}.`);
+  if (any && stT && stT.q > 0 && Math.abs(sq - stT.q) > 0.5) msgs.push(`SPC units targets add up to ${full(sq)}; the store target is ${full(stT.q)}.`);
+  $('#spcHint').textContent = msgs.join(' '); $('#spcHint').classList.toggle('warn', msgs.length > 0);
+}
+function splitField(field){
+  const stT = data.store_target_own || data.store_total_target, total = stT ? stT[field] : null, rows = spcInputs();
+  if (!(total > 0)) { alert(`Set the ${field === 'v' ? 'value' : 'units'} target at the top first.`); return; }
+  const parts = equalSplit(total, rows.length, field === 'q');
+  rows.forEach((r, i) => { r[field].value = full(parts[i]); });
+  updateSums(); setDirty(true);
+}
+async function saveSpc(){
+  const bad = spcInputs().some(r => Number.isNaN(parse(r.v.value)) || Number.isNaN(parse(r.q.value)));
+  if (bad) { alert('Targets must be numbers (commas are fine).'); return; }
+  const spc = {};
+  spcInputs().forEach(r => { const v = parse(r.v.value), q = parse(r.q.value); if (v != null || q != null) spc[r.name] = { v, q }; });
+  $('#saveBtn').disabled = true; $('#saveState').textContent = 'Saving…';
+  try { await post({ month: data.month, store: data.store, spc }); st.extra = []; dirty = false; st.editing = false; await load(); toast('SPC targets saved'); }
+  catch (e) { alert(e.message || 'Could not reach the server.'); setDirty(true); }
+}
+function showEdit(on){
+  st.editing = on;
+  $('#spcEdit').hidden = !on; $('#spcAchCard').hidden = on;
+  $('#editSpc').textContent = on ? 'Done' : 'Edit SPC targets';
+  if (on) renderEdit(data);
+}
+
+/* ---------- target vs achievement maths ---------- */
+function calc(t, a, d, lvl = STORE_LEVEL){
+  const target = tv(t), got = a[st.metric];
+  const rr = d.days_data ? got / d.days_data : 0;
+  const proj = got + rr * d.days_left;
+  const o = { target, got, rr, proj, lvl };
+  if (target) {
+    o.ach = got / target * 100; o.projAch = proj / target * 100; o.bal = Math.max(0, target - got);
+    o.need90 = Math.max(0, target * lvl / 100 - got);   /* still to sell for the row's level */
+    o.req = d.days_left ? o.bal / d.days_left : null;
+  }
+  return o;
+}
+/* daily rate needed from now to reach `lvl`% of target; 0 once that level is already reached */
+const reqAt = (o, lvl, d) => (o.target && d.days_left ? Math.max(0, o.target * lvl / 100 - o.got) / d.days_left : null);
+const reqCell = (o, lvl, d) => {
+  if (!o.target) return '–';
+  if (o.ach >= lvl) return `<span class="pp up">✓ ${lvl}% reached</span>`;
+  const r = reqAt(o, lvl, d);
+  return r == null ? '–' : `${fmtM(r)}${o.rr ? ` <span class="pp ${r > o.rr ? 'down' : 'up'}">${r > o.rr ? '+' : ''}${pct((r - o.rr) / o.rr * 100)}</span>` : ''}`;
+};
+const achCls = (x, gone) => (x == null ? '' : x >= 100 ? 'up' : x >= gone ? '' : 'down');
+const projCell = o => `${fmtM(o.proj)}${o.target ? ` <span class="pp ${o.projAch >= 100 ? 'up' : o.projAch >= o.lvl ? '' : 'down'}">${pct(o.projAch)}</span>` : ''}`;
+const need90Cell = o => (!o.target ? '–' : o.ach >= o.lvl ? `<span class="ok90">✓ reached</span>` : fmtM(o.need90));
+
+function renderAch(d){
+  const gone = d.days_total ? d.days_elapsed / d.days_total * 100 : 0;
+  const o = calc(d.store_target, d.actual, d);
+  const what = d.seg ? d.seg : 'SP';
+  $('#achHead').textContent = `${what} ${isV() ? 'Value' : 'Units'} Achievement`;
+  $('#achNote').textContent = `${d.store_label} · ${d.label} · ${d.days_elapsed} of ${d.days_total} days`;
+  let h;
+  if (o.target) {
+    h = `<div class="ach-top"><b>${pct(o.ach)}</b><span>${fmtM(o.got)} of ${fmtM(o.target)}</span></div>
+      <div class="prog"><i class="${o.ach >= 100 ? 'done' : ''}" style="width:${Math.min(100, o.ach)}%"></i><b style="left:${Math.min(100, gone)}%"></b></div>
+      <div class="prog-legend"><span>Achieved ${pct(o.ach)}</span><span>Time gone ${pct(gone)}</span></div>
+      <div class="kv">
+        <div><span>Target${d.store_target_source === 'spc' ? '<small>sum of SPC targets</small>' : d.store_target_source === 'stores' ? '<small>sum of store targets</small>' : ''}</span><b>${fmtM(o.target)}</b></div>
+        <div><span>Achieved<small>${what === 'SP' ? 'smartphones only' : what + ' only'}</small></span><b>${fmtM(o.got)}</b></div>
+        <div><span>Balance</span><b>${fmtM(o.bal)}</b></div>
+        <div><span>Required for ${LEVEL}%<small>${fmtM(o.target * LEVEL / 100)} in total</small></span><b>${need90Cell(o)}</b></div>
+        <div><span>Run rate per day</span><b>${fmtM(o.rr)}</b></div>
+        <div><span>Projected month-end</span><b>${projCell(o)}</b></div>
+        ${d.days_left ? `<div><span>Required per day for ${LEVEL}%<small>${d.days_left} days left</small></span><b>${reqCell(o, LEVEL, d)}</b></div>` : ''}
+        ${o.req != null ? `<div><span>Required per day for 100%<small>${d.days_left} days left</small></span><b>${fmtM(o.req)} ${o.rr ? `<span class="pp ${o.req > o.rr ? 'down' : 'up'}">${o.req > o.rr ? '+' : ''}${pct((o.req - o.rr) / o.rr * 100)} vs current</span>` : ''}</b></div>` : ''}
+      </div>`;
+  } else {
+    h = `<div class="ach-top"><b>${fmtM(o.got)}</b><span>${what} achieved so far</span></div>
+      <p class="plan-empty">No ${what} ${isV() ? 'value' : 'units'} target for ${esc(d.store_label)} in ${esc(d.label)}.${d.editable ? ' Type it in the boxes above.' : ''}</p>
+      <div class="kv"><div><span>Run rate per day</span><b>${fmtM(o.rr)}</b></div><div><span>Projected month-end</span><b>${fmtM(o.proj)}</b></div></div>`;
+  }
+  $('#achCard').innerHTML = h;
+
+  $('#storeAch').hidden = !d.store_rows.length;
+  if (d.store_rows.length) $('#storeTable').innerHTML = achTable(d.store_rows, d, gone, 'Store', true);
+  $('#spcAch').hidden = !d.has_spc || !d.spcs.length;
+  $('#editSpc').hidden = !d.editable || !!d.seg;
+  if (d.spcs.length) $('#spcAchTable').innerHTML = achTable(d.spcs, d, gone, 'SPC', true);
+  if (st.editing && (!d.editable || d.seg)) showEdit(false);
+  renderDeep(d);
+  $('#updated').textContent = `${d.updated ? 'Updated ' + d.updated + ' · ' : ''}sales to ${new Date(d.dmax + 'T00:00:00').toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })} · targets and achievement are for smartphones (SP) only`;
+  if (window.addExportButtons) window.addExportButtons();
+}
+/* every target table carries Balance, Required for 90% (store) or 80% (SPC), per-day rates and Projected */
+function achTable(rows, d, gone, label, sortable){
+  const lvl = label === 'SPC' ? SPC_LEVEL : STORE_LEVEL;
+  const list = rows.map(r => ({ ...r, o: calc(r.t, r.a, d, lvl) }));
+  const key = { ach: r => (r.o.ach != null ? r.o.ach : -1), got: r => r.o.got, target: r => r.o.target || 0, bal: r => r.o.bal || 0,
+    need: r => r.o.need90 || 0, proj: r => r.o.proj, name: null }[st.sort] || (r => r.o.got);
+  if (sortable) list.sort((a, b) => (st.sort === 'name' ? a.name.localeCompare(b.name) : key(b) - key(a)));
+  const tot = list.reduce((s, r) => ({ t: s.t + (r.o.target || 0), g: s.g + r.o.got, b: s.b + (r.o.bal || 0), n: s.n + (r.o.need90 || 0), p: s.p + r.o.proj }), { t: 0, g: 0, b: 0, n: 0, p: 0 });
+  const th = (k, t, sub) => `<th${sortable && k ? ` data-sort="${k}" class="${st.sort === k ? 'on' : ''}"` : ''}>${t}${sub ? `<small>${sub}</small>` : ''}</th>`;
+  return `<thead><tr>${th('name', label)}${th('target', 'Target')}${th('got', 'Achieved')}${th('ach', 'Ach%')}${th('bal', 'Balance', 'to 100%')}${th('need', 'Required for ' + lvl + '%', 'still to sell')}${th('', 'Per day ' + lvl + '%')}${th('', 'Per day 100%')}${th('proj', 'Projected', 'at current rate')}</tr></thead>
+    <tbody>${list.map(r => {
+      const o = r.o;
+      return `<tr><td title="${esc(r.name)}">${esc(r.name)}${o.target ? `<div class="mini"><i class="${o.ach >= 100 ? 'done' : ''}" style="width:${Math.min(100, o.ach)}%"></i></div>` : ''}</td>
+        <td>${o.target ? fmtM(o.target) : '–'}</td><td>${fmtM(o.got)}</td>
+        <td>${o.target ? `<span class="pp ${achCls(o.ach, gone)}">${pct(o.ach)}</span>` : '–'}</td>
+        <td>${o.target ? fmtM(o.bal) : '–'}</td><td>${need90Cell(o)}</td><td>${d.days_left ? reqCell(o, lvl, d) : '–'}</td><td>${o.req != null ? fmtM(o.req) : '–'}</td>
+        <td>${projCell(o)}</td></tr>`;
+    }).join('')}</tbody>
+    <tfoot><tr><td>Total</td><td>${tot.t ? fmtM(tot.t) : '–'}</td><td>${fmtM(tot.g)}</td><td>${tot.t ? pct(tot.g / tot.t * 100) : '–'}</td><td>${tot.t ? fmtM(tot.b) : '–'}</td><td>${tot.t ? fmtM(tot.n) : '–'}</td><td>${tot.t && d.days_left ? fmtM(tot.n / d.days_left) : '–'}</td><td>${tot.t && d.days_left ? fmtM(tot.b / d.days_left) : '–'}</td><td>${fmtM(tot.p)}${tot.t ? ` <span class="pp ${tot.p >= tot.t ? 'up' : 'down'}">${pct(tot.p / tot.t * 100)}</span>` : ''}</td></tr></tfoot>`;
+}
+/* ---------- deep insights: strengths, weaknesses, focus items ---------- */
+const ppChip = x => `<span class="pp ${x > 0.05 ? 'up' : x < -0.05 ? 'down' : ''}">${x > 0 ? '+' : ''}${x.toFixed(2)}pp</span>`;
+const gr = (c, b) => (b ? (c - b) / b * 100 : null);
+const grTxt = x => (x == null ? 'new' : (x >= 0 ? '+' : '') + pct(x));
+const FLAG = /^(flagship|sp)$/i;
+const unitsTxt = n => (n >= 10 ? full(n) : n.toFixed(2).replace(/\.00$/, '')) + (Math.abs(n - 1) < 0.005 ? ' unit' : ' units');
+const sumR = (a, i, j) => a.slice(i, j).reduce((s, x) => s + (x || 0), 0);
+/* idx: 0 v, 1 q, 2 lmtd v, 3 lmtd q */
+const fmtR = v => (isV() ? compact(v) : (v || 0).toFixed(2));  // daily rates keep decimals in qty mode
+const mi = () => (isV() ? 0 : 1), li = () => (isV() ? 2 : 3);
+
+function analyse(o, a, pk, d, level, opt){
+  const S = [], W = [], F = [];
+  const gone = d.days_total ? d.days_elapsed / d.days_total * 100 : 0;
+  const lab = isV() ? 'value' : 'units';
+  const asp = a.q ? a.v / a.q : 0;
+  const daily = pk ? (isV() ? pk.dv : pk.dq) : [];
+  const n = daily.length;
+
+  /* 1. pace and month-end outcome */
+  if (o.target) {
+    const gap = o.ach - gone, pace = o.target * gone / 100;
+    if (o.ach >= 100) S.push([`Target achieved: <b>${pct(o.ach)}</b> (${fmtM(o.got)} of ${fmtM(o.target)})`, `${fmtM(o.got - o.target)} above target with ${d.days_left} day${d.days_left === 1 ? '' : 's'} still to go`, 9]);
+    else if (gap >= 0) S.push([`Ahead of pace by ${ppChip(gap)}: ${pct(o.ach)} achieved with ${pct(gone)} of the month gone`, `${fmtM(o.got - pace)} ahead of the straight-line pace`, 7]);
+    else W.push([`Behind pace by ${ppChip(gap)}: ${pct(o.ach)} achieved with ${pct(gone)} of the month gone`, `${fmtM(pace - o.got)} short of where a straight-line pace would be`, 8]);
+    if (d.days_left && o.ach < 100) {
+      if (o.projAch >= 100) S.push([`On course for <b>${pct(o.projAch)}</b> at month-end`, `projected ${fmtM(o.proj)} at the current ${fmtR(o.rr)}/day`, 6]);
+      else if (o.projAch >= level) S.push([`Projected <b>${pct(o.projAch)}</b> clears the ${level}% mark`, `100% still needs ${fmtR(o.req)}/day vs ${fmtR(o.rr)} now`, 4]);
+      else W.push([`Projected only <b>${pct(o.projAch)}</b> at month-end, below the ${level}% mark`, `${fmtM(o.proj)} projected vs ${fmtM(o.target * level / 100)} needed for ${level}%`, 9]);
+      const r = reqAt(o, level, d);
+      if (r > 0) {
+        const extra = r - o.rr, lift = o.rr ? extra / o.rr * 100 : null;
+        const u = isV() ? (asp ? extra / asp : 0) : extra;
+        F.push([`Lift daily ${lab} to <b>${fmtR(r)}</b> to reach ${level}%`, `now ${fmtR(o.rr)}/day${lift != null ? ` (${lift > 0 ? '+' : ''}${pct(lift)})` : ''}${extra > 0 && u > 0 ? `, about ${unitsTxt(u)} more a day${isV() ? ` at the ${compact(asp)} ASP` : ''}` : ''} for the last ${d.days_left} day${d.days_left === 1 ? '' : 's'}`, 10]);
+      }
+      if (o.req && o.projAch < 100 && level < 100) F.push([`For 100%, close ${fmtM(o.bal)} in ${d.days_left} day${d.days_left === 1 ? '' : 's'}`, `${fmtR(o.req)}/day needed${isV() && asp ? `, about ${unitsTxt(o.req / asp)} a day` : ''}`, 5]);
+    }
+  } else F.push([`No ${lab} target set for ${d.label}`, 'type it in the target boxes at the top of this page so pace and required rates can be tracked', 3]);
+
+  /* 2. value vs units target: premium-led or volume-led */
+  const tt = opt.t;
+  if (tt && tt.v && tt.q && a.q) {
+    const av = a.v / tt.v * 100, aq = a.q / tt.q * 100, g = av - aq, tAsp = tt.v / tt.q;
+    if (g >= 8) { S.push([`Premium-led: value ach ${pct(av)} is ahead of units ach ${pct(aq)}`, `ASP ${compact(asp)} vs ${compact(tAsp)} built into the target`, 5]); F.push([`Add volume: units are the lagging target (${pct(aq)})`, `push A-series, Tab and Wearables attach to convert footfall into units`, 6]); }
+    else if (g <= -8) { W.push([`Volume-led: units ach ${pct(aq)} but value ach only ${pct(av)}`, `ASP ${compact(asp)} vs ${compact(tAsp)} built into the target; the units are lower-priced`, 7]); F.push([`Upsell: lift ASP from ${compact(asp)} towards ${compact(tAsp)}`, 'lead with Flagship / FF8 demos and upgrade offers on every walk-in', 7]); }
+  }
+
+  /* 3. momentum: last 7 days against the earlier part of the month */
+  if (n >= 10) {
+    const last = sumR(daily, n - 7, n) / 7, early = sumR(daily, 0, n - 7) / (n - 7), ch = gr(last, early);
+    if (ch != null && ch >= 15) S.push([`Momentum building: last 7 days average ${fmtR(last)}/day`, `${grTxt(ch)} vs ${fmtR(early)}/day earlier in the month`, 6]);
+    else if (ch != null && ch <= -15) { W.push([`Slowing down: last 7 days average ${fmtR(last)}/day`, `${grTxt(ch)} vs ${fmtR(early)}/day earlier in the month`, 7]); F.push(['Restart the run rate this week', `the last 7 days are ${pct(-ch)} below the month's earlier pace`, 6]); }
+  }
+
+  /* 4. consistency and best day */
+  if (n >= 5) {
+    const zero = daily.filter(x => !x).length, best = Math.max(...daily), bi = daily.indexOf(best);
+    if (opt.spc && zero / n >= 0.3) { W.push([`No sale on ${zero} of ${n} days`, `selling on ${pct((n - zero) / n * 100)} of days; gaps cost about ${fmtM(o.rr * zero)} at the current rate`, 6]); F.push(['Convert on more days', 'aim for at least one sale every working day; follow up on open leads on quiet days', 5]); }
+    else if (opt.spc && zero === 0) S.push([`Sold every day (${n} of ${n})`, 'consistent daily conversion', 4]);
+    if (best > 0 && d.deep && d.deep.labels[bi]) {
+      const avg = sumR(daily, 0, n) / n;
+      if (best >= avg * 2.5) S.push([`Best day ${esc(d.deep.labels[bi])}: ${fmtM(best)}`, `${(best / (avg || 1)).toFixed(2)}x the daily average; repeat what worked that day`, 2]);
+    }
+  }
+
+  /* 5. growth vs LMTD */
+  if (pk && pk.lm && (pk.lm.v || pk.lm.q)) {
+    const g = gr(a[st.metric], pk.lm[st.metric]), go = gr(isV() ? a.q : a.v, isV() ? pk.lm.q : pk.lm.v);
+    if (g != null && g >= 5) S.push([`Growing ${grTxt(g)} vs LMTD`, `${fmtM(a[st.metric])} vs ${fmtM(pk.lm[st.metric])} over ${esc(d.deep.lm_range)}`, 6]);
+    else if (g != null && g <= -5) W.push([`Down ${grTxt(g)} vs LMTD`, `${fmtM(a[st.metric])} vs ${fmtM(pk.lm[st.metric])} over ${esc(d.deep.lm_range)}`, 7]);
+    if (g != null && go != null && Math.abs(g - go) >= 15) {
+      const lmAsp = pk.lm.q ? pk.lm.v / pk.lm.q : 0;
+      if (lmAsp) (asp >= lmAsp ? S : W).push([`ASP ${asp >= lmAsp ? 'up' : 'down'} ${grTxt(gr(asp, lmAsp))} vs LMTD`, `${compact(asp)} now vs ${compact(lmAsp)}; value ${grTxt(isV() ? g : go)}, units ${grTxt(isV() ? go : g)}`, 5]);
+    }
+  }
+
+  /* 6. segment mix */
+  if (pk) {
+    const segs = Object.entries(pk.segs), tot = segs.reduce((s, [, x]) => s + x[mi()], 0);
+    const flag = segs.find(([k]) => FLAG.test(k));
+    if (opt.spc && opt.store && tot) {
+      const ss = Object.entries(opt.store.segs), stot = ss.reduce((s, [, x]) => s + x[mi()], 0);
+      if (flag && stot) {
+        const own = flag[1][mi()] / tot * 100, sf = (opt.store.segs[flag[0]] || [0, 0])[mi()] / stot * 100, dpp = own - sf;
+        if (dpp >= 5) S.push([`Strong ${esc(flag[0])} mix: ${pct(own)} of ${lab}`, `store ${pct(sf)} (${ppChip(dpp)})`, 6]);
+        else if (dpp <= -5) {
+          W.push([`Weak ${esc(flag[0])} mix: ${pct(own)} of ${lab}`, `store ${pct(sf)} (${ppChip(dpp)})`, 7]);
+          F.push([`Push ${esc(flag[0])}: match the store's ${pct(sf)} mix`, `at your current ${lab} that is about ${fmtM(tot * -dpp / 100)} more ${esc(flag[0])}`, 7]);
+        }
+      }
+      /* segments the store sells that this SPC barely touches */
+      const miss = ss.filter(([k, x]) => stot && x[mi()] / stot >= 0.05 && !(pk.segs[k] && pk.segs[k][mi()])).map(([k]) => esc(k));
+      if (miss.length) { W.push([`No ${miss.join(', ')} sales yet`, 'these segments make up at least 5% of the store each', 5]); F.push([`Open ${miss.join(' / ')}`, 'cross-sell from existing smartphone buyers (Tab with S-series, Watch / Buds with every Flagship)', 5]); }
+    }
+    if (!opt.spc && tot) {
+      const lsum = segs.reduce((s, [, x]) => s + x[li()], 0);
+      if (lsum) {
+        const mv = segs.map(([k, x]) => ({ k, d: x[mi()] - x[li()], g: gr(x[mi()], x[li()]), x })).sort((p, q) => q.d - p.d);
+        if (mv[0].d > 0) S.push([`${esc(mv[0].k)} is driving growth: ${grTxt(mv[0].g)} vs LMTD`, `+${fmtM(mv[0].d)} ${lab}`, 6]);
+        const lo = mv[mv.length - 1];
+        if (lo.d < 0) { W.push([`${esc(lo.k)} is down ${grTxt(lo.g)} vs LMTD`, `${fmtM(lo.d)} ${lab}`, 7]); F.push([`Recover ${esc(lo.k)}`, `win back ${fmtM(-lo.d)} to get it back to last month's level`, 6]); }
+      }
+      if (flag) {
+        const sh = flag[1][mi()] / tot * 100;
+        (sh >= 50 ? S : W).push([`${esc(flag[0])} is ${pct(sh)} of store ${lab}`, sh >= 50 ? 'premium-heavy mix supports ASP' : 'premium mix is thin; ASP depends on mid-range', sh >= 50 ? 3 : 4]);
+      }
+    }
+  }
+
+  /* 7. products */
+  if (pk && pk.fams.length) {
+    const fams = pk.fams.filter(f => f[mi()] > 0).sort((x, y) => y[mi()] - x[mi()]), tot = fams.reduce((s, f) => s + f[mi()], 0);
+    if (fams.length && tot) {
+      const top = fams[0], sh = top[mi()] / tot * 100;
+      S.push([`Top product: ${esc(top.name)} (${fmtM(top[mi()])}, ${pct(sh)})`, `${isV() ? full(top[1]) + ' units' : compact(top[0]) + ' value'}${fams[1] ? `; next ${esc(fams[1].name)} ${fmtM(fams[1][mi()])}` : ''}`, 4]);
+      if (sh >= 45 && fams.length > 1) { W.push([`Dependent on one product: ${esc(top.name)} is ${pct(sh)} of ${lab}`, 'a slow week on this model hits the whole number', 5]); F.push(['Widen the basket', `pitch the next models alongside ${esc(top.name)}${fams[1] ? ` (e.g. ${esc(fams[1].name)})` : ''}`, 4]); }
+    }
+    const withLm = pk.fams.filter(f => f[li()] > 0);
+    if (withLm.length) {
+      const mv = pk.fams.map(f => ({ f, d: f[mi()] - f[li()] })).sort((x, y) => x.d - y.d);
+      const drop = mv[0], up = mv[mv.length - 1];
+      if (drop.d < 0) { W.push([`${esc(drop.f.name)} down ${grTxt(gr(drop.f[mi()], drop.f[li()]))} vs LMTD`, `${fmtM(drop.f[mi()])} vs ${fmtM(drop.f[li()])}`, 6]); F.push([`Recover ${esc(drop.f.name)}`, `${fmtM(-drop.d)} below last month's same days`, 6]); }
+      if (up.d > 0) S.push([`${esc(up.f.name)} up ${grTxt(gr(up.f[mi()], up.f[li()]))} vs LMTD`, `+${fmtM(up.d)}`, 5]);
+    }
+    if (opt.spc && opt.store) {
+      const own = new Set(pk.fams.filter(f => f[mi()] > 0).map(f => f.name));
+      const best = opt.store.fams.filter(f => f[mi()] > 0).sort((x, y) => y[mi()] - x[mi()]).slice(0, 6).filter(f => !own.has(f.name)).slice(0, 3);
+      if (best.length) F.push([`Sell the store's best-sellers: ${best.map(f => esc(f.name)).join(', ')}`, `none sold by this SPC yet; the store has sold ${best.map(f => `${full(f[1])} ${esc(f.name)}`).join(', ')}`, 7]);
+    }
+  }
+
+  /* 8. SPC share of target vs share of sales */
+  if (opt.spc && o.target && opt.sumT && opt.storeGot) {
+    const ts = o.target / opt.sumT * 100, ss = o.got / opt.storeGot * 100, dpp = ss - ts;
+    if (dpp >= 3) S.push([`Carrying more than their share: ${pct(ss)} of store ${lab}`, `holds ${pct(ts)} of the SPC targets (${ppChip(dpp)})`, 5]);
+    else if (dpp <= -3) W.push([`Below their share: ${pct(ss)} of store ${lab}`, `holds ${pct(ts)} of the SPC targets (${ppChip(dpp)})`, 6]);
+  }
+
+  /* 9. store only: where the balance sits */
+  if (!opt.spc && opt.spcs && o.target) {
+    const rows = opt.spcs.map(r => ({ r, o: calc(r.t, r.a, d, SPC_LEVEL) })).filter(x => x.o.target);
+    const bal = rows.reduce((s, x) => s + (x.o.bal || 0), 0);
+    if (bal > 0) {
+      const big = rows.filter(x => x.o.bal).sort((x, y) => y.o.bal - x.o.bal).slice(0, 2);
+      const share = big.reduce((s, x) => s + x.o.bal, 0) / bal * 100;
+      F.push([`${big.map(x => esc(x.r.name)).join(' and ')} hold ${pct(share)} of the SPC balance`, big.map(x => `${esc(x.r.name)} ${fmtM(x.o.bal)} to go (${pct(x.o.ach)})`).join(' · '), 8]);
+    }
+    const behind = rows.filter(x => x.o.ach < gone), ahead = rows.filter(x => x.o.ach >= gone);
+    if (ahead.length) S.push([`${ahead.length} of ${rows.length} SPCs at or ahead of pace`, ahead.map(x => `${esc(x.r.name)} ${pct(x.o.ach)}`).join(' · '), 5]);
+    if (behind.length) W.push([`${behind.length} of ${rows.length} SPCs behind pace`, behind.map(x => `${esc(x.r.name)} ${pct(x.o.ach)}`).join(' · '), 6]);
+    const below = rows.filter(x => d.days_left && x.o.projAch < SPC_LEVEL);
+    if (below.length) F.push([`Coach ${below.map(x => esc(x.r.name)).join(', ')}: projected below ${SPC_LEVEL}%`, below.map(x => `${esc(x.r.name)} needs ${fmtR(reqAt(x.o, SPC_LEVEL, d) || 0)}/day vs ${fmtR(x.o.rr)}`).join(' · '), 8]);
+  }
+  if (!opt.spc && opt.untagged && opt.untagged[st.metric] && o.got) {
+    const sh = opt.untagged[st.metric] / o.got * 100;
+    if (sh >= 3) F.push([`Tag ${pct(sh)} of ${lab} to an SPC`, `${fmtM(opt.untagged[st.metric])} has no SPC Name, so it counts for the store but for no SPC`, 4]);
+  }
+  const rank = l => l.sort((x, y) => y[2] - x[2]).slice(0, 6);
+  return { s: rank(S), w: rank(W), f: rank(F) };
+}
+function swfHtml(r){
+  const col = (cls, icon, title, list, empty) => `<div class="swf-col ${cls}"><h3><i>${icon}</i>${title}<em>${list.length}</em></h3>${list.length ? `<ol>${list.map(([t, sub]) => `<li>${t}${sub ? `<small>${sub}</small>` : ''}</li>`).join('')}</ol>` : `<p class="none">${empty}</p>`}</div>`;
+  return col('swf-s', '↑', 'Strengths', r.s, 'Nothing stands out yet.') + col('swf-w', '!', 'Weaknesses', r.w, 'No weak spots found.') + col('swf-f', '◎', 'Focus items', r.f, 'Keep the current pace.');
+}
+function verdict(o, gone, level, d){
+  if (!o.target) return ['No target', '#8e8e93'];
+  if (o.ach >= 100) return ['Achieved', '#34c759'];
+  if (!d.days_left) return [o.ach >= level ? `Above ${level}%` : `Below ${level}%`, o.ach >= level ? '#30b0c7' : '#ff3b30'];
+  if (o.projAch >= 100) return ['On track', '#34c759'];
+  if (o.projAch >= level) return [`On track for ${level}%`, '#30b0c7'];
+  return o.ach >= gone * 0.85 ? ['Needs push', '#ff9500'] : ['At risk', '#ff3b30'];
+}
+
+function renderDeep(d){
+  const dp = d.deep, gone = d.days_total ? d.days_elapsed / d.days_total * 100 : 0;
+  $('#storeIns').hidden = $('#spcIns').hidden = $('#prodAch').hidden = !dp;
+  if (!dp) return;
+  if (!dp.norm) { const nz = pk => { pk.fams = pk.fams.map(f => Object.assign(f.slice(1), { name: f[0] })); }; nz(dp.store); Object.values(dp.spc).forEach(nz); dp.norm = true; }
+  const so = calc(d.store_target, d.actual, d);
+  const sumT = d.spcs.reduce((s, r) => s + (tv(r.t) || 0), 0);
+  $('#storeInsNote').textContent = `${d.store_label} · ${d.seg || 'SP'} ${isV() ? 'value' : 'units'} · LMTD ${dp.lm_range}`;
+  $('#storeSwf').innerHTML = swfHtml(analyse(so, d.actual, dp.store, d, STORE_LEVEL, { spc: false, spcs: d.spcs, untagged: dp.untagged, t: d.store_target }));
+
+  /* SPC cards */
+  const list = d.spcs.filter(r => r.a.v || r.a.q || tv(r.t));
+  $('#spcIns').hidden = !list.length;
+  if (list.length) {
+    // one SPC at a time; it opens on the one furthest behind (lowest projected achievement, else lowest sales)
+    const behind = list.map(r => ({ r, o: calc(r.t, r.a, d, SPC_LEVEL) }))
+      .sort((x, y) => (x.o.target ? x.o.projAch : 1e9) - (y.o.target ? y.o.projAch : 1e9) || x.o.got - y.o.got);
+    if (!st.insSpc || !list.some(r => r.name === st.insSpc)) st.insSpc = behind[0].r.name;
+    $('#spcInsPick').innerHTML = behind.map(({ r }) => `<button type="button" data-ins="${esc(r.name)}" class="${st.insSpc === r.name ? 'on' : ''}">${esc(r.name)}</button>`).join('');
+    $('#spcSwf').innerHTML = list.filter(r => r.name === st.insSpc).map(r => {
+      const o = calc(r.t, r.a, d, SPC_LEVEL), [vt, vc] = verdict(o, gone, SPC_LEVEL, d);
+      const res = analyse(o, r.a, dp.spc[r.name], d, SPC_LEVEL, { spc: true, store: dp.store, sumT, storeGot: d.actual[st.metric], t: r.t });
+      return `<section class="card spc-swf"><div class="spc-head"><b>${esc(r.name)}</b><span class="verdict" style="--vc:${vc}">${vt}</span>${o.target ? `<span class="pp ${achCls(o.ach, gone)}">${pct(o.ach)} ach</span><span class="pp ${o.projAch >= 100 ? 'up' : o.projAch >= SPC_LEVEL ? '' : 'down'}">${pct(o.projAch)} projected</span>` : ''}<span class="meta">${fmtM(o.got)}${o.target ? ' of ' + fmtM(o.target) : ''} · ${fmtR(o.rr)}/day</span></div><div class="swf">${swfHtml(res)}</div></section>`;
+    }).join('');
+  }
+
+  /* product-wise for the store or one SPC, grouped under each segment */
+  const days = d.days_data || 1, tgt = tv(d.store_target);
+  const projOf = x => x + x / days * d.days_left;
+  const scopes = [['', 'Store']].concat(Object.keys(dp.spc).map(n => [n, n]));
+  if (st.prodSpc && !dp.spc[st.prodSpc]) st.prodSpc = '';
+  $('#prodPick').innerHTML = scopes.map(([k, t]) => `<button type="button" data-prod="${esc(k)}" class="${(st.prodSpc || '') === k ? 'on' : ''}">${esc(t)}</button>`).join('');
+  const pk = st.prodSpc ? dp.spc[st.prodSpc] : dp.store;
+  const fams = pk.fams.slice().sort((x, y) => y[mi()] - x[mi()] || y[li()] - x[li()]);
+  const ftot = fams.reduce((s, f) => s + f[mi()], 0), fl = fams.reduce((s, f) => s + f[li()], 0);
+  const own = st.prodSpc ? d.spcs.find(r => r.name === st.prodSpc) : null, ptgt = st.prodSpc ? tv(own && own.t) : tgt;
+  const fseg = dp.fam_seg || {};
+  const groups = {};
+  fams.forEach(f => { (groups[fseg[f.name] || 'Other'] = groups[fseg[f.name] || 'Other'] || []).push(f); });
+  const gorder = Object.keys(groups).sort((a, b) => groups[b].reduce((s, f) => s + f[mi()], 0) - groups[a].reduce((s, f) => s + f[mi()], 0));
+  const ncol = 3 + (ptgt ? 1 : 0);
+  $('#prodNote').textContent = `${st.prodSpc ? st.prodSpc : 'store'} · ${isV() ? 'value' : 'units'} · ${fams.length} products · units, share, ASP and growth are on Overview and SPC Performance`;
+  const line = f => `<tr><td title="${esc(f.name)}">${esc(f.name)}</td><td>${fmtM(f[mi()])}</td><td>${fmtM(projOf(f[mi()]))}</td>${ptgt ? `<td>${pct(projOf(f[mi()]) / ptgt * 100)}</td>` : ''}</tr>`;
+  $('#prodTable').innerHTML = `<thead><tr><th>Product</th><th>MTD</th><th>Projected<small>at the current rate</small></th>${ptgt ? '<th>Target contrib.<small>projected ÷ target</small></th>' : ''}</tr></thead>
+    <tbody>${gorder.map(g => { const fs = groups[g], gt = fs.reduce((s, f) => s + f[mi()], 0), gl = fs.reduce((s, f) => s + f[li()], 0);
+      return `<tr class="grp"><td colspan="${ncol}"><span class="grp-lab">${esc(g)}<small>${fs.length} product${fs.length === 1 ? '' : 's'} · ${fmtM(gt)} · ${ftot ? pct(gt / ftot * 100) : '–'}${gl ? ' · ' + grTxt(gr(gt, gl)) + ' vs LMTD' : ''}</small></span></td></tr>` + fs.map(line).join(''); }).join('') || '<tr><td>No sales yet</td></tr>'}</tbody>
+    <tfoot><tr><td>Total</td><td>${fmtM(ftot)}</td><td>${fmtM(projOf(ftot))}</td>${ptgt ? `<td>${pct(projOf(ftot) / ptgt * 100)}</td>` : ''}</tr></tfoot>`;
+}
+
+/* ---------- page ---------- */
+function render(){
+  const d = data;
+  $('#err').hidden = !d.error; if (d.error) { $('#err').textContent = d.error; return; }
+  $('#title').textContent = d.store_label;
+  $('#navLabel').textContent = d.label;
+  const i = d.months.indexOf(d.month);
+  $('#prevBtn').disabled = i <= 0; $('#nextBtn').disabled = i >= d.months.length - 1;
+  StorePicker.mount({ stores: d.stores, selected: d.scope, multi: false, noAll: true, note: 'Targets are set one store at a time',
+    onChange: sel => { if (!confirmLeave()) return; st.sel = sel; st.extra = []; dirty = false; load(); } });
+  syncSegs();
+  renderTop(d);
+  renderAch(d);
+  if (st.editing) renderEdit(d);
+}
+async function load(){
+  save(); syncSegs();
+  $('#wrap').classList.add('loading');
+  const q = new URLSearchParams({ seg: st.seg });
+  st.sel.forEach(s => q.append('store', s));
+  if (st.month) q.set('month', st.month);
+  try {
+    const res = await fetch('/api/targets?' + q);
+    data = await res.json();
+    if (!data.error) { st.month = data.month; st.sel = data.scope || []; st.seg = data.seg || ''; }
+    render();
+  } catch (e) {
+    data = { error: 'Could not reach the server. Please try again.' }; render();
+  } finally { $('#wrap').classList.remove('loading'); }
+}
+function go(dir){
+  if (!data || data.error || !confirmLeave()) return;
+  const i = data.months.indexOf(data.month) + dir;
+  if (i < 0 || i >= data.months.length) return;
+  st.month = data.months[i]; st.extra = []; dirty = false; load();
+}
+
+$('#prevBtn').addEventListener('click', () => go(-1));
+$('#nextBtn').addEventListener('click', () => go(1));
+$('#metricSeg').addEventListener('click', e => { const b = e.target.closest('[data-metric]'); if (b && b.dataset.metric !== st.metric) { st.metric = b.dataset.metric; save(); syncSegs(); if (data && !data.error) renderAch(data); } });
+['tV', 'tQ'].forEach(id => $('#' + id).addEventListener('input', () => { topDirty = true; $('#saveTop').disabled = false; }));
+$('#saveTop').addEventListener('click', saveTop);
+['tV', 'tQ'].forEach(id => $('#' + id).addEventListener('keydown', e => { if (e.key === 'Enter' && !$('#saveTop').disabled) saveTop(); }));
+$('#wrap').addEventListener('focusout', e => { if (e.target.matches('#tV,#tQ,#spcTable input') && e.target.value.trim()) { const v = parse(e.target.value); if (v >= 0) e.target.value = full(v); } });
+$('#spcEdit').addEventListener('input', e => { if (e.target.matches('#spcTable input')) { updateSums(); setDirty(true); } });
+$('#saveBtn').addEventListener('click', saveSpc);
+$('#editSpc').addEventListener('click', () => { if (st.editing && dirty && !confirm('Discard your SPC target changes?')) return; st.extra = []; dirty = false; showEdit(!st.editing); });
+$('#cancelSpc').addEventListener('click', () => { st.extra = []; dirty = false; showEdit(false); });
+$('#splitV').addEventListener('click', () => splitField('v'));
+$('#splitQ').addEventListener('click', () => splitField('q'));
+$('#clearSpc').addEventListener('click', () => { spcInputs().forEach(r => { r.v.value = ''; r.q.value = ''; }); updateSums(); setDirty(true); });
+$('#addSpc').addEventListener('click', () => {
+  const n = (prompt('SPC name (as it appears in the sheet):') || '').trim();
+  if (!n) return;
+  if (spcInputs().some(r => r.name.toLowerCase() === n.toLowerCase())) { alert('That SPC is already listed.'); return; }
+  const keep = Object.fromEntries(spcInputs().map(r => [r.name, [r.v.value, r.q.value]]));
+  st.extra.push(n); renderEdit(data);
+  spcInputs().forEach(r => { if (keep[r.name]) { r.v.value = keep[r.name][0]; r.q.value = keep[r.name][1]; } });
+  updateSums(); setDirty(true);
+});
+
+document.addEventListener('click', e => {
+  const s = e.target.closest('th[data-sort]');
+  if (s) { st.sort = s.dataset.sort; save(); renderAch(data); return; }
+  const ins = e.target.closest('[data-ins]');
+  if (ins) { st.insSpc = ins.dataset.ins; renderDeep(data); if (window.addExportButtons) window.addExportButtons(); return; }
+  const pr = e.target.closest('[data-prod]');
+  if (pr) { st.prodSpc = pr.dataset.prod; renderDeep(data); if (window.addExportButtons) window.addExportButtons(); }
+});
+window.addEventListener('beforeunload', e => { if (dirty || topDirty) { e.preventDefault(); e.returnValue = ''; } });
+const top = $('#top');
+window.addEventListener('scroll', () => top.classList.toggle('scrolled', window.scrollY > 4), { passive: true });
+
+syncSegs();
+load();
+})();
+"""
+
+XP_CSS = r"""
+/* admin passcode sheet (saving targets) */
+.adm-shade{position:fixed;inset:0;z-index:200;display:grid;place-items:center;padding:16px;background:rgba(0,0,0,.32);opacity:0;transition:opacity .2s}
+.adm-shade.show{opacity:1}
+.adm-sheet{width:min(360px,100%);display:grid;gap:10px;justify-items:center;padding:22px 20px 16px;border-radius:22px;text-align:center;
+  background:var(--card,var(--surface-solid,#fff));color:var(--label);box-shadow:0 20px 60px rgba(0,0,0,.35),0 0 0 .5px var(--sep,rgba(0,0,0,.15));
+  transform:scale(.92);transition:transform .35s cubic-bezier(.3,1.4,.5,1)}
+.adm-shade.show .adm-sheet{transform:none}
+.adm-ic{display:grid;place-items:center;width:44px;height:44px;border-radius:50%;background:color-mix(in srgb,var(--blue,#0a84ff) 14%,transparent);color:var(--blue,#0a84ff)}
+.adm-ic svg{width:22px;height:22px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.adm-sheet h3{margin:0;font-size:18px}
+.adm-sheet p{margin:0;font-size:13.5px;line-height:1.45;color:var(--label2,var(--label-3,#8e8e93))}
+.adm-sheet input{width:100%;height:44px;padding:0 14px;border:0;border-radius:12px;background:var(--fill,rgba(120,120,128,.12));color:var(--label);font:inherit;font-size:16px}
+.adm-sheet .adm-err{color:var(--neg,#d70015);font-weight:600}
+.adm-btns{display:flex;gap:8px;width:100%;margin-top:4px}
+.adm-btns button{flex:1;height:42px;border:0;border-radius:21px;font:inherit;font-size:15px;font-weight:600;cursor:pointer}
+.adm-no{background:var(--fill,rgba(120,120,128,.12));color:var(--label)}
+.adm-ok{background:var(--blue,#0a84ff);color:#fff}
+.adm-ok:disabled{opacity:.5}
+.sec-head h2{display:inline-flex;align-items:center;gap:8px}
+/* one rhythm on every page: 24px above a section, 10px under its heading, 12px between boxes in a row, 24px between columns */
+main .sec-head{display:flex!important;flex-wrap:wrap;align-items:center!important;justify-content:flex-start!important;column-gap:12px;row-gap:2px;margin:24px 2px 10px!important}
+main .sec-head h2{white-space:nowrap;max-width:100%;line-height:26px}
+main .sec-head > .link,main .sec-head > .sec-acts,main .sec-head > button:not(.xbtn){margin-left:auto}
+main .sec-head > .sub-note{order:3;flex-basis:100%;text-align:left!important;margin:0;line-height:1.35}
+main .kpis,main .tiles,main .rank,main .spc-models,main .ch-grid{gap:12px!important}
+main .grid2{column-gap:24px!important}
+main .card:not(.table-card):not(.list):not(.tiers){padding:14px 16px}
+.xbtn{width:26px;height:26px;flex:none;border-radius:50%;display:inline-grid;place-items:center;background:var(--fill);color:var(--blue);transition:transform .2s,opacity .2s}
+.xbtn svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}
+.xbtn:active{transform:scale(.88)}
+.xbtn.busy{opacity:.4;pointer-events:none}
+.x-wrap{position:fixed;left:-100000px;top:0;z-index:-1;display:inline-block;padding:18px;background:var(--x-canvas,#fff)}
+.x-holder{padding:22px 22px 24px;box-sizing:content-box;border-radius:24px;overflow:hidden;background:var(--card);border:1px solid color-mix(in srgb,var(--label) 12%,transparent)}
+.x-head{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;margin:0 4px 16px;padding-bottom:14px;border-bottom:1px solid var(--sep)}
+.x-title{margin:0;font-size:26px;font-weight:800;letter-spacing:-.02em;color:var(--label);line-height:1.1}
+.x-sub{margin:6px 0 0;font-size:13px;color:var(--label2)}
+.x-sub b{color:var(--label);font-weight:600}
+.x-stamp{font-size:11.5px;color:var(--label3);white-space:nowrap;text-align:right}
+.x-holder .sec-head{margin:0 4px 10px!important}
+.x-holder .x-ctx{margin:6px 0 0;font-size:12.5px;font-weight:600;color:var(--blue,#0a84ff)}
+.x-holder .x-foot{margin:16px 2px 0;padding-top:10px;border-top:.5px solid var(--sep,rgba(60,60,67,.18));font-size:11.5px;color:var(--label2)}
+.x-holder .sec-head > .sub-note{flex-basis:auto!important}
+.x-holder .card,.x-holder .kpi,.x-holder .tile,.x-holder .mcard,.x-holder .table-card{box-shadow:none!important;border:1px solid color-mix(in srgb,var(--label) 10%,transparent)}
+.x-holder .cmp th:first-child,.x-holder .cmp td:first-child{box-shadow:none!important}
+.x-holder .xbtn,.x-holder .more,.x-holder .link,.x-holder .tgt-form,.x-holder .savebar{display:none!important}
+.x-holder .tscroll,.x-holder .table-scroll,.x-holder .ch-box{overflow:visible!important;max-height:none!important}
+.x-holder .cmp th,.x-holder .cmp td:first-child{position:static!important}
+.x-holder .cmp td:first-child{max-width:none!important}
+.x-holder .sec-head:first-child{margin-top:0}
+/* an image shows everything in full: no "…", no sideways-scrolling rows, no sticky columns */
+.x-holder td,.x-holder th,.x-holder .tb-name,.x-holder .rk-name,.x-holder .name,.x-holder .meta,.x-holder .mcard li span,.x-holder .kpi small,.x-holder .kpi b{max-width:none!important;overflow:visible!important;text-overflow:clip!important}
+.x-holder .chips{flex-wrap:wrap!important;overflow:visible!important;mask-image:none!important;-webkit-mask-image:none!important}
+.x-holder .grp-lab{position:static!important}
+.x-holder .popover,.x-holder .pop,.x-holder .ctx,.x-holder [role=menu]{display:none!important}   /* menus never go into a picture */
+.x-holder [style*="position: sticky"],.x-holder .sticky{position:static!important}
+"""
+
+XP_JS = r"""
+(function(){
+/* Shared page chrome for every page: status light, help, Explore, store picker and settings in the top bar,
+   one pop-up open at a time (same look and motion for all of them), page heading and a go-to-top button. */
+if (window.__shell) return; window.__shell = true;
+const css = `
+html,body{overflow-x:clip}
+.shell{display:flex;align-items:center;gap:8px}
+.bar-right{display:flex;align-items:center;gap:8px;justify-self:end;min-width:0}
+.hbtn{height:36px;min-width:36px;border:0;padding:0 12px;border-radius:18px;display:inline-flex;align-items:center;justify-content:center;gap:6px;cursor:pointer;
+  background:var(--fill);color:var(--label);font:inherit;font-size:13.5px;font-weight:600;white-space:nowrap;transition:background .2s,transform .3s cubic-bezier(.3,1.4,.5,1)}
+.hbtn:hover{background:color-mix(in srgb,var(--label) 14%,transparent)}
+.hbtn:active{transform:scale(.92)}
+.hbtn[aria-expanded=true]{background:color-mix(in srgb,var(--blue,#0a84ff) 15%,transparent);color:var(--blue,#0a84ff)}
+.hbtn svg{width:18px;height:18px;flex:none;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.hbtn .chev-d{width:13px;height:13px;stroke-width:2.6;transition:transform .3s}
+.hbtn[aria-expanded=true] .chev-d{transform:rotate(180deg)}
+.hbtn.icon{padding:0;width:36px}
+/* toolbar icons move a little on hover and while their menu is open */
+.hbtn svg{transition:transform .55s cubic-bezier(.3,1.5,.5,1)}
+.hbtn svg *{transform-box:fill-box;transform-origin:center;transition:transform .45s cubic-bezier(.3,1.5,.5,1)}
+#gearBtn:hover svg{transform:rotate(60deg)}
+#gearBtn[aria-expanded=true] svg{transform:rotate(120deg)}
+#quickBtn:hover svg circle:nth-of-type(1),#quickBtn[aria-expanded=true] svg circle:nth-of-type(1){transform:translateX(-6px)}
+#quickBtn:hover svg circle:nth-of-type(2),#quickBtn[aria-expanded=true] svg circle:nth-of-type(2){transform:translateX(6px)}
+#exploreBtn:hover svg rect:nth-of-type(1),#exploreBtn:hover svg rect:nth-of-type(4){transform:scale(.72)}
+#exploreBtn[aria-expanded=true] svg rect{transform:scale(.82)}
+#exploreBtn:hover svg rect:nth-of-type(2),#exploreBtn:hover svg rect:nth-of-type(3){transform:scale(1.08)}
+/* the bulb lights up yellow on hover (and while the chat is open): filled glass, yellow rays, a soft glow */
+#helpBtn svg .bulb{transition:fill .25s,stroke .25s}
+#helpBtn svg .rays{opacity:0;transition:opacity .25s;stroke:#f5b400}
+#helpBtn:hover svg .rays,#helpBtn[aria-expanded=true] svg .rays{opacity:1}
+#helpBtn:hover svg .bulb{animation:bulbOn .6s ease}
+#helpBtn:hover svg .bulb,#helpBtn[aria-expanded=true] svg .bulb{fill:#ffd60a;stroke:#e0a800}
+#helpBtn:hover svg,#helpBtn[aria-expanded=true] svg{filter:drop-shadow(0 0 5px rgba(255,214,10,.75))}
+:root[data-theme=dark] #helpBtn svg .rays{stroke:#ffd60a}
+:root[data-theme=dark] #helpBtn:hover svg .bulb,:root[data-theme=dark] #helpBtn[aria-expanded=true] svg .bulb{stroke:#ffd60a}
+@keyframes bulbOn{0%,100%{transform:scale(1)}40%{transform:scale(1.12)}}
+#helpBtn[aria-expanded=true] svg{transform:scale(1.08)}
+.title-pick:hover .chev-d{transform:translateY(2px)}
+.title-pick[aria-expanded=true]:hover .chev-d{transform:rotate(180deg) translateY(2px)}
+.net-dot.warn,.net-dot.bad,.net.warn i,.net.bad i{animation:netPulse 1.6s ease-in-out infinite}
+@keyframes netPulse{50%{box-shadow:0 0 0 6px transparent}}
+@media (prefers-reduced-motion:reduce){.hbtn svg,.hbtn svg *{transition:none!important;animation:none!important;transform:none!important}.net-dot,.net i{animation:none!important}}
+.hbtn,.title-pick{position:relative}
+@media (pointer:coarse){.hbtn::before,.title-pick::before{content:"";position:absolute;inset:-4px -3px}}
+.hbtn.gear svg{fill:currentColor;stroke:none;width:20px;height:20px;transition:transform .45s cubic-bezier(.3,1.4,.5,1)}
+.hbtn.gear[aria-expanded=true] svg{transform:rotate(60deg)}
+.hbtn .cnt{min-width:18px;height:18px;padding:0 5px;border-radius:9px;background:var(--blue,#0a84ff);color:#fff;font-size:11px;line-height:18px}
+.hbtn[aria-expanded=true] .cnt{background:var(--blue,#0a84ff);color:#fff}
+#storeBtn{all:unset}
+.pop-wrap{position:relative}
+/* every pop-up: same surface, same spring */
+.ctx,.pop{position:absolute;right:0;top:calc(100% + 8px);z-index:80;min-width:240px;max-width:min(92vw,560px);max-height:min(72vh,640px);overflow:auto;overscroll-behavior:contain;
+  padding:8px;border-radius:18px;background:color-mix(in srgb,var(--card,var(--surface-solid,#fff)) 97%,transparent);-webkit-backdrop-filter:blur(30px) saturate(180%);backdrop-filter:blur(30px) saturate(180%);
+  box-shadow:0 14px 44px rgba(0,0,0,.24),0 0 0 .5px var(--sep,rgba(0,0,0,.15));text-align:left;
+  transform-origin:top right;transform:scale(.6);opacity:0;visibility:hidden;pointer-events:none;
+  transition:transform .35s cubic-bezier(.3,1.4,.5,1),opacity .2s,visibility 0s .35s}
+.ctx.show,.pop.show{transform:none;opacity:1;visibility:visible;pointer-events:auto;transition:transform .35s cubic-bezier(.3,1.4,.5,1),opacity .2s}
+.pop-title{margin:2px 6px 10px;font-size:15px;font-weight:700;color:var(--label)}
+.pop-cap{margin:10px 6px 6px;font-size:11px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:var(--label2,var(--label-3))}
+/* explore */
+.xp-pop{width:520px;--pw:330px}
+.xp-cols{display:grid;grid-template-columns:1fr 1fr;gap:2px 8px}
+.xp-item{display:grid;grid-template-columns:36px 1fr;gap:11px;align-items:center;padding:8px;border-radius:13px;color:var(--label);text-decoration:none;transition:background .15s}
+.xp-item:hover,.xp-item:focus-visible{background:var(--fill);outline:none}
+.xp-item.on{background:color-mix(in srgb,var(--blue,#0a84ff) 12%,transparent)}
+.xp-item b{display:block;font-size:14.5px;font-weight:600}
+.xp-item small{display:block;font-size:12px;color:var(--label2,var(--label-3));margin-top:1px;line-height:1.3}
+.gn-ic{width:36px;height:36px;border-radius:10px;display:grid;place-items:center;background:linear-gradient(160deg,color-mix(in srgb,var(--c) 75%,#fff),var(--c));box-shadow:0 3px 9px color-mix(in srgb,var(--c) 35%,transparent)}
+.gn-ic svg{width:20px;height:20px;fill:none;stroke:#fff;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+/* store picker */
+.sp-pick{width:340px;padding:8px;--pw:320px}
+.sp-cap{margin:2px 8px 6px;font-size:12.5px;color:var(--label2,var(--label-3))}
+.sp-search{position:sticky;top:-8px;z-index:2;margin:-8px -8px 6px;padding:8px 8px 6px;background:var(--card,var(--surface-solid,#fff))}
+.sp-search input{width:100%;height:36px;padding:0 12px 0 34px;border:0;border-radius:11px;background:var(--fill);color:var(--label);font:inherit;font-size:15px;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%238e8e93' stroke-width='2.4' stroke-linecap='round'%3E%3Ccircle cx='11' cy='11' r='7'/%3E%3Cpath d='M20 20l-3.5-3.5'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:11px center;background-size:16px}
+.sp-search input:focus{outline:2px solid var(--blue,#0a84ff)}
+.sp-row{display:grid;grid-template-columns:34px 1fr;align-items:center;border-radius:11px;min-height:42px}
+.sp-row:hover{background:var(--fill)}
+.sp-row[hidden]{display:none}
+.sp-ck{width:34px;height:42px;border:0;background:none;display:grid;place-items:center;cursor:pointer;padding:0}
+.sp-ck i{width:20px;height:20px;border-radius:6px;border:1.6px solid color-mix(in srgb,var(--label) 35%,transparent);display:grid;place-items:center;transition:background .2s,border-color .2s}
+.sp-ck[aria-pressed=true] i{background:var(--blue,#0a84ff);border-color:var(--blue,#0a84ff)}
+.sp-ck[aria-pressed=true] i::after{content:"";width:9px;height:5px;margin-top:-2px;border:2px solid #fff;border-top:0;border-right:0;transform:rotate(-45deg)}
+.sp-single .sp-ck i{border-radius:50%}
+.sp-name{border:0;background:none;text-align:left;font:inherit;font-size:15px;color:var(--label);padding:9px 8px 9px 0;cursor:pointer;line-height:1.25;min-width:0;overflow-wrap:anywhere}
+.sp-name b{font-weight:600}
+.sp-all .sp-name{font-weight:600}
+.sp-hr{height:.5px;margin:4px 6px;background:var(--sep,rgba(0,0,0,.12))}
+.sp-empty{padding:10px 8px;font-size:13px;color:var(--label2,var(--label-3))}
+.sp-foot{position:sticky;bottom:-8px;margin:6px -8px -8px;padding:8px;display:flex;align-items:center;gap:8px;background:var(--card,var(--surface-solid,#fff));border-top:.5px solid var(--sep,rgba(0,0,0,.12))}
+.sp-foot span{flex:1;font-size:12.5px;color:var(--label2,var(--label-3))}
+.sp-foot button,.sp-foot a{height:34px;padding:0 14px;border:0;border-radius:17px;font:inherit;font-size:13.5px;font-weight:600;display:inline-flex;align-items:center;text-decoration:none;cursor:pointer}
+.sp-apply{background:var(--blue,#0a84ff);color:#fff}
+.sp-cmp{background:var(--fill);color:var(--label)}
+.sp-foot .sp-clear{padding:0 10px;background:none;color:var(--blue,#0a84ff)}
+.sp-foot .sp-clear:hover{background:var(--fill)}
+.sp-foot .sp-clear + span{margin-left:-4px}
+.sp-foot :disabled,.sp-foot .off{opacity:.4;pointer-events:none}
+/* settings + help */
+.gear-pop{width:290px;--pw:300px}
+.gp-seg{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;padding:3px;border-radius:10px;background:var(--fill)}
+.gp-seg button{height:30px;border:0;border-radius:8px;background:none;color:var(--label);font:inherit;font-size:13px;font-weight:600;cursor:pointer}
+.gp-seg button[aria-pressed=true]{background:var(--card,var(--surface-solid,#fff));box-shadow:0 2px 6px rgba(0,0,0,.14)}
+.gp-rows{margin-top:10px;border-radius:12px;background:var(--fill);overflow:hidden}
+.gp-row{display:flex;align-items:center;justify-content:space-between;gap:10px;min-height:40px;padding:8px 12px;color:var(--label);font-size:14px;text-decoration:none}
+.gp-row+.gp-row{border-top:.5px solid var(--sep,rgba(0,0,0,.12))}
+.gp-row span:first-child{color:var(--label2,var(--label-3))}
+.gp-row b{font-weight:600;text-align:right}
+a.gp-row span:last-child{color:var(--label2,var(--label-3));font-size:16px}
+/* display and view choices as icon tiles */
+.gp-seg.ic{grid-template-columns:1fr 1fr;gap:5px;padding:4px;border-radius:14px}
+.gp-seg.ic button{height:60px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:5px;border-radius:11px;font-size:12px;color:var(--label2,var(--label-3))}
+.gp-seg.ic svg{width:22px;height:22px;fill:none;stroke:currentColor;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round}
+.gp-seg.ic button[aria-pressed=true]{color:var(--blue,#0a84ff)}
+.gp-seg.ic button[aria-pressed=true] span{color:var(--label)}
+/* sales data: one range, the update time, three counts */
+/* Settings → Sales data: one grouped list, label left, value right, hairlines between rows */
+.gl-list{border-radius:12px;background:var(--fill);overflow:hidden}
+.gl-row{display:flex;align-items:baseline;justify-content:space-between;gap:12px;padding:9px 12px;font-size:13.5px;color:var(--label)}
+.gl-row + .gl-row{box-shadow:inset 0 .5px 0 var(--sep,rgba(60,60,67,.18))}
+.gl-row > span{flex:none;color:var(--label)}
+.gl-row > b{min-width:0;text-align:right;font-weight:500;color:var(--label2,var(--label-3));font-variant-numeric:tabular-nums}
+.gl-row .ok{color:var(--up,#248a3d);font-weight:600}
+.gl-more{display:block;padding:0}
+.gl-more summary{display:flex;align-items:baseline;justify-content:space-between;gap:12px;padding:9px 12px;cursor:pointer;list-style:none}
+.gl-more summary::-webkit-details-marker{display:none}
+.gl-more summary b{font-weight:600;color:#c76a00;text-align:right}
+:root[data-theme=dark] .gl-more summary b{color:#ffb340}
+.gl-more summary i{font-style:normal;display:inline-block;margin-left:6px;color:var(--label2,var(--label-3));transition:transform .2s}
+.gl-more[open] summary i{transform:rotate(90deg)}
+.gl-detail{padding:0 12px 10px;font-size:12.5px;line-height:1.45;color:var(--label2,var(--label-3))}
+.gl-detail p{margin:2px 0 6px}
+.gl-detail p b{color:var(--label);font-weight:600}
+.gl-detail ul{margin:0;padding:0 10px 0 0;list-style:none;max-height:150px;overflow:auto;scrollbar-gutter:stable}
+.gl-detail li{display:flex;justify-content:space-between;gap:10px;padding:3px 0;font-variant-numeric:tabular-nums}
+.gl-detail li span{color:var(--label2,var(--label-3))}
+.gd-ic{width:34px;height:34px;border-radius:10px;display:grid;place-items:center;flex:none;color:#fff;background:linear-gradient(160deg,#64d2ff,#0a84ff)}
+.gd-ic.up{width:30px;height:30px;border-radius:9px;background:linear-gradient(160deg,#5ee17f,#34c759)}
+.gd-ic svg{width:19px;height:19px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.gp-up{display:flex;align-items:center;gap:10px;margin-top:10px;padding:9px 12px;border-radius:12px;background:var(--fill);color:var(--label);text-decoration:none;font-size:14px;font-weight:600}
+.gp-up:hover{background:color-mix(in srgb,var(--label) 10%,transparent)}
+.gp-up-t{display:grid;gap:1px;line-height:1.2}
+.gp-up-t small{font-size:11.5px;font-weight:500;color:var(--label2,var(--label-3))}
+.gp-up-t small.open{color:var(--pos,#1f8a3c)}
+.gp-up i{margin-left:auto;font-style:normal;font-weight:400;font-size:17px;color:var(--label2,var(--label-3))}
+.gp-btn{width:100%;border:0;background:none;font:inherit;text-align:left;cursor:pointer}
+.gp-btn span:last-child{color:var(--label2,var(--label-3));font-size:16px}
+.gp-btn:hover,a.gp-row:hover{background:color-mix(in srgb,var(--label) 6%,transparent)}
+.pop-back{display:inline-flex;align-items:center;gap:2px;margin:0 0 4px;padding:4px 8px 4px 2px;border:0;border-radius:8px;background:none;color:var(--blue,#0a84ff);font:inherit;font-size:13.5px;font-weight:600;cursor:pointer}
+.pop-back svg{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:2.6;stroke-linecap:round;stroke-linejoin:round;transform:rotate(90deg)}
+/* quick settings */
+.quick-pop{width:320px;--pw:310px}
+.qs-row{cursor:pointer}
+/* labelled toggles: one per row, a short label on the left, never wider than they need */
+.ctl-rows{display:grid;gap:10px;margin:2px 0 4px}
+.ctl-row{display:grid;grid-template-columns:76px minmax(0,340px);align-items:center;gap:12px}
+.ctl-lab{font-size:12.5px;font-weight:600;color:var(--label2)}
+.ctl-row .seg{margin:0!important;width:100%;max-width:none}
+@media (max-width:560px){.ctl-row{grid-template-columns:62px minmax(0,1fr);gap:10px}}
+html[data-view=phone] .ctl-row{grid-template-columns:62px minmax(0,1fr);gap:10px}
+.quick-pop{--pw:340px;width:340px}
+/* one type scale across pages: table cells, segmented toggles and chips */
+main table.cmp tbody td,main table.cmp tfoot td{font-size:13.5px!important}
+main table.cmp thead th{font-size:11px!important}
+main .seg button{font-size:13px!important}
+main .chips button{font-size:13px!important}
+.qs-row>span:first-child{min-width:0;text-align:left}
+.qs-row b{display:block;font-size:14px;font-weight:600;color:var(--label);text-align:left}
+.qs-row small{display:block;margin-top:2px;font-size:12px;color:var(--label2,var(--label-3));line-height:1.3}
+.qs-switch{position:relative;width:46px;height:28px;flex:none}
+.qs-switch input{position:absolute;inset:0;margin:0;opacity:0;cursor:pointer}
+.qs-switch i{position:absolute;inset:0;border-radius:14px;background:rgba(120,120,128,.32);transition:background .25s;pointer-events:none}
+.qs-switch i::after{content:"";position:absolute;top:2px;left:2px;width:24px;height:24px;border-radius:50%;background:#fff;box-shadow:0 2px 4px rgba(0,0,0,.25);transition:transform .25s}
+.qs-switch input:checked+i{background:#34c759}
+.qs-switch input:checked+i::after{transform:translateX(18px)}
+.qs-switch input:focus-visible+i{outline:2px solid var(--blue,#0a84ff);outline-offset:2px}
+.tg[hidden],.grp-toggles[hidden],.ch-toggles[hidden]{display:none!important}
+.qs-note{margin:10px 6px 2px;font-size:12px;color:var(--label2,var(--label-3))}
+.help-pop{width:340px}
+.help-pop ol{margin:0;padding:0 4px 0 2px;list-style:none;display:grid;gap:10px;counter-reset:t}
+.help-pop li{display:grid;grid-template-columns:24px 1fr;gap:10px;font-size:13.5px;line-height:1.45;color:var(--label)}
+.help-pop li::before{counter-increment:t;content:counter(t);width:24px;height:24px;border-radius:12px;display:grid;place-items:center;background:color-mix(in srgb,var(--blue,#0a84ff) 15%,transparent);color:var(--blue,#0a84ff);font-size:12px;font-weight:700}
+.help-pop li b{font-weight:600}
+.help-ask{display:flex;gap:6px;margin-top:12px}
+.help-ask input{flex:1;min-width:0;height:38px;padding:0 12px;border:0;border-radius:11px;background:var(--fill);color:var(--label);font:inherit;font-size:15px}
+.help-ask input:focus{outline:2px solid var(--blue,#0a84ff)}
+.help-ask button{flex:none;height:38px;padding:0 14px;border:0;border-radius:11px;background:var(--fill);color:var(--blue,#0a84ff);font:inherit;font-weight:700;cursor:pointer}
+.help-pop .got{margin-top:12px;width:100%;height:38px;border:0;border-radius:12px;background:var(--blue,#0a84ff);color:#fff;font:inherit;font-weight:600;cursor:pointer}
+/* connection status */
+.net{display:inline-flex;align-items:center;gap:7px;height:36px;padding:0 12px;border-radius:18px;background:var(--fill);font-size:12.5px;font-weight:600;color:var(--label);white-space:nowrap;cursor:default}
+.net i,.net-dot{width:9px;height:9px;border-radius:50%;background:#34c759;box-shadow:0 0 0 3px color-mix(in srgb,#34c759 25%,transparent);flex:none;transition:background .3s,box-shadow .3s}
+.net.warn i,.net-dot.warn{background:#ffcc00;box-shadow:0 0 0 3px color-mix(in srgb,#ffcc00 30%,transparent)}
+.net.bad i,.net-dot.bad{background:#ff3b30;box-shadow:0 0 0 3px color-mix(in srgb,#ff3b30 25%,transparent)}
+.net-dot{display:none;margin-right:8px}
+.net-bar{position:fixed;left:50%;top:calc(var(--hdr-h,56px) + 6px);z-index:90;max-width:calc(100% - 24px);transform:translate(-50%,-12px);opacity:0;pointer-events:none;
+  display:flex;align-items:center;gap:8px;padding:8px 14px;border-radius:14px;font-size:13px;font-weight:600;box-shadow:0 8px 24px rgba(0,0,0,.18);transition:transform .35s cubic-bezier(.3,1.4,.5,1),opacity .2s}
+.net-bar.show{transform:translate(-50%,0);opacity:1}
+.net-bar.warn{background:#fff4cc;color:#6b5100}
+.net-bar.bad{background:#ffe1df;color:#9a1209}
+.net-bar.ok{background:#d9f7e2;color:#145c2a}
+/* page heading */
+.pg-head{display:flex;align-items:center;gap:12px;margin:10px 4px 6px}
+.pg-head .gn-ic{width:40px;height:40px;border-radius:12px}
+.pg-head small{display:block;font-size:11.5px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:var(--label2,var(--label-3))}
+.pg-head h2{margin:1px 0 0;font-size:24px;font-weight:800;letter-spacing:-.02em;color:var(--label);line-height:1.15}
+.pg-head p{margin:2px 0 0;font-size:13px;color:var(--label2,var(--label-3))}
+/* go to top */
+.to-top{position:fixed;right:max(16px,calc(env(safe-area-inset-right) + 12px));bottom:calc(18px + env(safe-area-inset-bottom));z-index:70;width:46px;height:46px;border:0;border-radius:50%;display:grid;place-items:center;cursor:pointer;
+  background:var(--menu,var(--surface-solid,#fff));color:var(--blue,#0a84ff);-webkit-backdrop-filter:blur(20px) saturate(180%);backdrop-filter:blur(20px) saturate(180%);
+  box-shadow:0 8px 24px rgba(0,0,0,.2),0 0 0 .5px var(--sep,rgba(0,0,0,.15));transform:translateY(20px) scale(.8);opacity:0;pointer-events:none;transition:transform .35s cubic-bezier(.3,1.4,.5,1),opacity .2s}
+.to-top.show{transform:none;opacity:1;pointer-events:auto}
+.to-top svg{width:22px;height:22px;fill:none;stroke:currentColor;stroke-width:2.6;stroke-linecap:round;stroke-linejoin:round}
+body:has(.savebar) .to-top{bottom:calc(92px + env(safe-area-inset-bottom))}
+/* header folds to the period pill while scrolling down */
+header.top .bar{max-height:90px;transition:max-height .35s cubic-bezier(.3,.9,.3,1),opacity .25s;overflow:visible}
+header.top.compact .bar{max-height:0;opacity:0;overflow:hidden;pointer-events:none}
+header.top{transition:background .3s,box-shadow .3s}
+header.top.compact{background:transparent!important;box-shadow:none!important;-webkit-backdrop-filter:none!important;backdrop-filter:none!important;pointer-events:none}
+header.top .datenav{transition:none}
+header.top.compact .datenav{animation:pillIn .3s cubic-bezier(.2,.9,.3,1)}
+@keyframes pillIn{from{opacity:0;transform:translateY(-6px) scale(.97)}to{opacity:1;transform:none}}
+@media (prefers-reduced-motion:reduce){header.top.compact .datenav{animation:none}header.top .bar{transition:none!important}}
+/* the bar: no slab. The title sits on the page; the buttons share one glass capsule; the month navigator is its own
+   capsule; content fades under the top edge once the page scrolls. (No backdrop-filter on the header itself, so the
+   menus inside it stay positioned against the screen.) */
+:root{--chrome:rgba(255,255,255,.72);--chrome-line:rgba(60,60,67,.13)}
+:root[data-theme=dark]{--chrome:rgba(58,58,60,.62);--chrome-line:rgba(255,255,255,.1)}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){--chrome:rgba(58,58,60,.62);--chrome-line:rgba(255,255,255,.1)}}
+header.top{background:none!important;box-shadow:none!important;-webkit-backdrop-filter:none!important;backdrop-filter:none!important}
+header.top::before{content:"";position:absolute;inset:0 0 -22px 0;z-index:-1;pointer-events:none;opacity:0;transition:opacity .25s;
+  background:linear-gradient(to bottom,var(--bg) 0%,color-mix(in srgb,var(--bg) 86%,transparent) 50%,transparent 100%);
+  -webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);
+  -webkit-mask-image:linear-gradient(to bottom,#000 60%,transparent);mask-image:linear-gradient(to bottom,#000 60%,transparent)}
+header.top.scrolled::before{opacity:1}
+header.top.compact::before{opacity:0}
+/* one capsule for the toolbar buttons */
+header.top .bar-right{position:relative;isolation:isolate;gap:2px;padding:3px}
+header.top .bar-right::before{content:"";position:absolute;inset:0;z-index:-1;border-radius:22px;background:var(--chrome);
+  -webkit-backdrop-filter:blur(20px) saturate(180%);backdrop-filter:blur(20px) saturate(180%);
+  box-shadow:0 4px 16px rgba(0,0,0,.08),inset 0 1px 0 rgba(255,255,255,.35),0 0 0 .5px var(--chrome-line)}
+header.top .bar-right .hbtn,header.top .bar-right .net{background:transparent}
+header.top .bar-right .hbtn:hover{background:var(--fill)}
+header.top .bar-right .hbtn[aria-expanded=true]{background:color-mix(in srgb,var(--blue,#0a84ff) 15%,transparent);color:var(--blue,#0a84ff)}
+/* the month navigator: its own small capsule, the same one that stays when the bar folds */
+header.top .datenav{position:relative;isolation:isolate;width:max-content;max-width:calc(100% - 24px);height:42px;margin:2px auto 10px;padding:0 6px;border-radius:21px;gap:6px!important}
+header.top .datenav #navLabel{padding:0 12px;min-width:132px;text-align:center;letter-spacing:-.01em}
+header.top .datenav::before{content:"";position:absolute;inset:0;z-index:-1;border-radius:20px;background:var(--chrome);
+  -webkit-backdrop-filter:blur(20px) saturate(180%);backdrop-filter:blur(20px) saturate(180%);
+  box-shadow:0 4px 16px rgba(0,0,0,.07),inset 0 1px 0 rgba(255,255,255,.35),0 0 0 .5px var(--chrome-line)}
+header.top.compact .datenav::before{display:none}
+header.top.compact .datenav{margin:8px auto 0!important}
+header.top.compact .datenav{pointer-events:auto;width:max-content;max-width:calc(100% - 32px);height:46px;margin:8px auto 0;padding:0 8px;border-radius:23px;gap:4px!important;
+  /* liquid glass: a thin tinted body, a bright top edge and a soft sheen that fades down the capsule */
+  background:linear-gradient(180deg,rgba(255,255,255,.30),rgba(255,255,255,.04) 55%,rgba(255,255,255,.10)),color-mix(in srgb,var(--card,#fff) 32%,transparent);
+  -webkit-backdrop-filter:blur(18px) saturate(220%) brightness(1.04);backdrop-filter:blur(18px) saturate(220%) brightness(1.04);
+  box-shadow:0 6px 20px rgba(0,0,0,.12),0 1px 3px rgba(0,0,0,.06),inset 0 1px 0 rgba(255,255,255,.6),inset 0 -1px 0 rgba(255,255,255,.14),0 0 0 .5px color-mix(in srgb,var(--label) 14%,transparent)}
+header.top.compact .datenav span{min-width:0;padding:0 10px}
+/* the page name rides in the folded pill, before the period */
+.dn-page{display:none}
+header.top.compact .datenav .dn-page{display:inline-flex;align-items:center;gap:8px;min-width:0;padding:0 14px 0 4px;margin-right:4px;
+  border-right:.5px solid color-mix(in srgb,var(--label) 22%,transparent);font-size:14px;font-weight:700;color:var(--label);white-space:nowrap}
+header.top.compact .datenav .dn-page .gn-ic{width:24px;height:24px;min-width:0;padding:0;border-radius:7px;flex:none}
+header.top.compact .datenav .dn-page .gn-ic svg{width:14px;height:14px}
+header.top.compact .datenav .dn-page b{font-weight:700;overflow:hidden;text-overflow:ellipsis}
+@media (max-width:420px){header.top.compact .datenav .dn-page b{max-width:96px}}
+html[data-view=phone] header.top.compact .datenav .dn-page b{max-width:120px}
+.top-spacer{flex:none}
+.bar h1{display:flex;align-items:center;min-width:0}
+.title-wrap{min-width:0;display:flex;align-items:center;margin-left:-8px}   /* the button's padding lines the name up with the page */
+.title-wrap h1{min-width:0;overflow:visible!important}
+.title-pick{display:inline-flex;align-items:center;gap:4px;min-width:0;max-width:100%;margin:0;padding:4px 8px;border:0;border-radius:12px;
+  background:none;color:inherit;font:inherit;letter-spacing:inherit;cursor:pointer;transition:background .2s}
+.title-pick:hover,.title-pick[aria-expanded=true]{background:var(--fill)}
+.title-pick:active{transform:scale(.98)}
+.title-pick .t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.title-pick .chev-d{width:15px;height:15px;flex:none;fill:none;stroke:currentColor;stroke-width:2.6;stroke-linecap:round;stroke-linejoin:round;opacity:.65;transition:transform .3s}
+.title-pick[aria-expanded=true] .chev-d{transform:rotate(180deg)}
+.title-wrap > .ctx,.title-wrap > .pop{left:0;right:auto;transform-origin:top left}
+.bar h1 .t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pop-shade{position:fixed;inset:0;z-index:19;background:rgba(0,0,0,.06);opacity:0;pointer-events:none;transition:opacity .25s}
+.pop-shade.show{opacity:1;pointer-events:auto}
+/* phones: icon-only buttons; every pop-up becomes a full-width sheet under the bar, never cropped */
+@media (max-width:640px){
+  .hbtn .lbl,.hbtn .chev-d{display:none}
+  .hbtn{padding:0;width:36px}
+  .hbtn .cnt{position:absolute;top:-3px;right:-3px;min-width:16px;height:16px;line-height:16px;font-size:10px;padding:0 4px}
+  .hbtn{position:relative}
+  .net{display:none}
+  .net-dot{display:inline-block}
+  .bar{gap:8px!important}
+  .bar-right{gap:6px}
+  .bar h1{font-size:17px!important}
+  .title-wrap > .ctx{left:max(10px,env(safe-area-inset-left))!important;right:auto!important;transform-origin:top left!important}
+  .ctx,.pop{margin-right:env(safe-area-inset-right)}
+  .ctx,.pop{position:fixed;left:auto;right:10px;top:calc(var(--hdr-h,56px) + 6px);width:min(var(--pw,300px),calc(100vw - 20px))!important;max-width:none;
+    max-height:min(62vh,calc(100dvh - var(--hdr-h,56px) - 90px));transform-origin:top right}
+  .xp-cols{grid-template-columns:1fr 1fr;gap:0 4px}
+  .xp-item{grid-template-columns:28px 1fr;gap:8px;padding:6px}
+  .xp-item small{display:none}
+  .xp-item b{font-size:13px;line-height:1.25}
+  .xp-item .gn-ic{width:28px;height:28px;border-radius:8px}
+  .xp-item .gn-ic svg{width:16px;height:16px}
+  .pop-cap{margin:6px 6px 4px}
+  .pg-head h2{font-size:21px}
+}
+html[data-view=phone] .hbtn .lbl,html[data-view=phone] .hbtn .chev-d,html[data-view=phone] .net{display:none}
+html[data-view=phone] .hbtn{padding:0;width:36px;position:relative}
+html[data-view=phone] .hbtn .cnt{position:absolute;top:-3px;right:-3px;min-width:16px;height:16px;line-height:16px;font-size:10px;padding:0 4px}
+html[data-view=phone] .net-dot{display:inline-block}
+html[data-view=phone] .ctx,html[data-view=phone] .pop{position:fixed;left:auto;right:max(10px,calc(50% - 220px + 10px));top:calc(var(--hdr-h,56px) + 6px);
+  width:min(var(--pw,300px),calc(100vw - 20px),420px)!important;max-width:none;max-height:min(62vh,calc(100dvh - var(--hdr-h,56px) - 90px));transform-origin:top right}
+html[data-view=phone] .xp-cols{grid-template-columns:1fr 1fr;gap:0 4px}
+html[data-view=phone] .title-wrap > .ctx{left:max(10px,calc(50% - 220px + 10px))!important;right:auto!important;transform-origin:top left!important}
+html[data-view=phone] .xp-item{grid-template-columns:28px 1fr;gap:8px;padding:6px}
+html[data-view=phone] .xp-item small{display:none}
+html[data-view=phone] .xp-item b{font-size:13px;line-height:1.25}
+html[data-view=phone] .xp-item .gn-ic{width:28px;height:28px;border-radius:8px}
+html[data-view=phone] .xp-item .gn-ic svg{width:16px;height:16px}
+html[data-view=phone] body{max-width:440px;margin:0 auto;min-height:100vh;box-shadow:0 0 0 .5px var(--sep,rgba(0,0,0,.15)),0 0 80px rgba(0,0,0,.12)}
+html[data-view=phone] header.top{max-width:440px;margin:0 auto}
+html[data-view=phone] .to-top{right:calc(50% - 220px + 18px)}
+html[data-view=phone] .layout,html[data-view=phone] .eod-layout{display:block}
+html[data-view=phone] .layout.masonry>*{grid-row-end:auto!important}
+html[data-view=phone] .eod-right{position:static}
+html[data-view=phone] .kpis,html[data-view=phone] .tiles,html[data-view=phone] .eod-tiles,html[data-view=phone] .ch-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+html[data-view=phone] .grid2,html[data-view=phone] .spc-models,html[data-view=phone] .spc-ctl,html[data-view=phone] .tgt-grid{grid-template-columns:1fr}
+html[data-view=phone] .datenav span{min-width:150px}
+/* help: a ? toolbar button in the top bar; the panel is a sheet on phones and an inspector on the right on wide screens */
+#helpBtn svg{width:21px;height:21px;fill:none;stroke:currentColor;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round}
+.nav-right #helpBtn{background:var(--fill);color:var(--label)}
+/* first-visit tip, pointing at the ? */
+.help-tip{position:fixed;z-index:85;width:min(300px,calc(100vw - 20px));display:flex;gap:10px;align-items:flex-start;padding:12px 12px 12px 14px;border-radius:16px;
+  background:var(--card,var(--surface-solid,#fff));color:var(--label);box-shadow:0 14px 40px rgba(0,0,0,.22),0 0 0 .5px var(--sep,rgba(0,0,0,.15));
+  opacity:0;transform:translateY(-6px) scale(.96);transform-origin:calc(var(--ax,50%)) top;transition:opacity .2s,transform .35s cubic-bezier(.3,1.4,.5,1)}
+.help-tip.show{opacity:1;transform:none}
+.help-tip::before{content:"";position:absolute;top:-6px;left:calc(var(--ax,50%) - 7px);width:14px;height:14px;border-radius:3px 0 0 0;transform:rotate(45deg);
+  background:inherit;box-shadow:-.5px -.5px 0 var(--sep,rgba(0,0,0,.15))}
+.ht-ic{flex:none;width:30px;height:30px;border-radius:50%;display:grid;place-items:center;background:color-mix(in srgb,var(--blue,#0a84ff) 14%,transparent);color:var(--blue,#0a84ff)}
+.ht-ic svg{width:19px;height:19px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.ht-body{flex:1;min-width:0}
+.ht-body b{display:block;font-size:15px}
+.ht-body p{margin:2px 0 8px;font-size:13.5px;line-height:1.4;color:var(--label2,var(--label-3,#8e8e93))}
+.ht-open{border:0;background:none;padding:0;font:inherit;font-size:14px;font-weight:600;color:var(--blue,#0a84ff);cursor:pointer}
+.ht-x{flex:none;width:24px;height:24px;margin:-2px -2px 0 0;border:0;border-radius:50%;background:var(--fill);color:var(--label2,#6e6e73);font-size:16px;line-height:1;cursor:pointer}
+/* the help window never floats over the page: beside it on wide screens (the page moves over), below it on narrow ones (the page makes room) */
+.help-panel{position:fixed;z-index:73;display:flex;flex-direction:column;background:var(--card,var(--surface-solid,#fff));
+  box-shadow:0 0 0 .5px var(--sep,rgba(0,0,0,.15)),0 10px 40px rgba(0,0,0,.22);opacity:0;visibility:hidden;pointer-events:none;
+  transition:opacity .2s,transform .3s cubic-bezier(.3,.9,.3,1),visibility 0s .3s}
+.help-panel.show{opacity:1;visibility:visible;pointer-events:auto;transform:none;transition:opacity .2s,transform .3s cubic-bezier(.3,.9,.3,1)}
+.help-panel.resizing{transition:none;user-select:none;-webkit-user-select:none}
+.help-panel.side{top:0;bottom:0;right:0;width:var(--hp-w,380px);border-radius:20px 0 0 20px;transform:translateX(24px)}
+.help-panel.sheet{left:0;right:0;bottom:0;height:var(--hp-h,55vh);max-height:calc(100dvh - var(--hdr-h,56px) - 12px);border-radius:20px 20px 0 0;transform:translateY(24px)}
+html[data-view=phone] .help-panel.sheet{max-width:440px;margin:0 auto}
+.help-panel.show.side,.help-panel.show.sheet{transform:none}   /* settle exactly in place once open */
+html.help-side{padding-right:var(--hp-w,380px)}
+html.help-side header.top{right:var(--hp-w,380px)}
+html.help-side .to-top{right:calc(var(--hp-w,380px) + 16px)!important}
+/* narrow screens: the page becomes its own scroll area ending where the help sheet starts, so the two share the screen */
+html.help-sheet{overflow:hidden}
+html.help-sheet body,html[data-view=phone].help-sheet body{height:calc(100dvh - var(--hp-h,55vh));min-height:0;overflow-y:auto;overscroll-behavior:contain;padding-bottom:0}
+html.help-sheet .to-top{display:none}
+body.upload-page .help-panel.side{top:var(--nav-h,52px)}   /* Upload's own header stays on top */
+html.help-side body,html.help-side header.top{transition:none}
+.hp-grip{position:absolute;z-index:3;touch-action:none;outline:none}
+.help-panel.side .hp-grip{top:0;bottom:0;left:-6px;width:12px;cursor:ew-resize}
+.help-panel.sheet .hp-grip{top:0;left:0;right:0;height:22px;cursor:grab}
+.hp-grip::after{content:"";position:absolute;border-radius:3px;background:color-mix(in srgb,var(--label) 28%,transparent);transition:background .2s}
+.help-panel.side .hp-grip::after{top:50%;left:4px;width:4px;height:46px;transform:translateY(-50%)}
+.help-panel.sheet .hp-grip::after{left:50%;top:6px;width:36px;height:5px;border-radius:3px;transform:translateX(-50%)}
+.hp-grip:hover::after,.hp-grip:focus-visible::after,.help-panel.resizing .hp-grip::after{background:var(--blue,#0a84ff)}
+.help-panel.sheet .hp-head{padding-top:22px}
+.hp-size{width:30px;height:30px;border:0;border-radius:50%;background:var(--fill);color:var(--label);display:grid;place-items:center;cursor:pointer;flex:none}
+.hp-size svg{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}
+.hp-head{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:8px;padding:12px 14px 10px;border-bottom:.5px solid var(--sep,rgba(0,0,0,.12))}
+.hp-lead{display:flex;align-items:center;gap:4px;min-width:0}
+.hp-title{text-align:center;min-width:0;max-width:220px}
+.hp-title b{display:block;font-size:17px;font-weight:600;color:var(--label)}
+.hp-title small{display:block;font-size:12px;color:var(--label2,#6e6e73);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.hp-done{justify-self:end;border:0;background:none;padding:6px 2px;font:inherit;font-size:16px;font-weight:600;color:var(--blue,#0a84ff);cursor:pointer}
+.hp-clear{font-size:16px!important;font-weight:400!important;padding:6px 2px!important}
+.hp-size[hidden]{display:none}
+.hp-ic{width:32px;height:32px;border-radius:10px;display:grid;place-items:center;background:linear-gradient(160deg,#ffd60a,#ff9500);color:#fff;flex:none}
+.hp-ic svg{width:19px;height:19px;fill:none;stroke:currentColor;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}
+.hp-clear{border:0;background:none;color:var(--blue,#0a84ff);font:inherit;font-size:13.5px;font-weight:600;cursor:pointer;padding:6px}
+.hp-clear[hidden]{display:none}
+.hp-x{width:30px;height:30px;border:0;border-radius:50%;background:var(--fill);color:var(--label);font-size:20px;line-height:1;cursor:pointer}
+.hp-body{flex:1;overflow:auto;overscroll-behavior:contain;padding:10px 12px;display:flex;flex-direction:column;gap:10px}
+.hp-tips{border-radius:14px;background:var(--fill);padding:8px 12px}
+.hp-tips summary{cursor:pointer;font-size:13px;font-weight:700;color:var(--label);padding:2px 0}
+.hp-tips ol{margin:8px 0 4px;padding-left:18px;display:grid;gap:6px;font-size:13px;line-height:1.45;color:var(--label)}
+.hp-chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.hp-chips.start{margin-top:0}
+.hp-chips button{border:0;border-radius:14px;padding:7px 11px;background:color-mix(in srgb,var(--blue,#0a84ff) 12%,transparent);color:var(--blue,#0a84ff);font:inherit;font-size:12.5px;font-weight:600;text-align:left;cursor:pointer}
+.hp-msg{display:flex}
+.hp-msg.me{justify-content:flex-end}
+.hp-msg > div{max-width:92%;padding:9px 12px;border-radius:16px;font-size:14px;line-height:1.45;overflow-wrap:anywhere}
+.hp-msg.me > div{background:var(--blue,#0a84ff);color:#fff;border-bottom-right-radius:5px}
+.hp-msg.bot > div{background:var(--fill);color:var(--label);border-bottom-left-radius:5px}
+.hp-msg ol{margin:6px 0 0;padding-left:18px;display:grid;gap:4px}
+.hp-msg small{display:block;margin-top:6px;font-size:10.5px;color:var(--label2,#6e6e73)}
+.hp-msg .muted{color:var(--label2,#6e6e73)}
+.hp-link{display:inline-block;margin-top:8px;padding:6px 10px;border-radius:9px;background:var(--card,#fff);color:var(--blue,#0a84ff);font-weight:600;font-size:13px;text-decoration:none}
+.hp-read{display:flex;flex-wrap:wrap;gap:4px;margin-top:8px;font-size:11px}
+.hp-read span{padding:2px 7px;border-radius:7px;background:var(--card,#fff)}
+.hp-read i{font-style:normal;color:var(--label2,#6e6e73);margin-right:4px}
+.hp-t{margin-top:8px;border-radius:10px;max-height:220px;overflow:auto}
+.hp-t table{font-size:12px}
+.hp-msg .typing{display:flex;gap:4px;padding:12px 14px}
+.hp-msg .typing i{width:7px;height:7px;border-radius:50%;background:var(--label2,#6e6e73);animation:hpdot 1s infinite}
+.hp-msg .typing i:nth-child(2){animation-delay:.15s}
+.hp-msg .typing i:nth-child(3){animation-delay:.3s}
+@keyframes hpdot{0%,80%,100%{opacity:.25}40%{opacity:1}}
+.hp-ask{display:flex;gap:8px;padding:10px 12px 4px;border-top:.5px solid var(--sep,rgba(0,0,0,.12))}
+.hp-ask input{flex:1;min-width:0;height:40px;padding:0 14px;border:0;border-radius:20px;background:var(--fill);color:var(--label);font:inherit;font-size:16px}
+.hp-ask input:focus{outline:2px solid var(--blue,#0a84ff)}
+.hp-ask button{flex:none;width:40px;height:40px;border:0;border-radius:50%;background:var(--blue,#0a84ff);color:#fff;display:grid;place-items:center;cursor:pointer}
+.hp-ask button svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:2.6;stroke-linecap:round;stroke-linejoin:round}
+.hp-note{margin:4px 14px 10px;font-size:11px;line-height:1.35;color:var(--label2,#6e6e73)}
+@media print{.to-top,.bar-right,.help-panel,.help-tip{display:none}}`;
+const style = document.createElement('style'); style.textContent = css; document.head.appendChild(style);
+
+const store = {
+  get(k){ try { return localStorage.getItem(k); } catch (e) { return null; } },
+  set(k, v){ try { if (v == null) localStorage.removeItem(k); else localStorage.setItem(k, v); } catch (e) {} }
+};
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const root = document.documentElement;
+const hoverable = matchMedia('(hover:hover) and (pointer:fine)').matches;
+
+/* ---------- pages (Explore menu, page headings, help) ---------- */
+const TOOLS = [
+  { group: 'Insights', items: [
+    { href: '/', key: '/', title: 'Overview', desc: 'Day to year sales with LMTD, LYSMTD and more', color: '#0a84ff', icon: '<path d="M4 19V10M9 19V5M14 19v-7M19 19v-4"/>' },
+    { href: '/charts', key: '/charts', title: 'Chart Builder', desc: 'Build any chart: period, split, compare', color: '#af52de', icon: '<path d="M4 4v16h16"/><path d="M8 15l3-4 3 2 4-6"/>' },
+    { href: '/spc', key: '/spc', title: 'SPC Performance', desc: 'Each SPC: share, growth, mix, products and targets', color: '#ff9500', icon: '<circle cx="9" cy="8" r="3.2"/><path d="M3.5 19a5.5 5.5 0 0111 0"/><path d="M16 11a2.6 2.6 0 100-5M20.5 19a4.5 4.5 0 00-4-4.5"/>' },
+    { href: '/compare', key: '/compare', title: 'Comparison', desc: 'Stores, or one store\'s SPCs, side by side', color: '#5e5ce6', icon: '<path d="M4 9l1.5-5h13L20 9"/><path d="M4 9h16v2a2.7 2.7 0 01-5.3 0 2.7 2.7 0 01-5.4 0A2.7 2.7 0 014 11z"/><path d="M5.5 13.5V20h13v-6.5"/>' } ] },
+  { group: 'Plan', items: [
+    { href: '/targets', key: '/targets', title: 'Target vs Achievement', desc: 'Set SP targets, Ach%, balance, 90% and projection', color: '#34c759', icon: '<circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="4"/><circle cx="12" cy="12" r="1" fill="#fff"/>' } ] },
+  { group: 'Daily', items: [
+    { href: '/eod', key: '/eod', title: 'EOD Report', desc: 'Fill in today and send on WhatsApp', color: '#25d366', icon: '<path d="M12 3a9 9 0 00-7.8 13.5L3 21l4.6-1.2A9 9 0 1012 3z"/>' },
+    { href: '/activation', key: '/activation', title: 'Activations & Claims', desc: 'Sales waiting for activation, and claim quality', color: '#ff3b30', icon: '<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>' } ] }
+];
+const here = location.pathname.replace(/\/+$/, '') || '/';
+const page = TOOLS.flatMap(g => g.items.map(it => ({ ...it, group: g.group }))).find(it => it.key === here);
+const ico = it => `<span class="gn-ic" style="--c:${it.color}"><svg viewBox="0 0 24 24">${it.icon}</svg></span>`;
+const SVG = {
+  chev: '<svg class="chev-d" viewBox="0 0 24 24"><path d="M7 10l5 5 5-5"/></svg>',
+  grid: '<svg viewBox="0 0 24 24"><rect x="4" y="4" width="7" height="7" rx="2"/><rect x="13" y="4" width="7" height="7" rx="2"/><rect x="4" y="13" width="7" height="7" rx="2"/><rect x="13" y="13" width="7" height="7" rx="2"/></svg>',
+  store: '<svg viewBox="0 0 24 24"><path d="M4 9l1.5-5h13L20 9"/><path d="M4 9h16v2a2.7 2.7 0 01-5.3 0 2.7 2.7 0 01-5.4 0A2.7 2.7 0 014 11z"/><path d="M5.5 13.5V20h13v-6.5M10 20v-4h4v4"/></svg>',
+  help: '<svg viewBox="0 0 24 24"><path class="bulb" d="M9 17.5h6M10 20.5h4M12 3a6 6 0 00-3.6 10.8c.7.6 1.1 1.4 1.1 2.3v.4h5v-.4c0-.9.4-1.7 1.1-2.3A6 6 0 0012 3z"/><path class="rays" d="M12 .9v.6M3.6 4.4l.5.4M20.4 4.4l-.5.4M1.5 10.5h.7M21.8 10.5h.7"/></svg>',   // light bulb: ideas and help
+  sliders: '<svg viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/></svg>',
+  gear: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13.6 2.5l.4 2.3a7.6 7.6 0 012 .8l1.9-1.4 2.3 2.3-1.4 1.9c.3.6.6 1.3.8 2l2.3.4v3.2l-2.3.4a7.6 7.6 0 01-.8 2l1.4 1.9-2.3 2.3-1.9-1.4c-.6.3-1.3.6-2 .8l-.4 2.3h-3.2l-.4-2.3a7.6 7.6 0 01-2-.8l-1.9 1.4-2.3-2.3 1.4-1.9a7.6 7.6 0 01-.8-2l-2.3-.4v-3.2l2.3-.4c.2-.7.5-1.4.8-2L3.8 6.5l2.3-2.3 1.9 1.4c.6-.3 1.3-.6 2-.8l.4-2.3zM12 8.6a3.4 3.4 0 100 6.8 3.4 3.4 0 000-6.8z"/></svg>',
+};
+
+const HELP = {
+  '/': ['Pick <b>Day, Week, Month, Qtr, Year</b> or <b>All</b>; the arrows step back and forward.', 'Every number is compared with LMTD, LLMTD and LYSMTD; switch the base with the <b>vs</b> pills.', 'Tap a bar in the chart for its segment split and last year.', 'Run Rate &amp; Target shows smartphone (SP) achievement for the month.'],
+  '/charts': ['Choose the period, chart type and measure at the top.', 'X axis and <b>Split by</b> build any breakdown: model by store, SPC by week…', 'Compare adds the previous period or last year as a dashed line.'],
+  '/spc': ['See each SPC\'s share of the store, growth and product mix.', 'Tap a table heading to sort; tap a legend name to highlight that SPC.'],
+  '/compare': ['Tick two or more stores in <b>Stores</b> and tap <b>Compare</b>, or compare every store at once.', 'Growth uses the same days last month (or last year).', 'Target columns are for smartphones (SP) only.'],
+  '/targets': ['Type the month\'s SP value and units targets at the top; they are split equally across SPCs when you save.', 'Targets are SP as a whole. <b>Required for</b> means 90% of the store target and 80% of each SPC target.', 'Tables show Balance, Required for 90% and Projected for every row.'],
+  '/eod': ['Type today\'s figures; month-to-date comes from the sheet plus what you type.', 'Search the model name in Today\'s Models Sold.', 'Share sends the report to WhatsApp or copies it.'],
+  '/activation': ['Every sale with no Activation Date, oldest first.', 'Days pending count from the sale date to today.', 'Use Stores to see one store, or search for an SPC or model.'],
+  '/ask': ['Ask in plain English: "top 5 SPCs last month", "Fold 8 units vs last month in Adyar".', 'Name the period, store, SPC, model or segment and I pick it up.', 'Selected stores in <b>Stores</b> are used when the question names none.'],
+};
+const GENERAL_TIPS = ['<b>Explore</b> opens every page.', '<b>Stores</b> lets you search, pick one store or tick several to add them up or compare them.', 'The light in the top bar shows the connection: green online, yellow server offline, red no internet.', 'Quick settings (the sliders) turns <b>SP combined</b>, <b>Foldables grouped</b> (FF7…) and <b>S series grouped</b> (S26F…) on or off for every page.', 'Settings (gear) has the theme, layout and the dates your sales sheet covers.', 'The <b>?</b> button at the bottom left opens this help on any page: ask how to do anything, or ask about your sales.'];
+const HELP_STARTERS = {
+  '/': ['How does the Overview page work?', 'How do I set the SP target for a store?'],
+  '/charts': ['How do I build a chart?', 'How do I save a section as an image?'],
+  '/spc': ['What does the SPC Performance page show?', 'How do I set SPC targets?'],
+  '/compare': ['How do I compare stores side by side?', 'How are Ach%, balance, required for 90% / 80% and projection worked out?'],
+  '/targets': ['How do I set SPC targets?', 'How are Ach%, balance, required for 90% / 80% and projection worked out?', "Why can't I edit targets?"],
+  '/eod': ['How do I fill in the EOD report?', 'How do I send the EOD report on WhatsApp?', 'What are MX, Store MTD and Care+ attach%?'],
+  '/activation': ['What is Activations & Claims?', 'Which sales rows are counted?'],
+};
+
+/* ---------- build the top bar ---------- */
+const bar = document.querySelector('header.top .bar');
+const right = document.createElement('div'); right.className = 'bar-right';
+const oldMenu = bar ? bar.querySelector(':scope > .menu') : null;
+const storeMenu = document.getElementById('storeMenu');
+const hasQuick = !!bar;   // every page with the top bar: measure, comparison, numbers and charts apply everywhere
+// left to right = least to most used, so the button reached for most (Explore) sits at the edge, where the thumb lands
+right.innerHTML = `<span class="net" id="netPill" role="status" aria-live="polite" title="Connection"><i></i><span id="netText">Online</span></span>
+  ${here !== '/ask' ? `<button type="button" class="hbtn icon" id="helpBtn" aria-label="Help" aria-expanded="false" aria-controls="helpPanel" title="Help  (press ?)">${SVG.help}</button>` : ''}
+  <div class="pop-wrap"><button type="button" class="hbtn icon gear" id="gearBtn" aria-label="Settings" aria-expanded="false" title="Settings">${SVG.gear}</button>
+    <div class="pop gear-pop" id="gearPop" role="dialog" aria-label="Settings"></div></div>
+  ${hasQuick ? `<div class="pop-wrap"><button type="button" class="hbtn icon" id="quickBtn" aria-label="Quick settings" aria-expanded="false" title="Quick settings">${SVG.sliders}</button>
+    <div class="pop quick-pop" id="quickPop" role="dialog" aria-label="Quick settings"></div></div>` : ''}
+  <div class="pop-wrap"><button type="button" class="hbtn" id="exploreBtn" aria-expanded="false" aria-haspopup="true" title="Explore: all pages">${SVG.grid}<span class="lbl">Explore</span>${SVG.chev}</button>
+    <div class="pop xp-pop" id="explorePop" role="menu" aria-label="Explore"></div></div>`;
+const navHost = !bar && document.querySelector('header.nav .nav-right');   // Upload has its own small header: same buttons there
+if (navHost) navHost.appendChild(right);
+if (bar) {
+  bar.appendChild(right);
+  if (oldMenu) oldMenu.remove();
+  const h1 = bar.querySelector('h1');
+  if (h1 && !h1.querySelector('.t')) {
+    const txt = h1.textContent; h1.textContent = '';
+    if (storeMenu) {   // the store name is the store picker: tap it (or hover on a computer) to change store
+      const wrap = document.createElement('div'); wrap.className = 'pop-wrap title-wrap';
+      h1.replaceWith(wrap); wrap.appendChild(h1);
+      h1.insertAdjacentHTML('beforeend', `<span class="net-dot" id="netDot" title="Connection"></span><button type="button" class="title-pick" id="storePick" aria-haspopup="true" aria-expanded="false"><span class="t"></span>${SVG.chev}</button>`);
+      storeMenu.classList.add('sp-pick'); wrap.appendChild(storeMenu);
+    } else {
+      h1.insertAdjacentHTML('beforeend', `<span class="net-dot" id="netDot" title="Connection"></span><span class="t"></span>`);
+    }
+    h1.querySelector('.t').textContent = txt;
+    // pages keep writing h1.textContent: route that to the inner span so the status light stays
+    const tspan = h1.querySelector('.t');
+    Object.defineProperty(h1, 'textContent', { configurable: true, get(){ return tspan.textContent; }, set(v){ tspan.textContent = v; } });
+  }
+}
+const shade = document.createElement('div'); shade.className = 'pop-shade'; document.body.appendChild(shade);
+
+/* ---------- one pop-up at a time ---------- */
+const POPS = [];
+let openPop = null;
+const small = () => matchMedia('(max-width:640px)').matches || root.dataset.view === 'phone';
+function setOpen(pop, on){
+  const p = POPS.find(x => x.pop === pop); if (!p) return;
+  if (on) { POPS.forEach(x => { if (x !== p) setOpen(x.pop, false); }); if (helpPanel.classList.contains('show')) hpOpen(false); }   // one floating layer at a time
+  p.pop.classList.toggle('show', on); p.btn.setAttribute('aria-expanded', String(on));
+  if (on) { openPop = p; if (p.onOpen) p.onOpen(); } else if (openPop === p) openPop = null;
+  shade.classList.toggle('show', !!openPop && small());
+}
+function register(btn, pop, onOpen){
+  if (!btn || !pop) return;
+  const p = { btn, pop, onOpen }; POPS.push(p);
+  btn.addEventListener('click', e => { e.stopPropagation(); setOpen(pop, !pop.classList.contains('show')); });
+  if (hoverable) {   /* hover opens on a computer; leaving both the button and the pop-up closes it */
+    let t = null;
+    [btn, pop].forEach(el => {
+      el.addEventListener('mouseenter', () => { clearTimeout(t); t = setTimeout(() => setOpen(pop, true), openPop && openPop !== p ? 0 : 90); });
+      el.addEventListener('mouseleave', () => { clearTimeout(t); t = setTimeout(() => { if (!pop.contains(document.activeElement) || document.activeElement.type !== 'search') setOpen(pop, false); }, 260); });
+    });
+    btn.addEventListener('click', e => { if (pop.classList.contains('show') && Date.now() - (p.t || 0) < 400) { e.stopImmediatePropagation(); } }, true);
+    pop.addEventListener('transitionstart', () => { p.t = Date.now(); });
+  }
+}
+document.addEventListener('click', e => {
+  if (!openPop || !e.isTrusted) return;   // clicks the menus make for you (e.g. Quick settings) don't close them
+  // the path as it was when clicked: a choice that redraws the menu is still a click inside it
+  const path = e.composedPath ? e.composedPath() : [e.target];
+  if (!path.includes(openPop.pop) && !path.includes(openPop.btn)) setOpen(openPop.pop, false);
+});
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && openPop) { const b = openPop.btn; setOpen(openPop.pop, false); b.focus(); } });
+shade.addEventListener('click', () => { if (openPop) setOpen(openPop.pop, false); });
+/* page-made pop-ups (EOD share menu, chart menus) also close the others */
+new MutationObserver(ms => ms.forEach(m => {
+  const el = m.target;
+  if (!el.classList.contains('show') || !el.matches('.ctx,.chart-more-menu') || POPS.some(p => p.pop === el)) return;
+  if (openPop) setOpen(openPop.pop, false);
+  document.querySelectorAll('.ctx.show,.chart-more-menu.show').forEach(o => { if (o !== el) o.classList.remove('show'); });
+})).observe(document.body, { subtree: true, attributes: true, attributeFilter: ['class'] });
+
+/* ---------- Explore ---------- */
+const xp = document.getElementById('explorePop');
+xp.innerHTML = `<div class="xp-cols">${TOOLS.map(g => `<div><div class="pop-cap">${g.group}</div>${g.items.map(it => `
+  <a class="xp-item${it.key === here ? ' on' : ''}" href="${it.href}" role="menuitem">${ico(it)}<span><b>${it.title}</b><small>${it.desc}</small></span></a>`).join('')}</div>`).join('')}</div>`;
+register(document.getElementById('exploreBtn'), xp);
+
+/* ---------- folded header: the page name rides in the same glass pill as the period ---------- */
+const dnav = document.querySelector('header.top .datenav');
+if (dnav && page && !dnav.querySelector('.dn-page')) {
+  dnav.insertAdjacentHTML('afterbegin', `<span class="dn-page" aria-hidden="true">${ico(page)}<b>${esc(page.title)}</b></span>`);
+}
+
+/* ---------- page heading (the topic from Explore) ---------- */
+const main = document.querySelector('main.wrap');
+if (page && main && !document.querySelector('.pg-head')) {
+  main.insertAdjacentHTML('afterbegin', `<header class="pg-head">${ico(page)}<div><small>${page.group}</small><h2>${page.title}</h2></div></header>`);
+}
+
+/* ---------- help: a ? button on every page opens a help chat right there ---------- */
+const tips = (HELP[here] || []).concat(GENERAL_TIPS);
+const HELP_CHAT = 'help-chat';
+const ss = { get(k){ try { return sessionStorage.getItem(k); } catch (e) { return null; } }, set(k, v){ try { sessionStorage.setItem(k, v); } catch (e) {} } };
+/* answers may carry <b> and <span class="muted"> only; everything else is shown as text */
+const safeHtml = s => esc(s).replace(/&lt;(\/?)b&gt;/g, '<$1b>').replace(/&lt;span class=(?:&#39;|&quot;)muted(?:&#39;|&quot;)&gt;/g, '<span class="muted">').replace(/&lt;\/span&gt;/g, '</span>');
+let hMsgs = [], hBusy = false;
+try { hMsgs = JSON.parse(ss.get(HELP_CHAT) || '[]'); } catch (e) {}
+/* the ? lives in the top bar; pages with their own small header (Upload) get it there */
+const helpBtn = document.getElementById('helpBtn') || (() => {
+  const b = document.createElement('button');
+  b.type = 'button'; b.className = 'hbtn icon'; b.id = 'helpBtn'; b.title = 'Help  (press ?)';
+  b.setAttribute('aria-label', 'Help'); b.setAttribute('aria-expanded', 'false'); b.setAttribute('aria-controls', 'helpPanel');
+  b.innerHTML = SVG.help;
+  const host = document.querySelector('.nav-right'); if (host) host.appendChild(b);
+  return b;
+})();
+const helpPanel = document.createElement('section');
+helpPanel.className = 'help-panel'; helpPanel.id = 'helpPanel';
+helpPanel.setAttribute('role', 'dialog'); helpPanel.setAttribute('aria-label', 'Help');
+helpPanel.innerHTML = `<div class="hp-grip" id="hpGrip" role="separator" tabindex="0" aria-label="Resize help (arrow keys)" title="Drag to resize"></div>
+  <header class="hp-head"><span class="hp-lead"><button type="button" class="hp-clear" id="hpClear">Clear</button>
+      <button type="button" class="hp-size" id="hpSize" aria-label="Wider help" title="Wider / narrower"></button></span>
+    <div class="hp-title"><b>Help</b><small>${page ? esc(page.title) : 'This page'}</small></div>
+    <button type="button" class="hp-done" id="hpClose">Done</button></header>
+  <div class="hp-body" id="hpBody"></div>
+  <form class="hp-ask" id="hpAsk" autocomplete="off"><input type="text" id="hpIn" enterkeyhint="send" placeholder="Ask how to… or about your sales" aria-label="Ask a question">
+    <button type="submit" aria-label="Send"><svg viewBox="0 0 24 24"><path d="M5 12h13M13 6l6 6-6 6"/></svg></button></form>
+  <p class="hp-note">How-to answers come from the app's built-in guide. Sales answers come only from your uploaded sheet.</p>`;
+const hpBody = helpPanel.querySelector('#hpBody');
+function hpTable(t){
+  if (!t || !t.cols) return '';
+  return `<div class="tscroll hp-t"><table class="cmp"><thead><tr>${t.cols.map(c => `<th>${esc(c)}</th>`).join('')}</tr></thead><tbody>${t.rows.slice(0, 12).map(r => `<tr>${r.map(c => `<td>${esc(c)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
+}
+function hpBubble(m){
+  if (m.role === 'user') return `<div class="hp-msg me"><div>${esc(m.content)}</div></div>`;
+  const steps = (m.steps || []).length ? `<ol>${m.steps.map(x => `<li>${safeHtml(x)}</li>`).join('')}</ol>` : '';
+  const read = (m.read || []).length ? `<div class="hp-read">${m.read.map(([k, v]) => `<span><i>${esc(k)}</i>${esc(v)}</span>`).join('')}</div>` : '';
+  return `<div class="hp-msg bot${m.help ? ' guide' : ''}"><div>${safeHtml(m.content)}${steps}${hpTable(m.table)}${read}
+    ${m.link ? `<a class="hp-link" href="${esc(m.link)}">${esc(m.link_label || 'Open')} ›</a>` : ''}
+    ${(m.chips || []).length ? `<div class="hp-chips">${m.chips.map(c => `<button type="button" data-hq="${esc(c)}">${esc(c)}</button>`).join('')}</div>` : ''}
+    <small>${m.help ? 'App guide' : 'From your uploaded sheet'}</small></div></div>`;
+}
+function hpPaint(){
+  const starters = (HELP_STARTERS[here] || []).concat(['How do I pick one store or several stores?', 'What do LMTD, LLMTD and LYSMTD mean?']).slice(0, 4);
+  hpBody.innerHTML = `<details class="hp-tips"${hMsgs.length ? '' : ' open'}><summary>Tips for ${page ? esc(page.title) : 'this page'}</summary>
+      <ol>${tips.map(t => `<li>${t}</li>`).join('')}</ol></details>`
+    + (hMsgs.length ? '' : `<div class="hp-chips start">${starters.map(c => `<button type="button" data-hq="${esc(c)}">${esc(c)}</button>`).join('')}</div>`)
+    + hMsgs.map(hpBubble).join('') + (hBusy ? '<div class="hp-msg bot"><div class="typing"><i></i><i></i><i></i></div></div>' : '');
+  helpPanel.querySelector('#hpClear').hidden = !hMsgs.length;
+  ss.set(HELP_CHAT, JSON.stringify(hMsgs.slice(-30)));
+  requestAnimationFrame(() => { hpBody.scrollTop = hpBody.scrollHeight; });
+}
+async function hpAsk(q){
+  q = (q || '').trim(); if (!q || hBusy) return;
+  hMsgs.push({ role: 'user', content: q }); hBusy = true; hpPaint();
+  try {
+    const res = await fetch('/api/ask', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ q, page: here, stores: readSel(), history: hMsgs.slice(-7, -1).map(m => ({ role: m.role, content: String(m.content).replace(/<[^>]+>/g, '') })) }) });
+    const r = await res.json();
+    hMsgs.push({ role: 'assistant', content: r.error || r.text || 'No answer.', steps: r.steps, table: r.table, chips: r.chips, link: r.link, link_label: r.link_label, read: r.read, help: r.help });
+  } catch (e) { hMsgs.push({ role: 'assistant', content: 'I could not reach the server. Check the connection light at the top and try again.' }); }
+  hBusy = false; hpPaint();
+}
+function hpOpen(on){
+  if (on && openPop) setOpen(openPop.pop, false);   // one floating layer at a time
+  helpPanel.classList.toggle('show', on); helpBtn.setAttribute('aria-expanded', String(on));
+  hpLayout();
+  if (on) { tipClose(); hpPaint(); if (hoverable) setTimeout(() => helpPanel.querySelector('#hpIn').focus(), 200); }
+  else if (helpPanel.contains(document.activeElement)) helpBtn.focus();
+}
+/* the help window docks: beside the page when there is room for both (the page moves over), else as a sheet below it (the page makes room) */
+const HP = { w: +store.get('help-w') || 380, h: +store.get('help-h') || 0 };
+const ICON_GROW = '<svg viewBox="0 0 24 24"><path d="M14 4h6v6M10 20H4v-6M20 4l-7 7M4 20l7-7"/></svg>';
+const ICON_SHRINK = '<svg viewBox="0 0 24 24"><path d="M20 10h-6V4M4 14h6v6M14 10l7-7M10 14l-7 7"/></svg>';
+const hdrH = () => parseFloat(getComputedStyle(root).getPropertyValue('--hdr-h')) || 56;
+function hpBounds(){
+  return { wMin: 300, wMax: Math.max(300, Math.min(640, innerWidth - 640)), hMin: 220, hMax: Math.max(220, innerHeight - hdrH() - 12) };
+}
+function hpLayout(){
+  const open = helpPanel.classList.contains('show'), b = hpBounds();
+  const wasSheet = root.classList.contains('help-sheet'), y = wasSheet ? document.body.scrollTop : scrollY;   // keep the reading position
+  HP.w = Math.max(b.wMin, Math.min(b.wMax, HP.w));
+  HP.h = Math.max(b.hMin, Math.min(b.hMax, HP.h || Math.round(innerHeight * 0.55)));
+  const side = innerWidth - HP.w >= 640;   // the page keeps at least 640px beside the help window
+  helpPanel.classList.toggle('side', side); helpPanel.classList.toggle('sheet', !side);
+  root.style.setProperty('--hp-w', HP.w + 'px'); root.style.setProperty('--hp-h', HP.h + 'px');
+  root.classList.toggle('help-open', open);
+  root.classList.toggle('help-side', open && side);
+  root.classList.toggle('help-sheet', open && !side);
+  const isSheet = root.classList.contains('help-sheet');
+  if (isSheet !== wasSheet) { if (isSheet) document.body.scrollTop = y; else scrollTo(0, y); }
+  const big = side ? HP.w >= Math.min(b.wMax, 520) : HP.h >= b.hMax - 4;
+  const sz = helpPanel.querySelector('#hpSize');
+  sz.innerHTML = big ? ICON_SHRINK : ICON_GROW; sz.setAttribute('aria-label', big ? 'Narrower help' : 'Wider help');
+  sz.hidden = !side;   // a phone sheet is sized with its grabber instead
+  hpGrip.setAttribute('aria-label', side ? 'Resize help (arrow keys)' : 'Resize help: drag, or tap for medium / large; drag down to close');
+}
+function hpSave(){ store.set('help-w', String(Math.round(HP.w))); store.set('help-h', String(Math.round(HP.h))); }
+const hpGrip = helpPanel.querySelector('#hpGrip');
+const hpDetent = () => { const b = hpBounds(), mid = Math.round(innerHeight * 0.55); HP.h = HP.h >= b.hMax - 4 ? mid : b.hMax; hpLayout(); hpSave(); };
+hpGrip.addEventListener('pointerdown', e => {
+  e.preventDefault(); hpGrip.setPointerCapture(e.pointerId);
+  const side = helpPanel.classList.contains('side'), x0 = e.clientX, y0 = e.clientY, w0 = HP.w, h0 = HP.h;
+  let pull = 0, moved = false;
+  helpPanel.classList.add('resizing');
+  const move = ev => {
+    if (Math.abs(ev.clientX - x0) + Math.abs(ev.clientY - y0) > 4) moved = true;
+    if (side) { HP.w = w0 - (ev.clientX - x0); hpLayout(); return; }
+    const want = h0 - (ev.clientY - y0), min = hpBounds().hMin;
+    pull = Math.max(0, min - want);   // dragged below the smallest size: the sheet follows the finger down
+    HP.h = want; hpLayout(); helpPanel.style.transform = pull ? `translateY(${pull}px)` : '';
+  };
+  const up = () => {
+    hpGrip.removeEventListener('pointermove', move); hpGrip.removeEventListener('pointerup', up); hpGrip.removeEventListener('pointercancel', up);
+    helpPanel.classList.remove('resizing'); helpPanel.style.transform = '';
+    if (!side && pull > 70) { HP.h = h0; hpOpen(false); }
+    else if (!side && !moved) hpDetent();   // a tap on the grabber: medium <-> large
+    hpSave();
+  };
+  hpGrip.addEventListener('pointermove', move); hpGrip.addEventListener('pointerup', up); hpGrip.addEventListener('pointercancel', up);
+});
+hpGrip.addEventListener('keydown', e => {
+  const side = helpPanel.classList.contains('side');
+  if (!side && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); hpDetent(); return; }
+  const d = { ArrowLeft: 24, ArrowRight: -24, ArrowUp: 24, ArrowDown: -24 }[e.key];
+  if (d == null || (side && /Up|Down/.test(e.key)) || (!side && /Left|Right/.test(e.key))) return;
+  e.preventDefault();
+  if (side) HP.w += d; else HP.h += d;
+  hpLayout(); hpSave();
+});
+helpPanel.querySelector('#hpSize').addEventListener('click', () => {
+  const b = hpBounds();
+  if (helpPanel.classList.contains('side')) HP.w = HP.w >= Math.min(b.wMax, 520) ? 380 : b.wMax;
+  else HP.h = HP.h >= b.hMax - 4 ? Math.round(innerHeight * 0.55) : b.hMax;
+  hpLayout(); hpSave();
+});
+/* first visit: a small tip points at the ? (like TipKit) instead of opening help uninvited */
+let helpTip = null;
+function tipClose(){ if (helpTip) { helpTip.remove(); helpTip = null; store.set('ap-tips-seen', '1'); } }
+function tipShow(){
+  const r = helpBtn.getBoundingClientRect();
+  if (!r.width || (head && head.classList.contains('compact'))) return;
+  helpTip = document.createElement('div'); helpTip.className = 'help-tip'; helpTip.setAttribute('role', 'dialog'); helpTip.setAttribute('aria-label', 'Tip');
+  helpTip.innerHTML = `<span class="ht-ic">${SVG.help}</span><div class="ht-body"><b>Help is here</b><p>Ask how to do anything on this page, or ask about your sales.</p>
+    <button type="button" class="ht-open">Open Help</button></div><button type="button" class="ht-x" aria-label="Dismiss tip">×</button>`;
+  document.body.appendChild(helpTip);
+  const w = helpTip.offsetWidth, x = Math.max(10, Math.min(innerWidth - w - 10, r.left + r.width / 2 - w + 34));
+  helpTip.style.left = x + 'px'; helpTip.style.top = (r.bottom + 12) + 'px';
+  helpTip.style.setProperty('--ax', (r.left + r.width / 2 - x) + 'px');
+  helpTip.querySelector('.ht-x').addEventListener('click', tipClose);
+  helpTip.querySelector('.ht-open').addEventListener('click', () => hpOpen(true));
+  requestAnimationFrame(() => helpTip && helpTip.classList.add('show'));
+}
+if (here !== '/ask') {   // Ask Data is itself the chat
+  document.body.append(helpPanel);
+  hpLayout();
+  let rt = null;
+  addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(() => { hpLayout(); tipClose(); }, 80); });
+  addEventListener('scroll', () => { if (helpTip) tipClose(); }, { passive: true });
+  helpBtn.addEventListener('click', e => { e.stopPropagation(); hpOpen(!helpPanel.classList.contains('show')); });
+  // "?" opens and closes help from anywhere except a text box (like the Help shortcut on a Mac)
+  document.addEventListener('keydown', e => {
+    if (e.key !== '?' || e.metaKey || e.ctrlKey || e.altKey || e.target.closest('input,textarea,select,[contenteditable]')) return;
+    e.preventDefault(); hpOpen(!helpPanel.classList.contains('show'));
+  });
+  helpPanel.querySelector('#hpClose').addEventListener('click', () => hpOpen(false));
+  helpPanel.querySelector('#hpClear').addEventListener('click', () => { hMsgs = []; hpPaint(); });
+  helpPanel.querySelector('#hpAsk').addEventListener('submit', e => { e.preventDefault(); const i = helpPanel.querySelector('#hpIn'); const v = i.value; i.value = ''; hpAsk(v); });
+  helpPanel.addEventListener('click', e => { const c = e.target.closest('[data-hq]'); if (c) hpAsk(c.dataset.hq); });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape' && helpPanel.classList.contains('show')) hpOpen(false); });
+  if (new URLSearchParams(location.search).has('ask')) setTimeout(() => hpOpen(true), 400);   // old Ask Data links land in the chat
+  else if (!store.get('ap-tips-seen')) setTimeout(() => { if (!openPop && !helpPanel.classList.contains('show')) tipShow(); }, 1200);
+}
+
+/* ---------- settings ---------- */
+const gearPop = document.getElementById('gearPop');
+const GI = {
+  light: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M4.6 4.6L6 6M18 18l1.4 1.4M2.5 12h2M19.5 12h2M4.6 19.4L6 18M18 6l1.4-1.4"/></svg>',
+  dark: '<svg viewBox="0 0 24 24"><path d="M20.5 14.2A8.5 8.5 0 119.8 3.5a6.7 6.7 0 0010.7 10.7z"/></svg>',
+  phone: '<svg viewBox="0 0 24 24"><rect x="7" y="2.5" width="10" height="19" rx="2.6"/><path d="M11 18.3h2"/></svg>',
+  desktop: '<svg viewBox="0 0 24 24"><rect x="2.5" y="4" width="19" height="12.5" rx="2"/><path d="M8.5 20.5h7M12 16.5v4"/></svg>',
+  upload: '<svg viewBox="0 0 24 24"><path d="M12 15V4.5M7.5 9L12 4.5 16.5 9"/><path d="M4.5 15v3.5A1.5 1.5 0 006 20h12a1.5 1.5 0 001.5-1.5V15"/></svg>',
+};
+const seg = (id, attr, opts) => `<div class="gp-seg ic" id="${id}">${opts.map(([v, label, ic]) => `<button type="button" ${attr}="${v}">${ic}<span>${label}</span></button>`).join('')}</div>`;
+gearPop.innerHTML = `<div class="pop-title">Settings</div>
+  <div class="pop-cap">Display</div>${seg('themeChoice', 'data-theme-set', [['light', 'Light', GI.light], ['dark', 'Dark', GI.dark]])}
+  <div class="pop-cap">View</div>${seg('viewChoice', 'data-view-set', [['phone', 'Phone', GI.phone], ['desktop', 'Desktop', GI.desktop]])}
+  <div class="pop-cap">Sales data</div><div class="gl-list" id="dataInfo"><div class="gl-row"><span>Loading…</span></div></div>
+  <a class="gp-up" href="/upload"><span class="gd-ic up">${GI.upload}</span><span class="gp-up-t">Data &amp; upload<small id="upState">Admin passcode needed</small></span><i>›</i></a>`;
+fetch('/api/upload/status', { cache: 'no-store' }).then(r => r.json()).then(d => {
+  const el = document.getElementById('upState'); if (!el) return;
+  el.textContent = !d.protected ? 'Set an admin passcode first' : d.unlocked ? `Unlocked · ${Math.max(1, d.minutes)} min left` : 'Locked · admin passcode needed';
+  el.classList.toggle('open', !!d.unlocked);
+}).catch(() => {});
+/* '01 Jan 2025' + '26 Oct 2026' -> '1 Jan 2025 – 26 Oct 2026' (the year once when both are in the same year) */
+function dataRange(a, b){
+  const tidy = s => String(s || '').replace(/^0/, '');
+  const [x, y] = [tidy(a), tidy(b)];
+  if (!x || !y) return x || y || '–';
+  const ya = x.slice(-4), yb = y.slice(-4);
+  return ya === yb ? `${x.slice(0, -5)} – ${y}` : `${x} – ${y}`;
+}
+let metaLoaded = 0;
+async function loadMeta(){
+  if (Date.now() - metaLoaded < 60000) return;
+  try {
+    const m = await (await fetch('/api/meta')).json();
+    if (m.error) throw new Error(m.error);
+    metaLoaded = Date.now();
+    const row = (k, v) => `<div class="gl-row"><span>${k}</span><b>${v}</b></div>`;
+    const n = x => (x || 0).toLocaleString('en-IN');
+    const thin = m.thin || [], issues = (m.missing_days ? 1 : 0) + thin.length;
+    const gapText = [m.missing_days ? `${n(m.missing_days)} day${m.missing_days === 1 ? '' : 's'}` : '', thin.length ? `${thin.length} thin period${thin.length === 1 ? '' : 's'}` : ''].filter(Boolean).join(' · ');
+    document.getElementById('dataInfo').innerHTML =
+      row('Range', esc(dataRange(m.from, m.to)))
+      + (m.updated ? row('Updated', esc(m.updated)) : '')
+      + row('Coverage', `${n((m.months || []).length)} months · ${n(m.days)} selling days`)
+      + row('Stores', n(m.stores))
+      + row('Sales records', n(m.rows))
+      + (issues
+        ? `<details class="gl-row gl-more"><summary><span>Gaps</span><b class="warn">${gapText}<i>›</i></b></summary><div class="gl-detail">
+            ${thin.map(t => `<p><b>${esc(t.label)}</b> very little data (${esc(t.low)}–${esc(t.high)} a month, against ${esc(m.typical)} usually)</p>`).join('')}
+            ${m.missing_days ? `<p><b>${n(m.missing_days)} of ${n(m.calendar_days)} days</b> have no sales</p><ul>${m.gaps.map(g => `<li>${esc(g.label)}<span>${g.days} day${g.days === 1 ? '' : 's'}</span></li>`).join('')}</ul>` : ''}</div></details>`
+        : (m.calendar_days ? row('Gaps', '<span class="ok">None ✓</span>') : ''));
+  } catch (e) { document.getElementById('dataInfo').innerHTML = '<div class="gl-row"><span>Could not load the data details.</span></div>'; }
+}
+register(document.getElementById('gearBtn'), gearPop, loadMeta);
+/* no Auto: the page head picks Light/Dark and Phone/Desktop once from the device, after that only a tap changes them */
+function paintTheme(){
+  const cur = root.dataset.theme === 'light' ? 'light' : 'dark';
+  document.querySelectorAll('[data-theme-set]').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.themeSet === cur)));
+}
+document.getElementById('themeChoice').addEventListener('click', e => {
+  const b = e.target.closest('[data-theme-set]'); if (!b) return;
+  store.set('ap-theme', b.dataset.themeSet); root.dataset.theme = b.dataset.themeSet;
+  paintTheme(); window.dispatchEvent(new Event('themechange'));
+});
+paintTheme();
+function paintView(){
+  const cur = root.dataset.view === 'phone' ? 'phone' : 'desktop';
+  document.querySelectorAll('[data-view-set]').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.viewSet === cur)));
+}
+document.getElementById('viewChoice').addEventListener('click', e => {
+  const b = e.target.closest('[data-view-set]'); if (!b) return;
+  if (b.dataset.viewSet === (root.dataset.view === 'phone' ? 'phone' : 'desktop')) return;
+  store.set('ap-view', b.dataset.viewSet); location.reload();
+});
+paintView();
+
+/* ---------- quick settings: how models and segments are grouped, one choice for every page ---------- */
+const QUICK = [
+  { k: 'sp', id: 'optSP', def: false, name: 'SP combined', desc: 'Flagship and Innovative shown together as SP' },
+  { k: 'ff', id: 'optFF', def: true, name: 'Foldables grouped', desc: 'Fold and Flip of one number as one: FF8, FF7, FF6, FF5…' },
+  { k: 'ss', id: null, def: true, name: 'S series grouped', desc: 'S26, S26+, S26 Ultra and S26 FE as S26F; the same for S25F, S24F, S23F…' },
+];
+const QUICK_KEYS = ['ov-state', 'ch-state', 'spc-state'];   // each page's saved state carries its own sp / ff
+const cookieGet = k => { const m = document.cookie.match(new RegExp('(?:^|; )ap-' + k + '=([01])')); return m ? m[1] === '1' : null; };
+const cookieSet = (k, on) => { document.cookie = `ap-${k}=${on ? 1 : 0}; path=/; max-age=31536000; samesite=lax`; };
+const quickOn = q => { const c = cookieGet(q.k); return c == null ? q.def : c; };
+const cookieStr = k => { const m = document.cookie.match(new RegExp('(?:^|; )ap-' + k + '=([^;]+)')); return m ? decodeURIComponent(m[1]) : null; };
+const cookieStrSet = (k, v) => { document.cookie = `ap-${k}=${encodeURIComponent(v)}; path=/; max-age=31536000; samesite=lax`; };
+/* one measure and one comparison for every page: whichever page you switch it on, the others follow (written into each
+   page's saved settings before its script reads them) */
+const SYNC = {
+  metric: { ok: ['v', 'q'], keys: { 'ov-state': 'metric', 'ch-state': 'metric', 'spc-state': 'metric', 'cmp-state': 'metric', 'tg-state': 'metric' } },
+  cmp: { ok: ['prev', 'ly'], keys: { 'ov-state': 'base', 'spc-state': 'compare', 'cmp-state': 'compare' } },
+};
+const syncWrite = (k, v) => Object.entries(SYNC[k].keys).forEach(([key, f]) => {
+  let o = {}; try { o = JSON.parse(store.get(key) || '{}') || {}; } catch (e) {}
+  if (key === 'ch-state' && o[f] === 'asp') return;   // Charts' ASP measure is its own
+  if (o[f] !== v) { o[f] = v; store.set(key, JSON.stringify(o)); }
+});
+['metric', 'cmp'].forEach(k => { const v = cookieStr(k); if (SYNC[k].ok.includes(v)) syncWrite(k, v); });
+// switching it on any page sets it for every page
+document.addEventListener('click', e => {
+  const b = e.target.closest && e.target.closest('[data-metric],[data-base],[data-cmp]'); if (!b || b.disabled) return;
+  const [k, v] = b.dataset.metric ? ['metric', b.dataset.metric] : ['cmp', b.dataset.base || b.dataset.cmp];
+  if (SYNC[k].ok.includes(v)) cookieStrSet(k, v);
+}, true);
+/* numbers and charts */
+window.AP_FULL = cookieGet('num') === true;                        // 1,36,44,866 instead of 1.36Cr
+window.AP_AVG = cookieGet('avg') !== false;                        // average line on charts (on unless switched off)
+window.AP_LABELS = cookieGet('labels') === true;                   // values on chart bars
+(() => { let o = {}; try { o = JSON.parse(store.get('ch-state') || '{}') || {}; } catch (e) {}
+  if (cookieGet('avg') != null) o.avg = window.AP_AVG;
+  if (cookieGet('labels') != null) o.labels = window.AP_LABELS;
+  store.set('ch-state', JSON.stringify(o)); })();
+document.addEventListener('change', e => {   // Charts' own boxes set it for every page too
+  if (e.target.id === 'optAvg') cookieSet('avg', e.target.checked);
+  if (e.target.id === 'optLabels') cookieSet('labels', e.target.checked);
+}, true);
+/* one choice for every page: written into each page's saved settings now, before the page scripts (which load after
+   this one on every page) read them, so every page starts out the same */
+QUICK.forEach(q => {
+  let c = cookieGet(q.k);
+  if (c == null) {
+    let o = {}; try { o = JSON.parse(store.get('ov-state') || '{}') || {}; } catch (e) {}
+    c = typeof o[q.k] === 'boolean' ? o[q.k] : q.def;
+    cookieSet(q.k, c);
+  }
+  if (q.k !== 'ss') QUICK_KEYS.forEach(key => {
+    let o = {}; try { o = JSON.parse(store.get(key) || '{}') || {}; } catch (e) {}
+    if (o[q.k] !== c) { o[q.k] = c; store.set(key, JSON.stringify(o)); }
+  });
+});
+if (hasQuick) {
+  const quickPop = document.getElementById('quickPop');
+  const sw = (k, name, desc) => `<label class="gp-row qs-row"><span><b>${name}</b><small>${desc}</small></span>
+      <span class="qs-switch"><input type="checkbox" data-q="${k}" aria-label="${name}"><i></i></span></label>`;
+  quickPop.innerHTML = `<div class="pop-title">Quick settings</div>
+    <div class="pop-cap">Numbers &amp; charts</div><div class="gp-rows">
+      ${sw('num', 'Full numbers', '1,36,44,866 instead of 1.36Cr')}
+      ${sw('avg', 'Average line', 'The dashed average line on charts')}
+      ${sw('labels', 'Values on bars', 'Totals above chart bars (charts with up to 16 bars on Overview)')}</div>
+    <div class="pop-cap">Grouping</div><div class="gp-rows">${QUICK.map(q => sw(q.k, q.name, q.desc)).join('')}</div>
+    <p class="qs-note">Grouping applies to Overview, Chart Builder, SPC Performance and Comparison.</p>`;
+  // the page's own checkboxes stay as the source of truth (they drive its reload); only their labels are hidden
+  QUICK.forEach(q => {
+    const box = q.id && document.getElementById(q.id), lab = box && box.closest('label');
+    if (lab) lab.hidden = true;
+    const holder = lab && lab.parentElement;
+    if (holder && ![...holder.children].some(c => !c.hidden)) holder.hidden = true;
+  });
+  const paintQuick = () => {
+    QUICK.forEach(q => { quickPop.querySelector(`[data-q="${q.k}"]`).checked = quickOn(q); });
+    quickPop.querySelector('[data-q="num"]').checked = window.AP_FULL;
+    quickPop.querySelector('[data-q="avg"]').checked = window.AP_AVG;
+    quickPop.querySelector('[data-q="labels"]').checked = window.AP_LABELS;
+  };
+  quickPop.addEventListener('change', e => {
+    const k = e.target.dataset.q;
+    if (k === 'num' || k === 'avg' || k === 'labels') {
+      cookieSet(k, e.target.checked);
+      if (k !== 'num' && document.getElementById(k === 'avg' ? 'optAvg' : 'optLabels')) {   // Charts: through its own box
+        const box = document.getElementById(k === 'avg' ? 'optAvg' : 'optLabels'); box.checked = e.target.checked; box.dispatchEvent(new Event('change', { bubbles: true }));
+      } else location.reload();
+      return;
+    }
+    const q = QUICK.find(x => x.k === k); if (!q) return;
+    const on = e.target.checked;
+    cookieSet(q.k, on);
+    if (q.k !== 'ss') QUICK_KEYS.forEach(key => {
+      let o = {}; try { o = JSON.parse(store.get(key) || '{}') || {}; } catch (err) {}
+      o[q.k] = on; store.set(key, JSON.stringify(o));
+    });
+    // reload the page's data: through its own checkbox when it has one, else the whole page
+    const box = q.id && document.getElementById(q.id), any = document.getElementById('optFF') || document.getElementById('optSP');
+    if (box) { box.checked = on; box.dispatchEvent(new Event('change', { bubbles: true })); }
+    else if (any) any.dispatchEvent(new Event('change', { bubbles: true }));
+    else location.reload();
+  });
+  register(document.getElementById('quickBtn'), quickPop, paintQuick);
+}
+
+/* ---------- store picker: search, pick one, or tick several to add up / compare ---------- */
+const KEY = 'ap-stores';
+const readSel = () => { try { const v = JSON.parse(store.get(KEY) || 'null'); if (Array.isArray(v)) return v; } catch (e) {}
+  try { const o = JSON.parse(store.get('ov-state') || '{}'); return o.store ? [o.store] : []; } catch (e) { return []; } };
+const SP = { stores: [], sel: readSel(), pending: null, multi: true, onChange: null, allLabel: 'All Stores' };
+function spLabel(sel){ return !sel.length ? SP.allLabel : sel.length === 1 ? sel[0] : sel.length + ' stores'; }
+function spRender(){
+  if (!storeMenu) return;
+  const pend = SP.pending || SP.sel, q = (storeMenu.querySelector('.sp-search input') || {}).value || '';
+  const row = s => `<div class="sp-row" data-store="${esc(s)}"><button type="button" class="sp-ck" aria-pressed="${pend.includes(s)}" aria-label="Tick ${esc(s)}" data-tick="${esc(s)}"><i></i></button><button type="button" class="sp-name" data-only="${esc(s)}">${esc(s)}</button></div>`;
+  storeMenu.classList.toggle('sp-single', !SP.multi);
+  storeMenu.innerHTML = (SP.stores.length > 3 ? `<div class="sp-search"><input type="search" placeholder="Search ${SP.stores.length} stores" aria-label="Search stores" value="${esc(q)}"></div>` : '')
+    + (SP.noAll ? `<div class="sp-cap">${esc(SP.note || 'Pick a store')}</div>` : `<div class="sp-row sp-all"><button type="button" class="sp-ck" aria-pressed="${!pend.length}" data-only="" aria-label="All stores"><i></i></button><button type="button" class="sp-name" data-only="">${esc(SP.allLabel)}</button></div><div class="sp-hr"></div>`)
+    + SP.stores.map(row).join('') + '<div class="sp-empty" id="spEmpty" hidden>No store matches.</div>'
+    + (SP.multi ? `<div class="sp-foot">${pend.length || q ? `<button type="button" class="sp-clear" title="Untick every store">Clear</button>` : ''}<span>${pend.length > 1 ? pend.length + ' ticked' : pend.length ? '1 ticked' : 'Tick stores to add them up'}</span>
+        <a class="sp-cmp${pend.length < 2 ? ' off' : ''}" href="/compare?${pend.map(s => 'store=' + encodeURIComponent(s)).join('&')}">Compare</a>
+        <button type="button" class="sp-apply" ${SP.pending && JSON.stringify(SP.pending) !== JSON.stringify(SP.sel) ? '' : 'disabled'}>Show</button></div>` : '');
+  spFilter();
+  const b = document.getElementById('storePick');
+  if (b) { b.title = 'Change store · now: ' + spLabel(SP.sel); b.setAttribute('aria-label', 'Store: ' + spLabel(SP.sel) + '. Change store'); }
+}
+function spFilter(){
+  const inp = storeMenu.querySelector('.sp-search input'); if (!inp) return;
+  const q = inp.value.trim().toLowerCase(); let n = 0;
+  storeMenu.querySelectorAll('.sp-row[data-store]').forEach(r => { const hit = !q || r.dataset.store.toLowerCase().includes(q); r.hidden = !hit; n += hit; });
+  document.getElementById('spEmpty').hidden = n > 0;
+}
+function spApply(sel){
+  SP.sel = sel.filter(s => SP.stores.includes(s)); SP.pending = null;
+  store.set(KEY, JSON.stringify(SP.sel));
+  if (!(hoverable && storeMenu.matches(':hover'))) setOpen(storeMenu, false);   // with a mouse it stays until the pointer leaves
+  spRender();
+  if (SP.onChange) SP.onChange(SP.sel.slice());
+}
+if (storeMenu) {
+  register(document.getElementById('storePick'), storeMenu, () => { SP.pending = null; spRender(); const i = storeMenu.querySelector('.sp-search input'); if (i && !small()) setTimeout(() => i.focus(), 60); });
+  storeMenu.addEventListener('input', e => { if (e.target.type === 'search') spFilter(); });
+  storeMenu.addEventListener('keydown', e => { if (e.key === 'Enter' && e.target.type === 'search') { const r = storeMenu.querySelector('.sp-row[data-store]:not([hidden])'); if (r) spApply([r.dataset.store]); } });
+  storeMenu.addEventListener('click', e => {
+    e.stopPropagation();
+    const only = e.target.closest('[data-only]'), tick = e.target.closest('[data-tick]');
+    if (tick && SP.multi) {
+      const s = tick.dataset.tick, p = (SP.pending || SP.sel).slice(), i = p.indexOf(s);
+      if (i >= 0) p.splice(i, 1); else p.push(s);
+      SP.pending = p; spRender(); return;
+    }
+    if (only && SP.tick && only.dataset.only) { const s = only.dataset.only, p = (SP.pending || SP.sel).slice(), i = p.indexOf(s); if (i >= 0) p.splice(i, 1); else p.push(s); SP.pending = p; spRender(); return; }
+    if (only) { spApply(only.dataset.only ? [only.dataset.only] : []); return; }
+    if (e.target.closest('.sp-clear')) {   // untick everything; Show then applies All Stores
+      SP.pending = []; const i = storeMenu.querySelector('.sp-search input'); if (i) i.value = '';
+      spRender(); const j = storeMenu.querySelector('.sp-search input'); if (j && !small()) j.focus(); return;
+    }
+    if (e.target.closest('.sp-apply')) spApply(SP.pending || SP.sel);
+  });
+}
+window.StorePicker = {
+  /* pages call mount() after each load with the stores in the data and what is shown */
+  mount(o){
+    SP.stores = o.stores || []; SP.multi = o.multi !== false; SP.tick = !!o.tick; SP.onChange = o.onChange || SP.onChange; SP.allLabel = o.allLabel || 'All Stores';
+    SP.noAll = !!o.noAll; SP.note = o.note || '';   // one store only (Target vs Achievement): no All Stores, no ticking
+    if (o.selected) SP.sel = o.selected.filter(s => SP.stores.includes(s));
+    if (!SP.multi && SP.sel.length > 1) SP.sel = SP.sel.slice(0, 1);
+    spRender();
+  },
+  saved(){ return readSel(); },
+  label: spLabel,
+  params(sel){ return (sel || SP.sel).map(s => ['store', s]); },
+};
+
+/* ---------- connection: green online, yellow server offline, red no internet ---------- */
+const netPill = document.getElementById('netPill'), netText = document.getElementById('netText');
+const netBar = document.createElement('div'); netBar.className = 'net-bar'; netBar.setAttribute('role', 'status'); document.body.appendChild(netBar);
+let netState = 'ok', barT = null;
+function paintNet(state, why){
+  const text = { ok: 'Online', warn: 'Server offline', bad: 'No internet' }[state];
+  const long = { ok: 'Back online · connected to the dashboard server', warn: 'Server offline · the internet works but the dashboard server is not answering; numbers on screen may be old', bad: 'No internet · check Wi-Fi or mobile data' }[state];
+  const cls = state === 'ok' ? '' : state;
+  netPill.className = 'net ' + cls; netText.textContent = text; netPill.title = long;
+  const dot = document.getElementById('netDot'); if (dot) { dot.className = 'net-dot ' + cls; dot.title = long; }
+  if (state !== netState || why === 'tap') {
+    netBar.className = 'net-bar show ' + (state === 'ok' ? 'ok' : state); netBar.textContent = long;
+    clearTimeout(barT); barT = setTimeout(() => netBar.classList.remove('show'), state === 'ok' ? 2500 : 6000);
+  }
+  netState = state;
+}
+const timeout = (ms) => { const c = new AbortController(); setTimeout(() => c.abort(), ms); return c.signal; };
+const nativeFetch = window.fetch.bind(window);
+async function checkNet(){
+  if (!navigator.onLine) { paintNet('bad'); return; }
+  try {
+    const r = await nativeFetch('/api/ping?t=' + Date.now(), { cache: 'no-store', signal: timeout(6000) });
+    if (r.ok) { paintNet('ok'); return; }
+  } catch (e) { /* fall through */ }
+  try {   /* server did not answer: is the internet itself up? */
+    await nativeFetch('https://www.gstatic.com/generate_204', { mode: 'no-cors', cache: 'no-store', signal: timeout(5000) });
+    paintNet('warn');
+  } catch (e) { paintNet('bad'); }
+}
+/* ---------- changing targets needs the admin passcode: ask in a small sheet, then send the save again ---------- */
+const ADMIN_POST = /^\/api\/targets?$/;
+let adminToken = null;
+async function adminTokenGet(){
+  if (adminToken) return adminToken;
+  try { const d = await (await nativeFetch('/api/upload/status', { cache: 'no-store' })).json(); adminToken = d.unlocked && d.csrf ? d.csrf : null; }
+  catch (e) { adminToken = null; }
+  return adminToken;
+}
+function adminAsk(){
+  return new Promise(resolve => {
+    const shade = document.createElement('div'); shade.className = 'adm-shade';
+    shade.innerHTML = `<form class="adm-sheet" role="dialog" aria-modal="true" aria-labelledby="admT" autocomplete="off">
+      <span class="adm-ic"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="10.5" width="14" height="10" rx="2.5"/><path d="M8.5 10.5V8a3.5 3.5 0 017 0v2.5"/></svg></span>
+      <h3 id="admT">Admin passcode</h3>
+      <p>Changing targets needs the admin passcode. It unlocks this browser for 15 minutes; what you typed is kept.</p>
+      <input type="password" autocomplete="current-password" aria-label="Admin passcode" required>
+      <p class="adm-err" role="alert" hidden></p>
+      <div class="adm-btns"><button type="button" class="adm-no">Cancel</button><button type="submit" class="adm-ok">Unlock and save</button></div></form>`;
+    document.body.appendChild(shade);
+    const f = shade.querySelector('form'), inp = f.querySelector('input'), err = f.querySelector('.adm-err'), okb = f.querySelector('.adm-ok');
+    const esc = e => { if (e.key === 'Escape') done(null); };
+    const done = v => { shade.remove(); document.removeEventListener('keydown', esc, true); resolve(v); };
+    document.addEventListener('keydown', esc, true);
+    f.querySelector('.adm-no').addEventListener('click', () => done(null));
+    shade.addEventListener('click', e => { if (e.target === shade) done(null); });
+    f.addEventListener('submit', async e => {
+      e.preventDefault(); okb.disabled = true; err.hidden = true;
+      try {
+        const r = await nativeFetch('/api/admin/unlock', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: inp.value }) });
+        const d = await r.json().catch(() => ({}));
+        if (r.ok && d.csrf) { done(d.csrf); return; }
+        err.textContent = d.error || "That passcode isn't right."; err.hidden = false; inp.select();
+      } catch (x) { err.textContent = 'Could not reach the server. Please try again.'; err.hidden = false; }
+      okb.disabled = false;
+    });
+    requestAnimationFrame(() => shade.classList.add('show'));
+    setTimeout(() => inp.focus(), 60);
+  });
+}
+async function adminFetch(input, init){
+  const go = tok => { const h = new Headers(init.headers || {}); h.set('X-Admin-Token', tok || ''); return nativeFetch(input, { ...init, headers: h }); };
+  const r = await go(await adminTokenGet());
+  if (r.status !== 401) return r;
+  adminToken = null;
+  const info = await r.clone().json().catch(() => ({}));
+  if (info.reason === 'no_passcode') return r;   // nothing to unlock with yet; its message says where to set one
+  const tok = await adminAsk();
+  if (!tok) return new Response(JSON.stringify({ error: 'Not saved: changing targets needs the admin passcode.' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+  adminToken = tok;
+  return go(tok);
+}
+/* any failed request to our own server triggers a fresh check at once */
+window.fetch = function(input, init){
+  const url = typeof input === 'string' ? input : (input && input.url) || '';
+  const own = url.startsWith('/') || url.startsWith(location.origin);
+  if (own && init && String(init.method || '').toUpperCase() === 'POST' && ADMIN_POST.test(new URL(url, location.href).pathname)) return adminFetch(input, init);
+  return nativeFetch(input, init).then(r => { if (own && netState !== 'ok' && r.ok) paintNet('ok'); return r; },
+    err => { if (own && !(err && err.name === 'AbortError')) checkNet(); throw err; });
+};
+window.addEventListener('online', checkNet); window.addEventListener('offline', () => paintNet('bad'));
+document.addEventListener('visibilitychange', () => { if (!document.hidden) checkNet(); });
+setInterval(checkNet, 30000); checkNet();
+[netPill, document.getElementById('netDot')].forEach(el => el && el.addEventListener('click', e => { e.stopPropagation(); paintNet(netState, 'tap'); }));
+
+/* ---------- header: fixed, with a spacer of its height; folds to the period pill while scrolling down ---------- */
+const head = document.querySelector('header.top');
+if (head) {
+  const spacer = document.createElement('div'); spacer.className = 'top-spacer'; head.after(spacer);
+  let lockUntil = 0;   // while the header folds or unfolds: no re-measuring, no flipping back
+  // the spacer always holds the full header height; measuring mid-animation made the page jump and the header flip
+  const fit = () => {
+    if (head.classList.contains('compact') || performance.now() < lockUntil) return;
+    const bottom = Math.round(head.getBoundingClientRect().bottom);   // the bar floats a little below the top edge
+    spacer.style.height = (bottom + 8) + 'px'; root.style.setProperty('--hdr-h', bottom + 'px');
+  };
+  fit(); new ResizeObserver(fit).observe(head); window.addEventListener('resize', fit);
+  const setCompact = on => {
+    if (on === head.classList.contains('compact') || performance.now() < lockUntil) return;
+    lockUntil = performance.now() + 450;
+    head.classList.toggle('compact', on);
+    if (on && typeof tipClose === 'function') tipClose();
+    if (!on) setTimeout(fit, 470);
+  };
+  if (head.querySelector('.datenav')) {
+    let lastY = window.scrollY, down = 0, up = 0, ticking = false;
+    window.addEventListener('scroll', () => {
+      if (ticking) return; ticking = true;
+      requestAnimationFrame(() => {
+        ticking = false;
+        const y = window.scrollY, dy = y - lastY; lastY = y;
+        if (Math.abs(dy) < 1) return;   // sub-pixel wobble from trackpads and momentum
+        // count each direction on its own; a tiny move the other way doesn't wipe out the scroll so far
+        if (dy > 0) { down += dy; if (down > 10) up = 0; } else { up -= dy; if (up > 10) down = 0; }
+        if (y < 60) setCompact(false);
+        else if (y > 120 && down > 56 && !openPop) setCompact(true);
+        else if (up > 40) setCompact(false);
+      });
+    }, { passive: true });
+  }
+}
+
+/* ---------- switching pills must not move the page: hold the scroll position while the content redraws ---------- */
+let hold = null;
+const PILL = '.seg button,.chips button,.tg input,[data-preset],[data-mode],[data-metric],[data-base],[data-gran],[data-dim],[data-heat],[data-tmode],[data-cmp],[data-segpick]';
+document.addEventListener('pointerdown', e => { if (e.target.closest && e.target.closest(PILL)) holdScroll(); }, true);
+document.addEventListener('keydown', e => { if ((e.key === 'Enter' || e.key === ' ') && e.target.closest && e.target.closest(PILL)) holdScroll(); }, true);
+function holdScroll(){
+  const y = window.scrollY, m = document.querySelector('main.wrap');
+  if (hold) { clearTimeout(hold.t); cancelAnimationFrame(hold.raf); }
+  root.style.overflowAnchor = 'none';
+  if (m) m.style.minHeight = m.offsetHeight + 'px';
+  const userMoved = () => { release(); };
+  const release = () => {
+    if (!hold) return;
+    clearTimeout(hold.t); cancelAnimationFrame(hold.raf);
+    window.removeEventListener('wheel', userMoved); window.removeEventListener('touchmove', userMoved);
+    if (m) m.style.minHeight = ''; hold = null;
+  };
+  window.addEventListener('wheel', userMoved, { passive: true, once: true }); window.addEventListener('touchmove', userMoved, { passive: true, once: true });
+  const keep = () => { if (!hold) return; if (Math.abs(window.scrollY - y) > 1) window.scrollTo(0, y); hold.raf = requestAnimationFrame(keep); };
+  hold = { t: setTimeout(release, 1600) };
+  hold.raf = requestAnimationFrame(keep);
+}
+
+/* ---------- masonry for the overview's two desktop columns ---------- */
+const masonryOn = () => matchMedia('(min-width:1000px)').matches && root.dataset.view !== 'phone';
+function relayout(){
+  document.querySelectorAll('.layout.masonry').forEach(g => Array.from(g.children).forEach(ch => {
+    if (!masonryOn()) { ch.style.gridRowEnd = ''; return; }
+    ch.style.gridRowEnd = 'span ' + Math.max(1, Math.ceil((ch.getBoundingClientRect().height + 22) / 4));
+  }));
+}
+let relayoutT = null;
+const queueRelayout = () => { cancelAnimationFrame(relayoutT); relayoutT = requestAnimationFrame(relayout); };
+const ro = new ResizeObserver(queueRelayout);
+document.querySelectorAll('.layout.masonry').forEach(g => Array.from(g.children).forEach(ch => ro.observe(ch)));
+window.addEventListener('resize', queueRelayout); window.addEventListener('load', relayout);
+matchMedia('(min-width:1000px)').addEventListener('change', queueRelayout);
+
+/* ---------- go to top ---------- */
+const topBtn = document.createElement('button');
+topBtn.type = 'button'; topBtn.className = 'to-top'; topBtn.setAttribute('aria-label', 'Go to top'); topBtn.title = 'Go to top';
+topBtn.innerHTML = '<svg viewBox="0 0 24 24"><path d="M12 19V5M5.5 11.5L12 5l6.5 6.5"/></svg>';
+document.body.appendChild(topBtn);
+let scroller = document.scrollingElement || document.documentElement;
+document.addEventListener('scroll', e => {
+  const t = e.target === document ? (document.scrollingElement || document.documentElement) : e.target;
+  if (!t || t.clientHeight < 240) return;
+  scroller = t; topBtn.classList.toggle('show', t.scrollTop > 400);
+}, true);
+topBtn.addEventListener('click', () => { scroller.scrollTo({ top: 0, behavior: 'smooth' }); topBtn.classList.remove('show'); });
+})();
+
+(function(){
+/* Save any section (its heading plus everything up to the next heading) as a PNG.
+   The section is copied off-screen at its full natural width first, so wide tables are never cropped. */
+const LIB = 'https://cdn.jsdelivr.net/npm/html-to-image@1.11.11/dist/html-to-image.js';
+const ICON = '<svg viewBox="0 0 24 24"><path d="M12 4v11m0 0l-4.5-4.5M12 15l4.5-4.5M5 19h14"/></svg>';
+let lib = null;
+const loadLib = () => lib || (lib = new Promise((ok, fail) => {
+  const s = document.createElement('script');
+  s.src = LIB; s.onload = () => ok(window.htmlToImage); s.onerror = () => { lib = null; fail(new Error('Could not load the image library.')); };
+  document.head.appendChild(s);
+}));
+const visible = n => !n.hidden && getComputedStyle(n).display !== 'none';
+const slug = s => String(s).replace(/[^A-Za-z0-9]+/g, '_').replace(/^_|_$/g, '').slice(0, 60) || 'Section';
+
+function group(head){
+  const nodes = [head];
+  for (let n = head.nextElementSibling; n && !n.classList.contains('sec-head'); n = n.nextElementSibling) if (visible(n)) nodes.push(n);
+  return nodes;
+}
+function addButtons(){
+  if (document.body.hasAttribute('data-noexport')) return;
+  document.querySelectorAll('.sec-head').forEach(h => {
+    if (h.querySelector('.xbtn') || h.closest('[data-noexport]')) return;
+    const h2 = h.querySelector('h2'); if (!h2) return;
+    const b = document.createElement('button');
+    b.type = 'button'; b.className = 'xbtn'; b.innerHTML = ICON;
+    b.title = 'Save this section as an image'; b.setAttribute('aria-label', 'Save ' + h2.textContent.trim() + ' as an image');
+    h2.appendChild(b);
+  });
+}
+function copyFormState(from, to){
+  const a = from.querySelectorAll('input,select,textarea'), b = to.querySelectorAll('input,select,textarea');
+  a.forEach((el, i) => { if (!b[i]) return; if (el.type === 'checkbox' || el.type === 'radio') b[i].checked = el.checked; else b[i].setAttribute('value', el.value); });
+}
+async function exportSection(head, btn){
+  btn.classList.add('busy');
+  // a table or list cut short with "Show More" is opened first, so the image has every row
+  for (let n = head.nextElementSibling; n && !n.classList.contains('sec-head'); n = n.nextElementSibling) {
+    const more = n.querySelector ? [...n.querySelectorAll('.more')].find(visible) : null;
+    if (more) { more.click(); await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))); }
+  }
+  const wrap = document.createElement('div');
+  const holder = document.createElement('div');
+  wrap.className = 'x-wrap'; wrap.appendChild(holder);
+  const dark = document.documentElement.dataset.theme === 'dark' || (document.documentElement.dataset.theme !== 'light' && matchMedia('(prefers-color-scheme: dark)').matches);
+  wrap.style.setProperty('--x-canvas', dark ? '#000' : '#fff');
+  try {
+    const htmlToImage = await loadLib();
+    const nodes = group(head);
+    const title = (head.querySelector('h2') || head).textContent.trim();
+    const who = (document.getElementById('title') || {}).textContent || '';
+    const when = (document.getElementById('navLabel') || {}).textContent || '';
+    let width = Math.max(...nodes.map(n => n.getBoundingClientRect().width));
+    nodes.forEach(n => n.querySelectorAll('.tscroll,.table-scroll,.ch-box,table,svg').forEach(s => { width = Math.max(width, (s.scrollWidth || s.getBoundingClientRect().width || 0) + 34); }));
+    const safe = s => String(s).replace(/[&<>]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[ch]));
+    const stamp = new Date().toLocaleString('en-GB', { day: 'numeric', month: 'short', year: 'numeric', hour: 'numeric', minute: '2-digit' });
+    holder.className = 'x-holder';
+    holder.style.minWidth = Math.max(560, Math.ceil(width)) + 'px';   // room for the title and the time stamp
+    holder.innerHTML = `<div class="x-head"><div><h1 class="x-title">${safe(title)}</h1><p class="x-sub"><b>${safe(who)}</b>${when ? ' · ' + safe(when) : ''}</p></div><div class="x-stamp">Exported ${safe(stamp)}</div></div>`;
+    nodes.forEach(n => { const c = n.cloneNode(true); copyFormState(n, c); holder.appendChild(c); });
+    // buttons don't belong in a picture: the choices they show are written out under the title instead
+    const picked = [];
+    holder.querySelectorAll('.chips,.seg').forEach(g => {
+      const on = g.querySelector('.on,[aria-selected="true"],[aria-pressed="true"]');
+      const t = on ? on.textContent.replace(/\s+/g, ' ').trim() : '';
+      if (t && !picked.includes(t)) picked.push(t);
+      g.remove();
+    });
+    if (picked.length) holder.querySelector('.x-sub').insertAdjacentHTML('afterend', `<p class="x-ctx">${safe(picked.join(' · '))}</p>`);
+    const src = (document.querySelector('.foot.updated,#updated,main .foot') || {}).textContent || '';
+    holder.insertAdjacentHTML('beforeend', `<div class="x-foot">${src.trim() ? safe(src.trim()) + ' · ' : ''}Sales Dashboard</div>`);
+    // the title now leads the card: drop the section's own heading, keep any note that sat beside it
+    const h = holder.querySelector('.sec-head');
+    if (h) { const h2 = h.querySelector('h2'); if (h2) h2.remove(); h.querySelectorAll('.xbtn,.link,button').forEach(x => x.remove()); if (!h.textContent.trim()) h.remove(); }
+    document.body.appendChild(wrap);
+    await (document.fonts ? document.fonts.ready : Promise.resolve());
+    await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+    const w = Math.ceil(wrap.getBoundingClientRect().width), hh = Math.ceil(wrap.getBoundingClientRect().height);
+    const canvas = dark ? '#000' : '#fff';
+    const blob = await htmlToImage.toBlob(wrap, { width: w, height: hh, pixelRatio: 3, backgroundColor: canvas,
+      style: { position: 'static', left: '0', top: '0', zIndex: 'auto' } });
+    const name = `${slug(title)}_${slug(who)}_${slug(when)}.png`;
+    const file = new File([blob], name, { type: 'image/png' });
+    if (navigator.canShare && navigator.canShare({ files: [file] }) && matchMedia('(pointer:coarse)').matches) {
+      await navigator.share({ files: [file], title });
+    } else {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a'); a.href = url; a.download = name;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 3000);
+    }
+  } catch (e) {
+    if (e && e.name !== 'AbortError') alert('Could not save the image: ' + (e.message || e));
+  } finally {
+    wrap.remove(); btn.classList.remove('busy');
+  }
+}
+document.addEventListener('click', e => {
+  const b = e.target.closest('.xbtn');
+  if (b) { e.preventDefault(); e.stopPropagation(); exportSection(b.closest('.sec-head'), b); }
+}, true);
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', addButtons); else addButtons();
+window.addExportButtons = addButtons;
+})();
+"""
+
+CHARTS_HTML = """<!doctype html>
+<html lang="en"><head><title>Chart Builder</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<script>(function(){try{var d=document.documentElement,t=localStorage.getItem('ap-theme'),v=localStorage.getItem('ap-view');if(t!=='light'&&t!=='dark'){t=matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';localStorage.setItem('ap-theme',t);}if(v!=='phone'&&v!=='desktop'){v=Math.min(screen.width||9999,innerWidth||9999)<700?'phone':'desktop';localStorage.setItem('ap-view',v);}d.dataset.theme=t;if(v==='phone'||v==='desktop'){d.dataset.view=v;if(v==='desktop'){var m=document.querySelector('meta[name=viewport]');if(m)m.setAttribute('content','width=1200, viewport-fit=cover');}}}catch(e){}})();</script>
+<link rel="stylesheet" href="/assets/ov.css?v={{ asset_v }}">
+<script src="/assets/xp.js?v={{ asset_v }}" defer></script>
+<script src="/assets/ch.js?v={{ asset_v }}" defer></script>
+</head><body>
+<header class="top" id="top">
+  <div class="bar">
+    <h1 id="title">Chart Builder</h1>
+    <div class="menu">
+      <button type="button" class="pill" id="storeBtn" aria-haspopup="menu" aria-expanded="false">Stores</button>
+      <div class="ctx" id="storeMenu" role="menu"></div>
+    </div>
+  </div>
+  <div class="datenav"><span id="navLabel">&nbsp;</span></div>
+</header>
+
+<main class="wrap ch" id="wrap">
+  <section class="ch-panel" aria-label="Chart options">
+    <div class="ch-group" style="--g:#ff9500">
+      <span class="gi"><svg viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="15" rx="3"/><path d="M8 3v4M16 3v4M3.5 10h17"/></svg></span>
+      <div class="gb"><div class="gl">Period</div>
+        <div class="chips" id="presets"></div>
+        <div class="ch-range" id="customRange" hidden>
+          <label>From<input type="date" id="fromDate"></label>
+          <label>To<input type="date" id="toDate"></label>
+        </div>
+      </div>
+    </div>
+    <div class="ch-group" style="--g:#0a84ff">
+      <span class="gi"><svg viewBox="0 0 24 24"><path d="M5 20V11M10 20V5M15 20V9M20 20V14"/></svg></span>
+      <div class="gb"><div class="gl">Chart type</div>
+        <div class="seg ch-types" id="typeSeg" role="tablist" aria-label="Chart type"><span class="thumb"></span></div>
+      </div>
+    </div>
+    <div class="ch-group" style="--g:#34c759">
+      <span class="gi"><svg viewBox="0 0 24 24"><path d="M4 17l5-5 4 4 7-8"/><path d="M15 8h5v5"/></svg></span>
+      <div class="gb"><div class="gl">Measure</div>
+        <div class="seg seg3" id="measureSeg" role="tablist" aria-label="Measure"><span class="thumb"></span>
+          <button type="button" data-metric="v">Value</button><button type="button" data-metric="q">Units</button><button type="button" data-metric="asp">ASP</button>
+        </div>
+      </div>
+    </div>
+    <div class="ch-group" style="--g:#af52de">
+      <span class="gi"><svg viewBox="0 0 24 24"><path d="M4 4v16h16"/><path d="M8 15l3-4 3 2 4-6"/></svg></span>
+      <div class="gb"><div class="gl">Axes &amp; comparison</div>
+        <div class="ch-grid">
+          <label>X axis<select id="xSel"></select></label>
+          <label>Split by<select id="splitSel"></select></label>
+          <label>Compare<select id="cmpSel"><option value="">None</option><option value="prev">Previous period</option><option value="ly">Last year</option></select></label>
+          <label>Show<select id="topSel"><option value="5">Top 5</option><option value="10">Top 10</option><option value="15">Top 15</option><option value="25">Top 25</option><option value="0">All</option></select></label>
+        </div>
+      </div>
+    </div>
+    <div class="ch-group" style="--g:#ff2d55">
+      <span class="gi"><svg viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/></svg></span>
+      <div class="gb"><div class="gl">Options</div>
+        <div class="ch-toggles">
+          <label class="tg"><input type="checkbox" id="optSP"><span>SP combined</span></label>
+          <label class="tg"><input type="checkbox" id="optFF"><span>Foldables grouped</span></label>
+          <label class="tg"><input type="checkbox" id="optLabels"><span>Value labels</span></label>
+          <label class="tg"><input type="checkbox" id="optAvg"><span>Average line</span></label>
+          <label class="tg"><input type="checkbox" id="optTable"><span>Data table</span></label>
+          <label class="tg"><input type="checkbox" id="optSort"><span>Sort by size</span></label>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <p class="err" id="err" hidden></p>
+
+  <div class="sec-head"><h2 id="chartTitle">Chart</h2><span class="sub-note" id="chartNote"></span></div>
+  <div class="chips secseg" id="chSeg" role="group" aria-label="Segment for this chart" hidden></div>
+  <section class="card ch-card">
+    <div class="ch-total" id="chartTotal"></div>
+    <div id="chartBox" class="ch-box"></div>
+    <div class="ch-legend" id="chartLegend"></div>
+  </section>
+
+  <div id="tableBlock">
+    <div class="sec-head"><h2>Chart Data</h2><span class="sub-note" id="tableNote"></span></div>
+    <section class="card table-card"><div class="tscroll"><table class="cmp" id="dataTable"></table></div></section>
+  </div>
+  <p class="foot" id="updated"></p>
+</main>
+<div class="tip" id="tip" role="tooltip" hidden></div>
+</body></html>"""
+
+CH_CSS = r"""
+.ch .chips{margin-top:8px}
+.ch-range{display:flex;gap:10px;margin:0 2px 10px}
+.ch-range label,.ch-grid label{display:grid;gap:4px;font-size:12px;color:var(--label2);flex:1}
+.ch-range input,.ch-grid select{height:36px;padding:0 10px;border:0;border-radius:10px;background:var(--fill);color:var(--label);font:inherit;font-size:14px;width:100%}
+.ch-controls{display:grid;gap:12px}
+.ch-row{display:grid;grid-template-columns:70px 1fr;align-items:center;gap:10px;font-size:13px;color:var(--label2)}
+.ch-row .seg{margin:0;max-width:none}
+.seg3{--n:3}
+.ch-types{--n:7}
+.ch-panel{display:grid;gap:0;margin-top:8px;padding:6px 16px;border-radius:22px;
+background:linear-gradient(140deg,color-mix(in srgb,#0a84ff 9%,var(--card)) 0%,var(--card) 45%,color-mix(in srgb,#af52de 8%,var(--card)) 100%);
+box-shadow:0 0 0 .5px var(--sep),0 10px 30px rgba(0,0,0,.07)}
+.ch-group{display:grid;grid-template-columns:34px minmax(0,1fr);gap:12px;align-items:start;padding:14px 0}
+.ch-group+.ch-group{border-top:.5px solid var(--sep)}
+.gi{width:34px;height:34px;border-radius:10px;display:grid;place-items:center;background:linear-gradient(160deg,color-mix(in srgb,var(--g) 80%,#fff),var(--g));box-shadow:0 4px 10px color-mix(in srgb,var(--g) 35%,transparent)}
+.gi svg{width:19px;height:19px;fill:none;stroke:#fff;stroke-width:2.1;stroke-linecap:round;stroke-linejoin:round}
+.gl{margin:1px 0 9px;font-size:11.5px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--g)}
+.ch-panel .chips{margin:0;flex-wrap:wrap;overflow:visible}
+.ch-panel .chips button{background:color-mix(in srgb,var(--g) 11%,var(--fill));color:var(--label)}
+.ch-panel .chips button.on{background:var(--g);color:#fff;box-shadow:0 3px 10px color-mix(in srgb,var(--g) 40%,transparent)}
+.ch-panel .seg{margin:0;max-width:none;background:color-mix(in srgb,var(--g) 10%,var(--fill))}
+.ch-panel .seg .thumb{background:var(--g);box-shadow:0 3px 10px color-mix(in srgb,var(--g) 40%,transparent)}
+.ch-panel .seg button{transition:color .25s}
+.ch-panel .seg button[aria-selected=true]{color:#fff}
+.ch-panel select,.ch-panel input[type=date]{appearance:none;-webkit-appearance:none;background:color-mix(in srgb,var(--g) 9%,var(--fill));border:1px solid color-mix(in srgb,var(--g) 18%,transparent);
+background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23af52de' stroke-width='2.5' stroke-linecap='round'%3E%3Cpath d='M7 10l5 5 5-5'/%3E%3C/svg%3E");
+background-repeat:no-repeat;background-position:right 8px center;background-size:16px;padding-right:30px;font-weight:600}
+.ch-panel input[type=date]{background-image:none;padding-right:10px}
+.ch-panel select:focus,.ch-panel input:focus{outline:2px solid var(--g)}
+.ch-panel .tg span{background:color-mix(in srgb,var(--g) 9%,var(--fill));color:var(--label2)}
+.ch-panel .tg input:checked+span{background:var(--g);color:#fff;box-shadow:0 3px 10px color-mix(in srgb,var(--g) 35%,transparent)}
+.ch-panel .tg input:checked+span::before{content:"✓ ";font-weight:700}
+.ch-types button{display:grid;place-items:center}
+.ch-types svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.ch-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.ch-toggles{display:flex;flex-wrap:wrap;gap:8px}
+.tg{display:inline-flex;align-items:center;cursor:pointer}
+.tg input{position:absolute;opacity:0;pointer-events:none}
+.tg span{height:30px;padding:0 12px;display:inline-flex;align-items:center;border-radius:15px;background:var(--fill);font-size:13px;font-weight:600;color:var(--label2)}
+.tg input:checked+span{background:color-mix(in srgb,var(--blue) 18%,transparent);color:var(--blue)}
+.tg input:focus-visible+span{outline:2px solid var(--blue)}
+.ch-card{padding:14px 12px 12px}
+.ch-total{display:flex;align-items:baseline;justify-content:space-between;gap:10px;flex-wrap:wrap;padding:0 4px 6px}
+.ch-total b{font-size:26px;font-weight:700;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+.ch-total span{font-size:13px;color:var(--label2)}
+.ch-box{width:100%;overflow-x:auto}
+.ch-box svg{display:block}
+.ch-box text{font:11px -apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,sans-serif;fill:var(--label2)}
+.ch-box .vl-t{fill:var(--label);font-weight:600;font-size:10.5px}
+.ch-box .ct{fill:var(--label);font-size:20px;font-weight:700}
+.ch-box .gl{stroke:var(--grid);stroke-width:1}
+.ch-box .avg{stroke:var(--avg);stroke-width:1.5;stroke-dasharray:5 4}
+.ch-box .cmpl{fill:none;stroke:var(--label);stroke-width:1.8;stroke-dasharray:5 4;opacity:.65}
+.ch-box .hit{fill:transparent;cursor:pointer}
+.ch-box .hit:hover,.ch-box .hit.hot{fill:color-mix(in srgb,var(--label) 7%,transparent)}
+.ch-legend{display:flex;flex-wrap:wrap;gap:6px 14px;padding:10px 4px 0;font-size:12.5px}
+.ch-legend span{display:inline-flex;align-items:center;gap:6px}
+.ch-legend i{width:10px;height:10px;border-radius:3px;display:inline-block}
+.ch-legend i.dash{height:0;border-top:2px dashed var(--label);border-radius:0;opacity:.65}
+@media (min-width:760px){.ch-grid{grid-template-columns:repeat(4,minmax(0,1fr))}}
+"""
+
+CH_JS = r"""
+(function(){
+const $ = s => document.querySelector(s);
+const $$ = s => Array.from(document.querySelectorAll(s));
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const store = {
+  get(k){ try { return localStorage.getItem(k); } catch (e) { return null; } },
+  set(k, v){ try { localStorage.setItem(k, v); } catch (e) {} }
+};
+const trimNum = n => n.toFixed(2);
+function compact(v){
+  if (window.AP_FULL) return Math.round(v || 0).toLocaleString('en-IN');   // Quick settings: full numbers
+  const a = Math.abs(v || 0), s = v < 0 ? '-' : '';
+  if (a >= 1e7) return s + trimNum(a / 1e7) + 'Cr';
+  if (a >= 1e5) return s + trimNum(a / 1e5) + 'L';
+  if (a >= 1e3) return s + trimNum(a / 1e3) + 'K';
+  return s + (a % 1 ? a.toFixed(2) : Math.round(a));
+}
+const full = v => Math.round(v || 0).toLocaleString('en-IN');
+const iso = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+const day = s => new Date(s + 'T00:00:00');
+const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x; };
+
+const PALETTE = ['#0a84ff', '#30b0c7', '#ff9500', '#af52de', '#ff2d55', '#34c759', '#5e5ce6', '#ffcc00', '#a2845e', '#8e8e93'];
+const SEG_FIXED = { sp: 0, flagship: 0, innovative: 1, tab: 2, npc: 3, wearables: 4, accessories: 5 };
+const TYPES = [
+  ['bar', 'Bar', '<path d="M5 20V11M10 20V5M15 20V9M20 20V14"/>'],
+  ['stack', 'Stacked', '<path d="M6 20v-6M6 11V8M12 20v-9M12 8V4M18 20v-4M18 13v-3"/>'],
+  ['pct', '100% stacked', '<rect x="4" y="4" width="5" height="16" rx="1"/><rect x="15" y="4" width="5" height="16" rx="1"/><path d="M4 12h5M15 9h5"/>'],
+  ['line', 'Line', '<path d="M3 17l5-6 4 3 8-9"/>'],
+  ['area', 'Area', '<path d="M3 19l5-7 4 3 9-9v13z"/>'],
+  ['hbar', 'Horizontal bar', '<path d="M4 6h10M4 12h16M4 18h7"/>'],
+  ['donut', 'Donut', '<circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3.5"/><path d="M12 4v4.5"/>'],
+];
+const PRESETS = [['mtd', 'MTD'], ['lmtd', 'Last month'], ['l7', 'Last 7 days'], ['l30', 'Last 30 days'], ['l90', 'Last 90 days'], ['qtd', 'QTD'], ['ytd', 'YTD'], ['l12m', 'Last 12 months'], ['all', 'All data'], ['custom', 'Custom']];
+
+let saved = {};
+try { saved = JSON.parse(store.get('ch-state') || '{}'); } catch (e) {}
+let ovState = {};
+try { ovState = JSON.parse(store.get('ov-state') || '{}'); } catch (e) {}
+const st = Object.assign({ type: 'bar', metric: 'v', x: 'day', split: '', compare: '', top: '10', preset: 'mtd', start: '', end: '',
+  labels: false, avg: true, table: true, sort: false, sp: false, ff: true, seg: '' }, saved);
+st.sel = StorePicker.saved(); delete st.store;
+const save = () => { const { sel, ...rest } = st; store.set('ch-state', JSON.stringify(rest)); };
+let data = null, ctrl = null;
+
+
+function presetRange(p, dmin, dmax){
+  const M = day(dmax), first = new Date(M.getFullYear(), M.getMonth(), 1);
+  switch (p) {
+    case 'lmtd': { const a = new Date(M.getFullYear(), M.getMonth() - 1, 1); return [a, new Date(M.getFullYear(), M.getMonth(), 0)]; }
+    case 'l7': return [addDays(M, -6), M];
+    case 'l30': return [addDays(M, -29), M];
+    case 'l90': return [addDays(M, -89), M];
+    case 'qtd': return [new Date(M.getFullYear(), Math.floor(M.getMonth() / 3) * 3, 1), M];
+    case 'ytd': return [new Date(M.getFullYear(), 0, 1), M];
+    case 'l12m': return [new Date(M.getFullYear(), M.getMonth() - 11, 1), M];
+    case 'all': return [day(dmin), M];
+    case 'custom': return [st.start ? day(st.start) : first, st.end ? day(st.end) : M];
+    default: return [first, M];
+  }
+}
+
+/* ---------- values per measure ---------- */
+const isASP = () => st.metric === 'asp';
+const fmt = v => (st.metric === 'q' ? full(v) : compact(v));
+const fmtFull = v => (st.metric === 'q' ? full(v) + ' units' : full(v));
+function valuesOf(s){
+  if (st.metric === 'q') return s.q.slice();
+  if (st.metric === 'asp') return s.v.map((v, i) => (s.q[i] ? v / s.q[i] : 0));
+  return s.v.slice();
+}
+function colorFor(name, i, splitDim){
+  if (name === 'Total') return PALETTE[0];
+  if (name === 'Other') return '#8e8e93';
+  if (splitDim === 'seg') { const f = SEG_FIXED[String(name).toLowerCase()]; if (f != null) return PALETTE[f]; }
+  return PALETTE[i % (PALETTE.length - 1)];
+}
+function niceTicks(max){
+  if (!(max > 0)) return [0, 1];
+  const p = Math.pow(10, Math.floor(Math.log10(max))), m = max / p;
+  const top = [1, 1.2, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10].find(x => m <= x) * p;
+  return [0, top / 4, top / 2, top * 3 / 4, top];
+}
+
+/* ---------- SVG chart ---------- */
+let tipRows = null;
+function build(){
+  const d = data;
+  const box = $('#chartBox');
+  let xs = d.x.map((x, i) => ({ ...x, i }));
+  let series = d.series.map((s, i) => ({ name: s.name, color: colorFor(s.name, i, d.split), vals: valuesOf(s), raw: s }));
+  const comp = d.compare ? { ...d.compare, vals: valuesOf(d.compare) } : null;
+  let type = st.type;
+  if (isASP() && (type === 'stack' || type === 'pct' || type === 'area')) type = 'bar';
+  const totals = xs.map(x => (isASP()
+    ? (() => { const v = d.series.reduce((a, s) => a + s.v[x.i], 0), q = d.series.reduce((a, s) => a + s.q[x.i], 0); return q ? v / q : 0; })()
+    : series.reduce((a, s) => a + s.vals[x.i], 0)));
+  if (st.sort && d.x_kind === 'cat') xs = xs.slice().sort((a, b) => totals[b.i] - totals[a.i]);
+  const W = Math.max(300, Math.floor(box.getBoundingClientRect().width || 600) - 2);
+  tipRows = { xs, series, comp, totals };
+  if (!xs.length || (!totals.some(v => v > 0) && !(comp && comp.vals.some(v => v > 0)))) {
+    box.innerHTML = '<p class="plan-empty" style="padding:30px 8px;text-align:center">No sales in this period for the chosen options.</p>';
+    $('#chartLegend').innerHTML = '';
+    return;
+  }
+
+  if (type === 'donut') return donut(box, W, xs, series, totals);
+  if (type === 'hbar') return hbar(box, W, xs, series, comp, totals);
+
+  const n = xs.length, stacked = type === 'stack' || type === 'pct' || (type === 'area' && series.length > 1);
+  const H = 300, m = { l: 48, r: 14, t: 18, b: 46 };
+  const minBand = type === 'line' || type === 'area' ? 14 : (series.length > 1 && !stacked ? 12 * series.length + 8 : 18);
+  const plotW = Math.max(W - m.l - m.r, n * minBand), pw = plotW + m.l + m.r, ph = H - m.t - m.b;
+  const band = plotW / n;
+  const yMax = type === 'pct' ? 100 : Math.max(1, ...(stacked ? totals : series.flatMap(s => s.vals)), ...(comp && type !== 'pct' ? comp.vals : [0]));
+  const ticks = type === 'pct' ? [0, 25, 50, 75, 100] : niceTicks(yMax);
+  const top = ticks[ticks.length - 1];
+  const Y = v => m.t + ph - Math.max(0, v) / top * ph;
+  const X = i => m.l + band * i + band / 2;
+  let g = `<svg width="${pw}" height="${H}" viewBox="0 0 ${pw} ${H}" role="img" aria-label="${esc($('#chartTitle').textContent)}">`;
+  ticks.forEach(t => { g += `<line class="gl" x1="${m.l}" x2="${m.l + plotW}" y1="${Y(t)}" y2="${Y(t)}"/><text x="${m.l - 6}" y="${Y(t) + 4}" text-anchor="end">${type === 'pct' ? t + '%' : fmt(t)}</text>`; });
+  const every = Math.ceil(n / Math.max(1, Math.floor(plotW / 46)));
+  const rotate = d.x_kind === 'cat' && xs.some(x => x.label.length > 6) && band < 70;
+  xs.forEach((x, k) => {
+    if (k % every) return;
+    const lab = x.label.length > 14 ? x.label.slice(0, 13) + '…' : x.label;
+    g += rotate ? `<text transform="translate(${X(k)},${H - m.b + 12}) rotate(-35)" text-anchor="end">${esc(lab)}</text>`
+                : `<text x="${X(k)}" y="${H - m.b + 16}" text-anchor="middle">${esc(lab)}</text>`;
+  });
+
+  if (type === 'bar' || stacked && type !== 'area') {
+    xs.forEach((x, k) => {
+      const tot = totals[x.i];
+      if (type === 'bar') {
+        const bw = Math.min(46, band * 0.72 / series.length);
+        series.forEach((s, j) => {
+          const v = s.vals[x.i], x0 = X(k) - bw * series.length / 2 + j * bw;
+          g += `<rect x="${x0 + 1}" y="${Y(v)}" width="${Math.max(1, bw - 2)}" height="${Math.max(0, Y(0) - Y(v))}" rx="3" fill="${s.color}"/>`;
+          if (st.labels && v && (series.length === 1 || bw > 22)) g += `<text class="vl-t" x="${x0 + bw / 2}" y="${Y(v) - 4}" text-anchor="middle">${fmt(v)}</text>`;
+        });
+      } else {
+        const bw = Math.min(46, band * 0.66); let acc = 0;
+        series.forEach(s => {
+          const raw = s.vals[x.i], v = type === 'pct' ? (tot ? raw / tot * 100 : 0) : raw;
+          if (v > 0) g += `<rect x="${X(k) - bw / 2}" y="${Y(acc + v)}" width="${bw}" height="${Math.max(0, Y(acc) - Y(acc + v))}" fill="${s.color}"/>`;
+          if (st.labels && type === 'pct' && v >= 8) g += `<text class="vl-t" x="${X(k)}" y="${Y(acc + v / 2) + 4}" text-anchor="middle" style="fill:#fff">${v.toFixed(2)}%</text>`;
+          acc += v;
+        });
+        if (st.labels && type === 'stack' && tot) g += `<text class="vl-t" x="${X(k)}" y="${Y(tot) - 4}" text-anchor="middle">${fmt(tot)}</text>`;
+      }
+    });
+  } else {
+    const base = xs.map(() => 0);
+    series.forEach(s => {
+      const pts = xs.map((x, k) => { const v = s.vals[x.i] + (type === 'area' ? base[k] : 0); return [X(k), Y(v), v]; });
+      if (type === 'area') {
+        const low = xs.map((x, k) => [X(k), Y(base[k])]).reverse();
+        g += `<path d="M${pts.map(p => p[0] + ',' + p[1]).join('L')}L${low.map(p => p[0] + ',' + p[1]).join('L')}Z" fill="${s.color}" fill-opacity="${series.length > 1 ? 0.85 : 0.35}" stroke="${s.color}" stroke-width="1.5"/>`;
+        xs.forEach((x, k) => { base[k] += s.vals[x.i]; });
+      } else {
+        g += `<path d="M${pts.map(p => p[0] + ',' + p[1]).join('L')}" fill="none" stroke="${s.color}" stroke-width="2.2" stroke-linejoin="round"/>`;
+        if (n <= 40) pts.forEach(p => { g += `<circle cx="${p[0]}" cy="${p[1]}" r="2.6" fill="${s.color}"/>`; });
+      }
+      if (st.labels && (series.length === 1 || type === 'area')) pts.forEach(p => { if (p[2]) g += `<text class="vl-t" x="${p[0]}" y="${p[1] - 7}" text-anchor="middle">${fmt(type === 'area' ? p[2] : p[2])}</text>`; });
+    });
+  }
+  if (comp && type !== 'pct') {
+    const pts = xs.map((x, k) => [X(k), Y(comp.vals[x.i])]);
+    g += `<path class="cmpl" d="M${pts.map(p => p[0] + ',' + p[1]).join('L')}"/>`;
+  }
+  if (st.avg && type !== 'pct') {
+    const live = xs.filter(x => !x.future).map(x => totals[x.i]);
+    const avg = live.length ? live.reduce((a, b) => a + b, 0) / live.length : 0;
+    if (avg > 0) g += `<line class="avg" x1="${m.l}" x2="${m.l + plotW}" y1="${Y(avg)}" y2="${Y(avg)}"/><text x="${m.l + plotW}" y="${Y(avg) - 4}" text-anchor="end" style="fill:var(--avg)">avg ${fmt(avg)}</text>`;
+  }
+  xs.forEach((x, k) => { g += `<rect class="hit" data-k="${k}" x="${m.l + band * k}" y="${m.t}" width="${band}" height="${ph}"/>`; });
+  box.innerHTML = g + '</svg>';
+  legend(series, comp);
+}
+
+function hbar(box, W, xs, series, comp, totals){
+  const rowH = series.length > 1 && st.type !== 'hbar' ? 22 : 26, m = { l: Math.min(170, Math.max(80, W * 0.3)), r: 64, t: 6, b: 20 };
+  const H = m.t + m.b + xs.length * rowH, plotW = W - m.l - m.r;
+  const max = Math.max(1, ...totals, ...(comp ? comp.vals : [0]));
+  const ticks = niceTicks(max), top = ticks[ticks.length - 1];
+  const Xv = v => m.l + Math.max(0, v) / top * plotW;
+  let g = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img">`;
+  ticks.forEach(t => { g += `<line class="gl" x1="${Xv(t)}" x2="${Xv(t)}" y1="${m.t}" y2="${H - m.b}"/><text x="${Xv(t)}" y="${H - 4}" text-anchor="middle">${fmt(t)}</text>`; });
+  xs.forEach((x, k) => {
+    const y = m.t + k * rowH, bh = rowH - 8;
+    const lab = x.label.length > 24 ? x.label.slice(0, 23) + '…' : x.label;
+    g += `<text x="${m.l - 8}" y="${y + rowH / 2 + 4}" text-anchor="end" style="fill:var(--label)">${esc(lab)}</text>`;
+    let acc = 0;
+    series.forEach(s => { const v = isASP() ? totals[x.i] : s.vals[x.i]; if (v > 0) g += `<rect x="${Xv(acc)}" y="${y + 4}" width="${Math.max(0, Xv(acc + v) - Xv(acc))}" height="${bh}" rx="${series.length > 1 ? 0 : 4}" fill="${s.color}"/>`; acc += isASP() ? 0 : v; });
+    if (comp) { const cx = Xv(comp.vals[x.i]); g += `<line x1="${cx}" x2="${cx}" y1="${y + 1}" y2="${y + rowH - 1}" stroke="var(--label)" stroke-width="2" opacity=".6"/>`; }
+    g += `<text class="vl-t" x="${Xv(totals[x.i]) + 6}" y="${y + rowH / 2 + 4}">${fmt(totals[x.i])}</text>`;
+    g += `<rect class="hit" data-k="${k}" x="0" y="${y}" width="${W}" height="${rowH}"/>`;
+  });
+  box.innerHTML = g + '</svg>';
+  legend(series, comp);
+}
+
+function donut(box, W, xs, series, totals){
+  const slices = series.length > 1
+    ? series.map(s => ({ name: s.name, color: s.color, v: isASP() ? 0 : s.vals.reduce((a, b) => a + b, 0) }))
+    : xs.map((x, k) => ({ name: x.label, color: colorFor(x.label, k, data.x_dim), v: totals[x.i] }));
+  const sum = slices.reduce((a, s) => a + s.v, 0) || 1;
+  const size = Math.min(W, 340), R = size / 2 - 10, r = R * 0.6, cx = W / 2, cy = size / 2;
+  let a0 = -Math.PI / 2, g = `<svg width="${W}" height="${size}" viewBox="0 0 ${W} ${size}" role="img">`;
+  slices.forEach((s, k) => {
+    const frac = s.v / sum; if (frac <= 0) return;
+    const a1 = a0 + frac * Math.PI * 2, large = a1 - a0 > Math.PI ? 1 : 0;
+    const p = (rad, ang) => [cx + rad * Math.cos(ang), cy + rad * Math.sin(ang)];
+    const [x0, y0] = p(R, a0), [x1, y1] = p(R, frac >= 0.9999 ? a1 - 0.0001 : a1), [x2, y2] = p(r, frac >= 0.9999 ? a1 - 0.0001 : a1), [x3, y3] = p(r, a0);
+    g += `<path class="hit-s" data-k="${k}" d="M${x0},${y0}A${R},${R} 0 ${large} 1 ${x1},${y1}L${x2},${y2}A${r},${r} 0 ${large} 0 ${x3},${y3}Z" fill="${s.color}" stroke="var(--card)" stroke-width="1.5"/>`;
+    if (st.labels && frac > 0.05) { const [lx, ly] = p((R + r) / 2, (a0 + a1) / 2); g += `<text x="${lx}" y="${ly + 4}" text-anchor="middle" style="fill:#fff;font-weight:700">${(frac * 100).toFixed(2)}%</text>`; }
+    a0 = a1;
+  });
+  g += `<text class="ct" x="${cx}" y="${cy + 2}" text-anchor="middle">${isASP() ? '' : fmt(sum)}</text><text x="${cx}" y="${cy + 20}" text-anchor="middle">${isASP() ? 'ASP not additive' : 'total'}</text>`;
+  box.innerHTML = g + '</svg>';
+  tipRows.slices = slices; tipRows.sum = sum;
+  $('#chartLegend').innerHTML = slices.filter(s => s.v > 0).map(s => `<span><i style="background:${s.color}"></i>${esc(s.name)} · ${fmt(s.v)} · ${(s.v / sum * 100).toFixed(2)}%</span>`).join('');
+}
+
+function legend(series, comp){
+  const items = (series.length > 1 ? series.map(s => `<span><i style="background:${s.color}"></i>${esc(s.name)}</span>`) : []);
+  if (comp) items.push(`<span><i class="dash"></i>${esc(comp.label)} (${esc(comp.range)})</span>`);
+  if (st.avg && st.type !== 'pct' && st.type !== 'donut' && st.type !== 'hbar') items.push(`<span><i class="dash" style="border-color:var(--avg)"></i>Average</span>`);
+  $('#chartLegend').innerHTML = items.join('');
+}
+
+/* ---------- pop-up ---------- */
+const tip = $('#tip');
+function showTip(k, x, y){
+  if (!tipRows) return;
+  let h;
+  if (tipRows.slices) {
+    const s = tipRows.slices[k]; if (!s) return;
+    h = `<h4>${esc(s.name)}</h4><div class="tv">${fmtFull(s.v)}</div><div class="tl"><span>Share</span><span>${(s.v / tipRows.sum * 100).toFixed(2)}%</span></div>`;
+  } else {
+    const xo = tipRows.xs[k]; if (!xo) return;
+    const i = xo.i, tot = tipRows.totals[i];
+    h = `<h4>${esc(xo.label)}</h4><div class="tv">${fmtFull(tot)}</div>`;
+    const other = st.metric === 'q' ? data.series.reduce((a, s) => a + s.v[i], 0) : data.series.reduce((a, s) => a + s.q[i], 0);
+    h += `<div class="tl" style="color:var(--label2)"><span>${st.metric === 'q' ? 'Value' : 'Units'}</span><span>${full(other)}</span></div>`;
+    if (tipRows.series.length > 1) h += tipRows.series.filter(s => s.vals[i]).map(s => `<div class="tl"><span><i style="background:${s.color}"></i>${esc(s.name)}</span><span>${fmt(s.vals[i])}${!isASP() && tot ? ' · ' + (s.vals[i] / tot * 100).toFixed(2) + '%' : ''}</span></div>`).join('');
+    if (tipRows.comp) {
+      const c = tipRows.comp.vals[i];
+      const gr = c ? ((tot - c) / c * 100) : null;
+      h += `<div class="ly"><span>${esc(tipRows.comp.label)} ${c ? fmt(c) : '–'}</span>${gr == null ? (tot ? '<span class="gc new">New</span>' : '') : `<span class="gc ${gr >= 0 ? 'up' : 'down'}">${gr >= 0 ? '↑' : '↓'}${Math.abs(gr).toFixed(2)}%</span>`}</div>`;
+    }
+  }
+  tip.innerHTML = h; tip.hidden = false;
+  const r = tip.getBoundingClientRect();
+  let left = x + 14, top = y - r.height - 12;
+  if (left + r.width > innerWidth - 8) left = x - r.width - 14;
+  if (top < 8) top = y + 16;
+  tip.style.left = Math.max(8, left) + 'px'; tip.style.top = Math.max(8, Math.min(top, innerHeight - r.height - 8)) + 'px';
+}
+const hideTip = () => { tip.hidden = true; $$('.hit.hot').forEach(h => h.classList.remove('hot')); };
+$('#chartBox').addEventListener('pointermove', e => {
+  if (e.pointerType === 'touch') return;
+  const h = e.target.closest('[data-k]'); if (h) showTip(+h.dataset.k, e.clientX, e.clientY); else hideTip();
+});
+$('#chartBox').addEventListener('pointerleave', hideTip);
+$('#chartBox').addEventListener('click', e => {
+  const h = e.target.closest('[data-k]'); if (!h) return hideTip();
+  $$('.hit.hot').forEach(x => x.classList.remove('hot')); h.classList.add('hot');
+  showTip(+h.dataset.k, e.clientX, e.clientY);
+});
+window.addEventListener('scroll', hideTip, { passive: true });
+
+/* ---------- table ---------- */
+function table(){
+  const d = data, { xs, series, comp, totals } = tipRows;
+  const multi = series.length > 1;
+  const dimName = id => ((d.dims.concat(d.time_dims)).find(x => x.key === id) || {}).label || id;
+  const head = `<th>${esc(dimName(d.x_dim))}</th>${multi ? series.map(s => `<th>${esc(s.name)}</th>`).join('') : ''}<th>${isASP() ? 'ASP' : 'Total'}</th>${!isASP() ? '<th>Share</th>' : ''}${comp ? `<th>${esc(comp.label)}</th><th>Growth</th>` : ''}`;
+  const grand = isASP() ? 0 : xs.reduce((a, x) => a + totals[x.i], 0);
+  const rows = xs.map(x => {
+    const t = totals[x.i], c = comp ? comp.vals[x.i] : 0;
+    const gr = comp ? (c ? `<span class="gc ${t >= c ? 'up' : 'down'}">${t >= c ? '↑' : '↓'}${Math.abs((t - c) / c * 100).toFixed(2)}%</span>` : (t ? '<span class="gc new">New</span>' : '–')) : '';
+    return `<tr><td>${esc(x.label)}</td>${multi ? series.map(s => `<td>${fmt(s.vals[x.i])}</td>`).join('') : ''}<td><b>${fmt(t)}</b></td>${!isASP() ? `<td>${grand ? (t / grand * 100).toFixed(2) + '%' : '–'}</td>` : ''}${comp ? `<td>${fmt(c)}</td><td>${gr}</td>` : ''}</tr>`;
+  }).join('');
+  const ctot = comp ? xs.reduce((a, x) => a + comp.vals[x.i], 0) : 0;
+  const foot = isASP() ? '' : `<tfoot><tr><td>Total</td>${multi ? series.map(s => `<td>${fmt(xs.reduce((a, x) => a + s.vals[x.i], 0))}</td>`).join('') : ''}<td>${fmt(grand)}</td><td>100%</td>${comp ? `<td>${fmt(ctot)}</td><td>${ctot ? `<span class="gc ${grand >= ctot ? 'up' : 'down'}">${grand >= ctot ? '↑' : '↓'}${Math.abs((grand - ctot) / ctot * 100).toFixed(2)}%</span>` : '–'}</td>` : ''}</tr></tfoot>`;
+  $('#dataTable').innerHTML = `<thead><tr>${head}</tr></thead><tbody>${rows}</tbody>${foot}`;
+  $('#tableNote').textContent = `${xs.length} rows · ${d.range}`;
+}
+
+/* ---------- controls ---------- */
+function controls(){
+  const d = data;
+  $('#presets').innerHTML = PRESETS.map(([k, t]) => `<button type="button" data-preset="${k}" class="${st.preset === k ? 'on' : ''}">${t}</button>`).join('');
+  $('#customRange').hidden = st.preset !== 'custom';
+  $('#fromDate').value = d.start; $('#toDate').value = d.end;
+  $('#fromDate').min = $('#toDate').min = d.dmin; $('#fromDate').max = $('#toDate').max = d.dmax;
+  const opt = (k, t, sel) => `<option value="${esc(k)}"${sel === k ? ' selected' : ''}>${esc(t)}</option>`;
+  $('#xSel').innerHTML = `<optgroup label="Time">${d.time_dims.map(x => opt(x.key, x.label, d.x_dim)).join('')}</optgroup><optgroup label="Category">${d.dims.map(x => opt(x.key, x.label, d.x_dim)).join('')}</optgroup>`;
+  $('#splitSel').innerHTML = opt('', 'None', d.split) + d.dims.filter(x => x.key !== d.x_dim).map(x => opt(x.key, x.label, d.split)).join('');
+  $('#cmpSel').value = st.compare; $('#topSel').value = st.top;
+  $('#topSel').disabled = d.x_kind !== 'cat';
+  $('#optLabels').checked = st.labels; $('#optAvg').checked = st.avg; $('#optTable').checked = st.table; $('#optSort').checked = st.sort;
+  $('#optSP').checked = st.sp; $('#optFF').checked = st.ff;
+  $('#optSort').closest('label').hidden = d.x_kind !== 'cat';
+  $('#typeSeg').innerHTML = '<span class="thumb"></span>' + TYPES.map(([k, t, ic]) => `<button type="button" data-type="${k}" title="${t}" aria-label="${t}"><svg viewBox="0 0 24 24">${ic}</svg></button>`).join('');
+  $('#typeSeg').style.setProperty('--i', Math.max(0, TYPES.findIndex(t => t[0] === st.type)));
+  $('#measureSeg').style.setProperty('--i', ['v', 'q', 'asp'].indexOf(st.metric));
+  $$('#typeSeg button').forEach(b => b.setAttribute('aria-selected', String(b.dataset.type === st.type)));
+  $$('#measureSeg button').forEach(b => b.setAttribute('aria-selected', String(b.dataset.metric === st.metric)));
+}
+
+function render(){
+  const d = data;
+  $('#err').hidden = !d.error; if (d.error) { $('#err').textContent = d.error; return; }
+  $('#title').textContent = d.store_label || 'All Stores';
+  $('#navLabel').textContent = d.range;
+  StorePicker.mount({ stores: d.stores, selected: d.scope, onChange: sel => { st.sel = sel; load(); } });
+  controls();
+  paintChSeg(d);
+  const dimName = id => ((d.dims.concat(d.time_dims)).find(x => x.key === id) || {}).label || id;
+  const mName = { v: 'Value', q: 'Units', asp: 'ASP' }[st.metric];
+  $('#chartTitle').textContent = `${mName} by ${dimName(d.x_dim)}${d.split ? ' · split by ' + dimName(d.split) : ''}`;
+  $('#chartNote').textContent = d.range + (d.compare ? ` · vs ${d.compare.label.toLowerCase()} ${d.compare.range}` : '');
+  const tv = isASP() ? (d.total.q ? d.total.v / d.total.q : 0) : d.total[st.metric];
+  let sub = isASP() ? `${full(d.total.q)} units` : st.metric === 'q' ? `${compact(d.total.v)} value` : `${full(d.total.q)} units`;
+  if (d.compare && !isASP()) {
+    const c = valuesOf(d.compare).reduce((a, b) => a + b, 0);
+    if (c) sub += ` · ${tv >= c ? '↑' : '↓'}${Math.abs((tv - c) / c * 100).toFixed(2)}% vs ${d.compare.label.toLowerCase()}`;
+  }
+  $('#chartTotal').innerHTML = `<b>${fmt(tv)}</b><span>${esc(sub)}</span>`;
+  build();
+  $('#tableBlock').hidden = !st.table;
+  if (st.table) table();
+  $('#updated').textContent = `${d.updated ? 'Updated ' + d.updated + ' · ' : ''}data ${d.dmin} to ${d.dmax}`;
+  if (window.addExportButtons) window.addExportButtons();
+}
+
+/* segment chooser on the chart: All, or one segment sold in the period */
+function paintChSeg(d){
+  const el = $('#chSeg'), segs = (d && d.segments) || [];
+  const list = st.seg && !segs.includes(st.seg) ? [...segs, st.seg] : segs;
+  el.hidden = list.length < 2;
+  el.innerHTML = ['', ...list].map(x => `<button type="button" data-chseg="${esc(x)}" class="${(st.seg || '') === x ? 'on' : ''}">${x ? esc(x) : 'All'}</button>`).join('');
+}
+$('#chSeg').addEventListener('click', e => { const b = e.target.closest('[data-chseg]'); if (!b) return; st.seg = b.dataset.chseg; load(); });
+async function load(){
+  save();
+  if (ctrl) ctrl.abort();
+  const mine = ctrl = new AbortController();
+  $('#wrap').classList.add('loading');
+  const q = new URLSearchParams({ x: st.x, split: st.split, metric: st.metric, top: st.top, compare: st.compare,
+    sp: st.sp ? '1' : '0', ff: st.ff ? '1' : '0' });
+  if (st.seg) q.set('seg', st.seg);   // the chart's segment chooser
+  st.sel.forEach(s => q.append('store', s));
+  if (data && !data.error && st.preset !== 'custom') { const [a, b] = presetRange(st.preset, data.dmin, data.dmax); q.set('start', iso(a)); q.set('end', iso(b)); }
+  else if (st.preset === 'custom' && st.start) { q.set('start', st.start); q.set('end', st.end || st.start); }
+  try {
+    const res = await fetch('/api/chart?' + q, { signal: mine.signal });
+    const d = await res.json();
+    const first = !data || data.error;
+    data = d;
+    if (!d.error) { st.x = d.x_dim; st.split = d.split; st.sel = d.scope || []; }
+    if (first && !d.error && st.preset !== 'mtd' && st.preset !== 'custom') return load();  // first call only learns the data's date range
+    render();
+  } catch (e) {
+    if (e.name !== 'AbortError') { data = { error: 'Could not reach the server. Please try again.' }; render(); }
+  } finally { if (mine === ctrl) $('#wrap').classList.remove('loading'); }
+}
+
+document.addEventListener('click', e => {
+  const p = e.target.closest('[data-preset]');
+  if (p) { st.preset = p.dataset.preset; if (st.preset === 'custom' && data && !data.error) { st.start = data.start; st.end = data.end; } load(); return; }
+  const t = e.target.closest('[data-type]');
+  if (t) { st.type = t.dataset.type; save(); controls(); build(); if (st.table) table(); return; }
+  const m = e.target.closest('[data-metric]');
+  if (m) { st.metric = m.dataset.metric; load(); return; }
+});
+$('#xSel').addEventListener('change', e => { st.x = e.target.value; if (st.split === st.x) st.split = ''; load(); });
+$('#splitSel').addEventListener('change', e => { st.split = e.target.value; load(); });
+$('#cmpSel').addEventListener('change', e => { st.compare = e.target.value; load(); });
+$('#topSel').addEventListener('change', e => { st.top = e.target.value; load(); });
+[['optLabels', 'labels'], ['optAvg', 'avg'], ['optTable', 'table'], ['optSort', 'sort']].forEach(([id, k]) => $('#' + id).addEventListener('change', e => { st[k] = e.target.checked; save(); render(); }));
+[['optSP', 'sp'], ['optFF', 'ff']].forEach(([id, k]) => $('#' + id).addEventListener('change', e => { st[k] = e.target.checked; load(); }));
+['fromDate', 'toDate'].forEach(id => $('#' + id).addEventListener('change', () => { st.preset = 'custom'; st.start = $('#fromDate').value; st.end = $('#toDate').value; load(); }));
+let rt = null;
+window.addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(() => { if (data && !data.error) { build(); } }, 150); });
+const top = $('#top');
+window.addEventListener('scroll', () => top.classList.toggle('scrolled', window.scrollY > 4), { passive: true });
+load();
+})();
+"""
+
+EOD_HTML = """<!doctype html>
+<html lang="en"><head><title>EOD Report</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<script>(function(){try{var d=document.documentElement,t=localStorage.getItem('ap-theme'),v=localStorage.getItem('ap-view');if(t!=='light'&&t!=='dark'){t=matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';localStorage.setItem('ap-theme',t);}if(v!=='phone'&&v!=='desktop'){v=Math.min(screen.width||9999,innerWidth||9999)<700?'phone':'desktop';localStorage.setItem('ap-view',v);}d.dataset.theme=t;if(v==='phone'||v==='desktop'){d.dataset.view=v;if(v==='desktop'){var m=document.querySelector('meta[name=viewport]');if(m)m.setAttribute('content','width=1200, viewport-fit=cover');}}}catch(e){}})();</script>
+<link rel="stylesheet" href="/assets/ov.css?v={{ asset_v }}">
+<script src="/assets/xp.js?v={{ asset_v }}" defer></script>
+<script src="/assets/eod.js?v={{ asset_v }}" defer></script>
+</head><body data-noexport>
+<script id="eodBoot" type="application/json">{{ eod_json|safe }}</script>
+<header class="top" id="top">
+  <div class="bar">
+    <h1 id="title">EOD Report</h1>
+    <div class="menu">
+      <button type="button" class="pill" id="storeBtn" aria-haspopup="menu" aria-expanded="false">Stores</button>
+      <div class="ctx" id="storeMenu" role="menu"></div>
+    </div>
+  </div>
+  <div class="datenav"><span id="navLabel">&nbsp;</span></div>
+</header>
+
+<main class="wrap eod2" id="wrap">
+  <p class="err" id="warn" hidden></p>
+  <div class="eod-layout">
+    <div class="eod-left">
+      <div class="sec-head"><h2>Today</h2><span class="sub-note" id="todayNote"></span></div>
+      <section class="card eod-tiles">
+        <label class="et"><small>Total day sales</small><input type="text" inputmode="numeric" id="totalSales" data-keep placeholder="0"></label>
+        <label class="et"><small>Bills</small><input type="number" min="0" id="bills" data-keep placeholder="0"></label>
+        <label class="et"><small>Walk-ins</small><input type="number" min="0" id="walkin" data-keep placeholder="0"></label>
+        <div class="et auto"><small>Units <em>MX + Care+</em></small><b id="units">0</b></div>
+        <div class="et auto"><small>Conversion <em>bills ÷ walk-ins</em></small><b id="conv">0%</b></div>
+        <div class="et auto"><small>Store MTD <em>MX + Acc + Care+</em></small><b id="storeMtd">0</b></div>
+      </section>
+
+      <div class="sec-head"><h2>Month to Date</h2><span class="sub-note" id="mtdNote"></span></div>
+      <section class="card">
+        <div class="ach-top"><b id="achPct">–</b><span id="achSub"></span></div>
+        <div class="prog"><i id="achBar"></i><b id="goneMark"></b></div>
+        <div class="prog-legend"><span id="achLeg"></span><span id="goneLeg"></span></div>
+        <div class="kv">
+          <div><span>SP value target<small id="tgtSrc"></small></span><b><input type="text" inputmode="numeric" id="target" class="kv-in" data-keep placeholder="Set target"></b></div>
+          <div><span>Value balance<small>SP value still to sell</small></span><b id="balance">–</b></div>
+          <div><span>Value required for 90%</span><b id="req90">–</b></div>
+          <div><span>Value required per day for 100%<small id="reqNote"></small></span><b id="req">–</b></div>
+          <div><span>SP units target<small id="tgtQSrc"></small></span><b><input type="text" inputmode="numeric" id="targetQ" class="kv-in" data-keep placeholder="Set target"></b></div>
+          <div><span>Units achievement<small id="achQSub">SP units so far</small></span><b id="achQ">–</b></div>
+          <div><span>Units balance<small>SP units still to sell</small></span><b id="balanceQ">–</b></div>
+          <div><span>Units required per day for 100%</span><b id="reqQ">–</b></div>
+        </div>
+      </section>
+
+      <div class="sec-head"><h2>Today's Models Sold</h2>
+        <span class="eod-steps"><button type="button" class="step" id="rmRow" aria-label="Remove last row">−</button><button type="button" class="step" id="addRow" aria-label="Add a row">+</button></span>
+      </div>
+      <section class="card list" id="models"></section>
+
+      <div class="sec-head"><h2>FF8 &amp; S26F</h2><span class="sub-note">FTD typed · MTD = sheet + FTD</span></div>
+      <section class="card eg eg-ff">
+        <div class="eg-head"><span>Model</span><span>FTD qty</span><span>MTD qty</span></div>
+        {% for key, label in [('f8u', 'Fold 8 Ultra'), ('f8', 'Fold 8'), ('fl8', 'Flip 8')] %}
+        <div class="eg-row">
+          <div class="eg-name">{{ label }}<small id="sh-{{ key }}"></small></div>
+          <label class="eg-in"><span>FTD qty</span><input type="number" min="0" inputmode="numeric" id="ftd-q-{{ key }}" data-keep placeholder="0"></label>
+          <div class="eg-out"><span>MTD qty</span><b id="mtd-q-{{ key }}">0</b></div>
+        </div>
+        {% endfor %}
+        <div class="eg-row sum">
+          <div class="eg-name">FF8 total</div>
+          <div class="eg-out"><span>FTD qty</span><b id="ftd-q-ff8">0</b></div>
+          <div class="eg-out"><span>MTD qty</span><b id="mtd-q-ff8">0</b></div>
+        </div>
+        <div class="eg-row">
+          <div class="eg-name">S26F<small class="eg-tag">S26 series</small><small id="sh-s26"></small></div>
+          <label class="eg-in"><span>FTD qty</span><input type="number" min="0" inputmode="numeric" id="ftd-q-s26" data-keep placeholder="0"></label>
+          <div class="eg-out"><span>MTD qty</span><b id="mtd-q-s26">0</b></div>
+        </div>
+      </section>
+
+      <div class="sec-head"><h2>Categories</h2><span class="sub-note">FTD typed · MTD = sheet + FTD · Accessories &amp; Care+ MTD can be typed</span></div>
+      <section class="card eg eg-cat">
+        <div class="eg-head"><span>Category</span><span>FTD qty</span><span>FTD value</span><span>MTD qty</span><span>MTD value</span></div>
+        {% for key, label in [('sp', 'SP'), ('tab', 'Tab'), ('pc', 'NPC'), ('wear', 'Wearables'), ('acc', 'Accessories')] %}
+        {% if key == 'acc' %}
+        <div class="eg-row sum">
+          <div class="eg-name">MX<small class="eg-tag">SP + Tab + NPC + Wearables</small></div>
+          <div class="eg-out"><span>FTD qty</span><b id="ftd-q-mx">0</b></div>
+          <div class="eg-out"><span>FTD value</span><b id="ftd-v-mx">0</b></div>
+          <div class="eg-out"><span>MTD qty</span><b id="mtd-q-mx">0</b></div>
+          <div class="eg-out"><span>MTD value</span><b id="mtd-v-mx">0</b></div>
+        </div>
+        {% endif %}
+        <div class="eg-row">
+          <div class="eg-name">{{ label }}<small id="sh-{{ key }}"></small></div>
+          <label class="eg-in"><span>FTD qty</span><input type="number" min="0" inputmode="numeric" id="ftd-q-{{ key }}" data-keep placeholder="0"></label>
+          <label class="eg-in"><span>FTD value</span><input type="text" inputmode="numeric" id="ftd-v-{{ key }}" data-keep placeholder="0"></label>
+          {% if key == 'acc' %}
+          <label class="eg-in"><span>MTD qty</span><input type="number" min="0" inputmode="numeric" id="mtd-q-acc" data-keep title="Leave empty to use sheet + FTD"></label>
+          <label class="eg-in"><span>MTD value</span><input type="text" inputmode="numeric" id="mtd-v-acc" data-keep title="Leave empty to use sheet + FTD"></label>
+          {% else %}
+          <div class="eg-out"><span>MTD qty</span><b id="mtd-q-{{ key }}">0</b></div>
+          <div class="eg-out"><span>MTD value</span><b id="mtd-v-{{ key }}">0</b></div>
+          {% endif %}
+        </div>
+        {% endfor %}
+        <div class="eg-row care">
+          <div class="eg-name">Care+<small class="eg-tag">MTD typed</small></div>
+          <label class="eg-in"><span>FTD qty</span><input type="number" min="0" inputmode="numeric" id="ftd-q-care" data-keep placeholder="0"></label>
+          <label class="eg-in"><span>FTD value</span><input type="text" inputmode="numeric" id="ftd-v-care" data-keep placeholder="0"></label>
+          <label class="eg-in"><span>MTD qty</span><input type="number" min="0" inputmode="numeric" id="mtd-q-care" data-keep placeholder="0"></label>
+          <label class="eg-in"><span>MTD value</span><input type="text" inputmode="numeric" id="mtd-v-care" data-keep placeholder="0"></label>
+        </div>
+        <div class="eg-foot"><span>Care+ MTD attach%<small>Care+ MTD qty ÷ MX MTD qty</small></span><b id="careAttach">–</b></div>
+      </section>
+      <p class="foot" id="sheetNote"></p>
+    </div>
+
+    <div class="eod-right">
+      <div class="sec-head"><h2>WhatsApp Preview</h2>
+        <div class="menu share-menu">
+          <button type="button" class="share-ic" id="shareBtn" aria-label="Share the report" aria-haspopup="menu" aria-expanded="false" title="Share"><svg viewBox="0 0 24 24"><path d="M12 15V3m0 0L8 7m4-4l4 4"/><path d="M8 10H6.5A2.5 2.5 0 004 12.5v6A2.5 2.5 0 006.5 21h11a2.5 2.5 0 002.5-2.5v-6a2.5 2.5 0 00-2.5-2.5H16"/></svg></button>
+          <div class="ctx share-pop" id="sharePop" role="menu">
+            <button type="button" id="copyBtn"><span class="sp-ic" style="background:#8e8e93"><svg viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2.5"/><path d="M15 9V6.5A2.5 2.5 0 0012.5 4h-6A2.5 2.5 0 004 6.5v6A2.5 2.5 0 006.5 15H9"/></svg></span>Copy text</button>
+            <button type="button" id="waBtn"><span class="sp-ic" style="background:#25d366"><svg viewBox="0 0 24 24"><path d="M12 3a9 9 0 00-7.8 13.5L3 21l4.6-1.2A9 9 0 1012 3z"/></svg></span>WhatsApp</button>
+            <button type="button" id="nativeShare" hidden><span class="sp-ic" style="background:#5e5ce6"><svg viewBox="0 0 24 24"><circle cx="6" cy="12" r="2"/><circle cx="18" cy="6" r="2"/><circle cx="18" cy="18" r="2"/><path d="M8 11l8-4M8 13l8 4"/></svg></span>More…</button>
+          </div>
+        </div>
+      </div>
+      <section class="card wa-card">
+        <div class="wa-chat"><pre class="wa-bubble" id="preview"></pre></div>
+      </section>
+    </div>
+  </div>
+</main>
+</body></html>"""
+
+EOD_CSS = r"""
+.eod-layout{display:grid;gap:0 24px}
+.eod-tiles{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;padding:12px}
+.et{display:grid;gap:6px;padding:12px;border-radius:14px;background:var(--fill);min-width:0}
+.et small{font-size:12px;color:var(--label2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.et small em{font-style:normal;color:var(--label3);font-size:10.5px}
+.et input{width:100%;border:0;background:none;color:var(--label);font:inherit;font-size:22px;font-weight:700;font-variant-numeric:tabular-nums;padding:0}
+.et input:focus{outline:none}
+.et:focus-within{box-shadow:0 0 0 2px var(--blue)}
+.et.auto{background:color-mix(in srgb,var(--blue) 12%,transparent)}
+.et.auto b{font-size:22px;font-weight:700;color:var(--blue);font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.kv-in{width:150px;max-width:100%;height:32px;padding:0 10px;border:0;border-radius:9px;background:var(--fill);color:var(--label);font:inherit;font-size:15px;font-weight:600;text-align:right}
+.kv-in:focus{outline:2px solid var(--blue)}
+.eod-steps{display:flex;gap:6px}
+.step{width:32px;height:28px;border-radius:14px;background:color-mix(in srgb,var(--blue) 14%,transparent);color:var(--blue);font-size:18px;font-weight:700;line-height:1}
+.mrow{display:grid;grid-template-columns:30px minmax(0,1fr) auto 28px;align-items:center;gap:10px;padding:8px 12px 8px 16px;position:relative}
+.mrow+.mrow::before{content:"";position:absolute;top:0;left:56px;right:0;border-top:.5px solid var(--sep)}
+.mcombo{position:relative;display:block;min-width:0}
+.mrow .mname{width:100%;height:38px;padding:0 12px;border:0;border-radius:10px;background:var(--fill);color:var(--label);font:inherit;font-size:16px}
+.mrow .mname:focus{outline:2px solid var(--blue)}
+.sugg{position:absolute;left:0;right:0;top:calc(100% + 6px);z-index:40;max-height:260px;overflow:auto;overscroll-behavior:contain;padding:6px;border-radius:14px;
+  background:var(--card);-webkit-backdrop-filter:blur(30px) saturate(180%);backdrop-filter:blur(30px) saturate(180%);box-shadow:var(--shadow),0 0 0 .5px var(--sep)}
+.sugg button{display:block;width:100%;min-height:40px;padding:8px 10px;border-radius:10px;text-align:left;font-size:15px;color:var(--label)}
+.sugg button:hover,.sugg button.on{background:color-mix(in srgb,var(--blue) 14%,transparent)}
+.sg-none{padding:10px;font-size:13px;color:var(--label2)}
+#models{overflow:visible}
+@media (max-width:560px){
+  .mrow{grid-template-columns:30px minmax(0,1fr) 28px;grid-template-areas:"n m x" ". q q";row-gap:8px}
+  .mrow .ico{grid-area:n}.mrow .mcombo{grid-area:m}.mrow .x{grid-area:x}.mrow .qty{grid-area:q;justify-self:start}
+}
+.qty{display:inline-flex;align-items:center;border-radius:10px;background:var(--fill);overflow:hidden}
+.qty button{width:30px;height:34px;color:var(--blue);font-size:18px;font-weight:700}
+.qty input{width:34px;height:34px;border:0;background:none;color:var(--label);font:inherit;font-weight:700;text-align:center;-moz-appearance:textfield}
+.qty input::-webkit-inner-spin-button{display:none}
+.mrow .x{width:28px;height:28px;border-radius:50%;background:var(--down-bg);color:var(--down);font-weight:700}
+.eod-t input{width:100%;min-width:70px;height:34px;padding:0 10px;border:0;border-radius:9px;background:var(--fill);color:var(--label);font:inherit;font-size:14px;text-align:right}
+.eod-t input:focus{outline:2px solid var(--blue)}
+.eod-t td small{display:block;font-size:10.5px;color:var(--label2);font-weight:400}
+.cmp.eod-t tbody tr.sum td{background:color-mix(in srgb,var(--blue) 10%,transparent);color:var(--blue)}
+.cmp.eod-t tbody tr.care td{background:color-mix(in srgb,#34c759 8%,transparent)}
+.eod-attach{margin:0;padding:0 16px 6px}
+.wa-card{padding:0;overflow:hidden}
+.wa-chat{padding:16px;background:color-mix(in srgb,#25d366 8%,var(--bg));background-image:radial-gradient(color-mix(in srgb,var(--label) 6%,transparent) 1px,transparent 1px);background-size:14px 14px;max-height:70vh;overflow:auto}
+.wa-bubble{margin:0 0 0 auto;max-width:92%;width:fit-content;padding:10px 12px;border-radius:12px 4px 12px 12px;background:#d9fdd3;color:#111b21;font:13.5px/1.42 -apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,sans-serif;white-space:pre-wrap;word-break:break-word;box-shadow:0 1px 1px rgba(0,0,0,.12)}
+:root[data-theme=dark] .wa-bubble{background:#005c4b;color:#e9edef}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]) .wa-bubble{background:#005c4b;color:#e9edef}}
+.share-menu{margin-left:auto}
+.share-ic{width:36px;height:36px;border-radius:50%;display:grid;place-items:center;background:color-mix(in srgb,var(--blue) 14%,transparent);color:var(--blue)}
+.share-ic svg{width:19px;height:19px;fill:none;stroke:currentColor;stroke-width:2.1;stroke-linecap:round;stroke-linejoin:round}
+.share-ic[aria-expanded=true]{background:var(--blue);color:#fff}
+.share-pop{top:44px;min-width:210px}
+.share-pop button{grid-template-columns:34px 1fr;gap:4px;font-size:15px}
+.sp-ic{width:26px;height:26px;border-radius:7px;display:grid;place-items:center;color:#fff}
+.sp-ic svg{width:15px;height:15px;fill:none;stroke:#fff;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}
+.wa-btn{height:40px;border-radius:12px;background:var(--fill);font-weight:600;font-size:14px;display:inline-flex;align-items:center;justify-content:center;gap:6px}
+.wa-btn svg{width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.wa-btn.wa{background:#25d366;color:#fff}
+@media (min-width:1000px){
+  .eod-layout{grid-template-columns:minmax(0,1.25fr) minmax(340px,1fr);align-items:start}
+  .eod-right{position:sticky;top:142px}
+}
+@media (max-width:560px){.eod-tiles{grid-template-columns:repeat(2,minmax(0,1fr))}.et input,.et.auto b{font-size:19px}}
+/* EOD entry grids: aligned columns on wide screens, two-line cards on phones */
+.eod2 .sec-head{margin-top:24px}
+.eod-tiles{gap:12px;padding:14px}
+.et{padding:12px 14px;border-radius:14px;min-height:78px;align-content:space-between}
+.et input{font-size:24px;line-height:1.1}
+.et.auto b{font-size:24px;line-height:1.1}
+.eg{padding:6px 0}
+.eg-cat .eg-head,.eg-cat .eg-row{grid-template-columns:minmax(130px,1.4fr) repeat(4,minmax(0,1fr))}
+.eg-ff .eg-head,.eg-ff .eg-row{grid-template-columns:minmax(130px,1.6fr) minmax(0,1fr) minmax(0,1fr)}
+.eg-head,.eg-row{display:grid;align-items:center;gap:10px;padding:0 16px}
+.eg-head{min-height:38px;margin:0 0 4px;font-size:11px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:var(--label);
+  background:color-mix(in srgb,var(--blue) 12%,var(--card));border-bottom:1.5px solid color-mix(in srgb,var(--blue) 35%,transparent);margin-top:-6px;border-radius:16px 16px 0 0}
+.eg-head span:not(:first-child){text-align:right}
+.eg-row{min-height:58px;padding-top:7px;padding-bottom:7px;position:relative}
+.eg-row+.eg-row::before{content:"";position:absolute;top:0;left:16px;right:16px;border-top:.5px solid var(--sep)}
+.eg-name{font-size:15px;font-weight:600;color:var(--label);min-width:0}
+.eg-name small{display:block;font-size:11px;font-weight:400;color:var(--label2);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.eg-name small.eg-tag{color:var(--label3)}
+.eg-in{display:block;min-width:0}
+.eg-in span,.eg-out span{display:none}
+.eg-in input{width:100%;height:40px;padding:0 12px;border:0;border-radius:11px;background:var(--fill);color:var(--label);font:inherit;font-size:15px;font-weight:600;text-align:right;font-variant-numeric:tabular-nums;-moz-appearance:textfield}
+.eg-in input::-webkit-inner-spin-button,.eg-in input::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}
+.eg-in input:focus{outline:none;box-shadow:0 0 0 2px var(--blue);background:var(--card)}
+.eg-in input::placeholder{color:var(--label3);font-weight:500}
+.eg-out{text-align:right;min-width:0}
+.eg-out b{font-size:15px;font-weight:700;font-variant-numeric:tabular-nums;color:var(--label)}
+.eg-row.sum{background:color-mix(in srgb,var(--blue) 10%,var(--card))}
+.eg-row.sum .eg-name,.eg-row.sum .eg-out b{color:var(--blue)}
+.eg-row.sum::before,.eg-row.sum+.eg-row::before{display:none}
+.eg-row.care{background:color-mix(in srgb,#34c759 8%,var(--card))}
+.eg-row.care::before,.eg-row.care+.eg-foot{border-top:0}
+.eg-foot{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 16px 8px;border-top:.5px solid var(--sep);font-size:14px;color:var(--label2)}
+.eg-foot .kv-in{width:140px}
+.eg-foot span small{display:block;font-size:11.5px;color:var(--label3);margin-top:2px}
+.eg-foot b{font-size:17px;font-weight:700;color:var(--label);font-variant-numeric:tabular-nums}
+.wa-chat{max-height:calc(100vh - 220px)}
+@media (min-width:1000px){.eod-layout{grid-template-columns:minmax(0,1.35fr) minmax(360px,1fr);gap:0 28px}}
+@media (max-width:640px){
+.eg-head{display:none}
+.eg-in{position:relative}
+.eg-in span{display:block;position:absolute;left:12px;top:50%;transform:translateY(-50%);font-size:11.5px;font-weight:600;color:var(--label2);pointer-events:none;margin:0}
+.eg-in input{height:42px;font-size:16px;padding-left:76px}
+.eg-out{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:36px;padding:0 12px;border-radius:11px;background:color-mix(in srgb,var(--blue) 8%,transparent)}
+.eg-out span{display:block;font-size:11.5px;font-weight:600;color:var(--label2);margin:0;white-space:nowrap}
+.eg-out b{font-size:14.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.eg-cat .eg-row,.eg-ff .eg-row{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 10px;padding:12px 14px}
+.eg-name{grid-column:1/-1;display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
+.eg-name small{display:inline;margin:0}
+.eg-row+.eg-row::before{left:14px;right:14px}
+.eg-foot .kv-in{width:120px}
+}
+html[data-view=phone] .eg-head{display:none}
+html[data-view=phone] .eg-in{position:relative}
+html[data-view=phone] .eg-in span{display:block;position:absolute;left:12px;top:50%;transform:translateY(-50%);font-size:11.5px;font-weight:600;color:var(--label2);pointer-events:none;margin:0}
+html[data-view=phone] .eg-in input{height:42px;font-size:16px;padding-left:76px}
+html[data-view=phone] .eg-out{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:36px;padding:0 12px;border-radius:11px;background:color-mix(in srgb,var(--blue) 8%,transparent)}
+html[data-view=phone] .eg-out span{display:block;font-size:11.5px;font-weight:600;color:var(--label2);margin:0;white-space:nowrap}
+html[data-view=phone] .eg-out b{font-size:14.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+html[data-view=phone] .eg-cat .eg-row,html[data-view=phone] .eg-ff .eg-row{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 10px;padding:12px 14px}
+html[data-view=phone] .eg-name{grid-column:1/-1;display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
+html[data-view=phone] .eg-name small{display:inline;margin:0}
+html[data-view=phone] .eg-row+.eg-row::before{left:14px;right:14px}
+html[data-view=phone] .eg-foot .kv-in{width:120px}
+
+"""
+
+EOD_JS = r"""
+(function(){
+const $ = s => document.querySelector(s);
+const $$ = s => Array.from(document.querySelectorAll(s));
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const store = {
+  get(k){ try { return localStorage.getItem(k); } catch (e) { return null; } },
+  set(k, v){ try { localStorage.setItem(k, v); } catch (e) {} }
+};
+const boot = JSON.parse(($('#eodBoot') || {}).textContent || '{}');
+const MX = ['sp', 'tab', 'pc', 'wear'], FF = ['f8u', 'f8', 'fl8'], FF_NAMES = { f8u: 'Fold 8U', f8: 'Fold 8', fl8: 'Flip 8' };
+const DRAFT = 'eod2-draft';
+const inr = n => Math.round(n || 0).toLocaleString('en-IN');
+const pad2 = n => String(Math.round(n || 0)).padStart(2, '0');
+const num = id => { const el = document.getElementById(id); const v = el ? parseFloat(String(el.value).replace(/[^0-9.]/g, '')) : 0; return isFinite(v) ? v : 0; };
+const set = (id, t) => { const el = document.getElementById(id); if (el) el.textContent = t; };
+const pct = x => (isFinite(x) ? x.toFixed(2) + '%' : '–');
+
+let ovState = {};
+try { ovState = JSON.parse(store.get('ov-state') || '{}'); } catch (e) {}
+const chans = boot.channels || [];
+const picked = StorePicker.saved();
+let cur = picked.length === 1 && chans.includes(picked[0]) ? picked[0] : (chans.includes(ovState.store) ? ovState.store : (boot.default_channel || chans[0] || '__all__'));
+const sheet = () => ((boot.data || {})[cur] || (boot.data || {}).__all__ || { cats: {}, fams: {} });
+const sheetOf = (g, k) => (g && g[k]) || { q: 0, v: 0 };
+const targetFor = () => ((boot.targets || {})[cur] || null);
+let targetTouched = false, targetQTouched = false;
+
+/* ---------- models sold ---------- */
+function addRow(name = '', qty = 1){
+  const row = document.createElement('div');
+  row.className = 'mrow';
+  row.innerHTML = `<span class="ico" style="background:#0a84ff">${'#'}</span>
+    <span class="mcombo"><input type="text" class="mname" placeholder="Search family name…" autocomplete="off" autocapitalize="off" spellcheck="false" enterkeyhint="done" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-label="Model"><span class="sugg" role="listbox" hidden></span></span>
+    <span class="qty"><button type="button" data-d="-1" aria-label="Less">−</button><input type="number" class="mqty" min="1" max="10" aria-label="Quantity"><button type="button" data-d="1" aria-label="More">+</button></span>
+    <button type="button" class="x" aria-label="Remove row">✕</button>`;
+  row.querySelector('.mname').value = name;
+  row.querySelector('.mqty').value = Math.min(10, Math.max(1, parseInt(qty, 10) || 1));
+  $('#models').appendChild(row);
+  numberRows();
+  return row;
+}
+function numberRows(){ $$('#models .mrow').forEach((r, i) => { r.querySelector('.ico').textContent = i + 1; }); }
+function removeRow(row){
+  const rows = $$('#models .mrow');
+  if (rows.length > 1) row.remove(); else { row.querySelector('.mname').value = ''; row.querySelector('.mqty').value = 1; }
+  numberRows();
+}
+
+/* ---------- calculations ---------- */
+function compute(){
+  const sh = sheet(), c = {}, f = {};
+  [...MX, 'acc'].forEach(k => {
+    const s = sheetOf(sh.cats, k), fq = num('ftd-q-' + k), fv = num('ftd-v-' + k);
+    c[k] = { fq, fv, sq: s.q, sv: s.v, mq: s.q + fq, mv: s.v + fv };
+  });
+  // Accessories MTD can be typed; an empty box falls back to sheet + FTD
+  const typed = id => { const el = document.getElementById(id); return el && el.value.trim() !== ''; };
+  if (typed('mtd-q-acc')) c.acc.mq = num('mtd-q-acc');
+  if (typed('mtd-v-acc')) c.acc.mv = num('mtd-v-acc');
+  c.care = { fq: num('ftd-q-care'), fv: num('ftd-v-care'), mq: num('mtd-q-care'), mv: num('mtd-v-care') };  // Care+ MTD is typed in
+  c.mx = { fq: 0, fv: 0, sq: 0, sv: 0, mq: 0, mv: 0 };
+  MX.forEach(k => Object.keys(c.mx).forEach(x => { c.mx[x] += c[k][x]; }));
+  [...FF, 's26'].forEach(k => { const s = sheetOf(sh.fams, k), fq = num('ftd-q-' + k); f[k] = { fq, sq: s.q, mq: s.q + fq }; });
+  f.ff8 = { fq: 0, mq: 0 };
+  FF.forEach(k => { f.ff8.fq += f[k].fq; f.ff8.mq += f[k].mq; });
+  const bills = num('bills'), walkin = num('walkin'), target = num('target'), targetQ = num('targetQ');
+  const storeMtd = c.mx.mv + c.acc.mv + c.care.mv;
+  const daysLeft = Math.max(0, (boot.days_total || 30) - (boot.today_day || 1));
+  const models = $$('#models .mrow').map(r => ({ name: r.querySelector('.mname').value.trim(), qty: parseInt(r.querySelector('.mqty').value, 10) || 1 })).filter(m => m.name);
+  const attach = c.mx.mq > 0 ? c.care.mq / c.mx.mq * 100 : NaN;
+  const spMtd = c.sp.mv, spMtdQ = c.sp.mq;   // targets are smartphone (SP) only: value and units
+  return { c, f, bills, walkin, target, targetQ, storeMtd, spMtd, spMtdQ, models, daysLeft, attach,
+    units: c.mx.fq + c.care.fq, ach: target > 0 ? spMtd / target * 100 : NaN, achQ: targetQ > 0 ? spMtdQ / targetQ * 100 : NaN,
+    conv: walkin > 0 ? bills / walkin * 100 : 0,
+    gone: (boot.today_day || 1) / (boot.days_total || 30) * 100 };
+}
+
+function message(r){
+  const { c, f } = r;
+  const block = (t, x) => `*${t}*\nFTD Qty -${pad2(x.fq)}\nFTD Value -${inr(x.fv)}\nMTD Qty -${pad2(x.mq)}\nMTD Value -${inr(x.mv)}`;
+  const ffLines = key => FF.map(k => `- ${FF_NAMES[k]} -${pad2(f[k][key])}`).join('\n');
+  const models = r.models.length ? r.models.map(m => `- ${m.name} -${pad2(m.qty)}`).join('\n') : '- Nil';
+  return `*${cur === '__all__' ? 'All Stores' : cur}*
+
+*${boot.date_label || ''}*
+
+Day -${boot.day || ''}
+Total Day Sales -${inr(num('totalSales'))}/-
+Bills -${pad2(r.bills)}
+Units -${pad2(r.units)}
+
+Store MTD Sales -${inr(r.storeMtd)}/-
+SP MTD Sales -${inr(r.spMtd)}/-
+SP MTD Units -${pad2(r.spMtdQ)}
+SP Value Target -${r.target ? inr(r.target) + '/-' : '–'}
+SP Value Ach% -${r.target ? pct(r.ach) : '–'}
+SP Units Target -${r.targetQ ? inr(r.targetQ) : '–'}
+SP Units Ach% -${r.targetQ ? pct(r.achQ) : '–'}
+
+*Today's Models Sold*
+${models}
+
+*FF8 FTD: ${pad2(f.ff8.fq)}*
+${ffLines('fq')}
+
+*FF8 MTD: ${pad2(f.ff8.mq)}*
+${ffLines('mq')}
+
+*S26F*
+- FTD -${pad2(f.s26.fq)}
+- MTD -${pad2(f.s26.mq)}
+
+${block('MX Sales', c.mx)}
+
+${block('SP', c.sp)}
+
+${block('Tab', c.tab)}
+
+${block('Wearables', c.wear)}
+
+${block('NPC', c.pc)}
+
+*Accessories*
+FTD Value -${inr(c.acc.fv)}
+MTD Value -${inr(c.acc.mv)}
+
+${block('CARE+', c.care)}
+MTD attach% -${isFinite(r.attach) ? r.attach.toFixed(2) + '%' : '–'}
+
+Walk-in: ${pad2(r.walkin)}
+Conversion: ${r.conv.toFixed(2)}%`;
+}
+
+function update(){
+  const r = compute(), { c, f } = r;
+  [...MX, 'acc', 'mx'].forEach(k => {
+    if (k !== 'acc') { set('mtd-q-' + k, inr(c[k].mq)); set('mtd-v-' + k, inr(c[k].mv)); }
+    if (k !== 'mx') set('sh-' + k, `sheet ${inr(c[k].sq)} · ${inr(c[k].sv)}`);
+  });
+  // the typable Accessories MTD boxes show the automatic figure as their hint
+  document.getElementById('mtd-q-acc').placeholder = inr(c.acc.sq + c.acc.fq);
+  document.getElementById('mtd-v-acc').placeholder = inr(c.acc.sv + c.acc.fv);
+  set('ftd-q-mx', inr(c.mx.fq)); set('ftd-v-mx', inr(c.mx.fv));
+  [...FF, 's26', 'ff8'].forEach(k => { set('mtd-q-' + k, inr(f[k].mq)); if (k !== 'ff8') set('sh-' + k, `sheet ${inr(f[k].sq)}`); });
+  set('ftd-q-ff8', inr(f.ff8.fq));
+  set('units', inr(r.units)); set('conv', r.conv.toFixed(2) + '%'); set('storeMtd', inr(r.storeMtd));
+  set('careAttach', isFinite(r.attach) ? r.attach.toFixed(2) + '%' : '–');
+  const has = r.target > 0;
+  set('achPct', has ? pct(r.ach) : '–');
+  set('achSub', has ? `SP ${inr(r.spMtd)} of ${inr(r.target)}` : 'Set the month SP target to track achievement');
+  $('#achBar').style.width = has ? Math.min(100, r.ach) + '%' : '0';
+  $('#achBar').classList.toggle('done', has && r.ach >= 100);
+  $('#goneMark').style.left = Math.min(100, r.gone) + '%';
+  set('achLeg', has ? `Achieved ${pct(r.ach)}` : '');
+  set('goneLeg', `Time gone ${r.gone.toFixed(2)}%`);
+  set('balance', has ? inr(Math.max(0, r.target - r.spMtd)) : '–');
+  set('req', has && r.daysLeft ? inr(Math.max(0, r.target - r.spMtd) / r.daysLeft) : '–');
+  set('req90', has && r.daysLeft ? inr(Math.max(0, r.target * 0.9 - r.spMtd)) + ' · ' + inr(Math.max(0, r.target * 0.9 - r.spMtd) / r.daysLeft) + '/day' : '–');
+  set('reqNote', r.daysLeft ? `${r.daysLeft} days left after today` : 'last day of the month');
+  const hasQ = r.targetQ > 0;
+  set('achQ', hasQ ? pct(r.achQ) : '–');
+  set('achQSub', hasQ ? `SP ${inr(r.spMtdQ)} of ${inr(r.targetQ)} units` : `SP ${inr(r.spMtdQ)} units so far`);
+  set('balanceQ', hasQ ? inr(Math.max(0, r.targetQ - r.spMtdQ)) : '–');
+  set('reqQ', hasQ && r.daysLeft ? (Math.max(0, r.targetQ - r.spMtdQ) / r.daysLeft).toFixed(2) : '–');
+  $('#preview').textContent = message(r);
+  saveDraft();
+}
+
+/* ---------- drafts ---------- */
+function saveDraft(){
+  const vals = {};
+  $$('[data-keep]').forEach(el => { vals[el.id] = el.value; });
+  const models = $$('#models .mrow').map(r => [r.querySelector('.mname').value, r.querySelector('.mqty').value]);
+  let all = {};
+  try { all = JSON.parse(store.get(DRAFT) || '{}'); } catch (e) {}
+  if (all.date !== boot.date_label) all = { date: boot.date_label, stores: {} };
+  all.stores[cur] = { vals, models, targetTouched, targetQTouched };
+  store.set(DRAFT, JSON.stringify(all));
+}
+function loadStore(){
+  $$('[data-keep]').forEach(el => { el.value = ''; });
+  $('#models').innerHTML = '';
+  let all = {};
+  try { all = JSON.parse(store.get(DRAFT) || '{}'); } catch (e) {}
+  const dr = all.date === boot.date_label ? (all.stores || {})[cur] : null;
+  targetTouched = !!(dr && dr.targetTouched); targetQTouched = !!(dr && dr.targetQTouched);
+  if (dr) {
+    Object.entries(dr.vals || {}).forEach(([id, v]) => { const el = document.getElementById(id); if (el) el.value = v; });
+    (dr.models || []).forEach(([n, q]) => addRow(n, q));
+  }
+  if (!$$('#models .mrow').length) addRow();
+  const t = targetFor();
+  if (t && t.v != null && !targetTouched) $('#target').value = inr(t.v);
+  set('tgtSrc', t && t.v != null ? (targetTouched ? 'edited here · Targets page has ' + inr(t.v) : 'from Targets page') : 'not set on Targets page');
+  if (t && t.q != null && !targetQTouched) $('#targetQ').value = inr(t.q);
+  set('tgtQSrc', t && t.q != null ? (targetQTouched ? 'edited here · Targets page has ' + inr(t.q) : 'from Targets page') : 'not set on Targets page');
+  $('#title').textContent = cur === '__all__' ? 'All Stores' : cur;
+  renderMenu();
+  update();
+}
+function renderMenu(){
+  StorePicker.mount({ stores: chans, selected: cur === '__all__' ? [] : [cur], multi: false,
+    onChange: sel => { saveDraft(); cur = sel[0] || '__all__'; loadStore(); } });
+}
+
+/* ---------- wiring ---------- */
+/* family name suggestions under the box: starts-with matches first, then anywhere in the name */
+const FAMS = boot.families || [];
+let suggFor = null, suggIdx = -1;
+function suggest(inp){
+  const box = inp.parentElement.querySelector('.sugg');
+  const q = inp.value.trim().toLowerCase().replace(/\s+/g, ' ');
+  const squash = x => x.toLowerCase().replace(/[^a-z0-9+]/g, '');
+  const qs = squash(q);
+  let list = !q ? FAMS.slice(0, 40) : FAMS.filter(n => n.toLowerCase().startsWith(q) || squash(n).startsWith(qs))
+    .concat(FAMS.filter(n => !(n.toLowerCase().startsWith(q) || squash(n).startsWith(qs)) && (n.toLowerCase().includes(q) || squash(n).includes(qs))));
+  list = list.slice(0, 40);
+  suggFor = inp; suggIdx = -1;
+  box.innerHTML = list.length ? list.map((n, i) => `<button type="button" role="option" data-fam="${esc(n)}" id="sg${i}">${esc(n)}</button>`).join('')
+    : `<div class="sg-none">${FAMS.length ? 'No model matches; the typed name is kept' : 'No family names in the sheet'}</div>`;
+  box.hidden = false; inp.setAttribute('aria-expanded', 'true');
+}
+function closeSugg(){
+  $$('.sugg').forEach(b => { b.hidden = true; });
+  $$('.mname').forEach(i => i.setAttribute('aria-expanded', 'false'));
+  suggFor = null; suggIdx = -1;
+}
+function pickSugg(inp, name){ inp.value = name; closeSugg(); update(); const q = inp.closest('.mrow').querySelector('.mqty'); if (q) q.focus(); }
+$('#models').addEventListener('focusin', e => { if (e.target.classList.contains('mname')) { suggest(e.target); setTimeout(() => e.target.scrollIntoView({ block: 'center', behavior: 'smooth' }), 250); } });
+$('#models').addEventListener('input', e => { if (e.target.classList.contains('mname')) suggest(e.target); });
+$('#models').addEventListener('keydown', e => {
+  if (!e.target.classList.contains('mname') || !suggFor) return;
+  const opts = $$('.sugg:not([hidden]) [data-fam]');
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    e.preventDefault(); if (!opts.length) return;
+    suggIdx = (suggIdx + (e.key === 'ArrowDown' ? 1 : -1) + opts.length) % opts.length;
+    opts.forEach((o, i) => o.classList.toggle('on', i === suggIdx)); opts[suggIdx].scrollIntoView({ block: 'nearest' });
+  } else if (e.key === 'Enter') { e.preventDefault(); if (opts[suggIdx]) pickSugg(e.target, opts[suggIdx].dataset.fam); else if (opts.length === 1) pickSugg(e.target, opts[0].dataset.fam); else closeSugg(); }
+  else if (e.key === 'Escape') closeSugg();
+});
+$('#models').addEventListener('pointerdown', e => { const o = e.target.closest('[data-fam]'); if (o) { e.preventDefault(); pickSugg(o.closest('.mcombo').querySelector('.mname'), o.dataset.fam); } });
+document.addEventListener('pointerdown', e => { if (suggFor && !e.target.closest('.mcombo')) closeSugg(); });
+$('#navLabel').textContent = `${boot.long_date || boot.date_label || ''} · EOD`;
+set('todayNote', boot.day || '');
+set('mtdNote', `${boot.month_label || ''} · day ${boot.today_day || ''} of ${boot.days_total || ''}`);
+set('sheetNote', `Sheet MTD covers ${boot.window || '–'} (${inr(boot.rows)} rows); today's figures come from what you type here.`);
+const warn = [];
+if (boot.error) warn.push('Sheet MTD could not be calculated: ' + boot.error);
+if ((boot.missing || []).length) warn.push('Columns not found in the raw sheet: ' + boot.missing.join(', ') + '.');
+$('#warn').hidden = !warn.length; $('#warn').textContent = warn.join(' ');
+
+$('#wrap').addEventListener('input', e => {
+  if (e.target.id === 'target') { targetTouched = true; const t = targetFor(); set('tgtSrc', t && t.v != null ? 'edited here · Targets page has ' + inr(t.v) : 'typed here'); }
+  if (e.target.id === 'targetQ') { targetQTouched = true; const t = targetFor(); set('tgtQSrc', t && t.q != null ? 'edited here · Targets page has ' + inr(t.q) : 'typed here'); }
+  update();
+});
+$('#wrap').addEventListener('change', e => {
+  if (e.target.classList.contains('mqty')) e.target.value = Math.min(10, Math.max(1, parseInt(e.target.value, 10) || 1));
+  update();
+});
+$('#wrap').addEventListener('focusout', e => {
+  const el = e.target;
+  if (el.matches('input[inputmode=numeric]') && el.value.trim()) {
+    const v = parseFloat(el.value.replace(/[^0-9.]/g, ''));
+    if (isFinite(v)) { el.value = inr(v); saveDraft(); }
+  }
+});
+$('#models').addEventListener('click', e => {
+  const d = e.target.closest('[data-d]');
+  if (d) { const inp = d.parentElement.querySelector('.mqty'); inp.value = Math.min(10, Math.max(1, (parseInt(inp.value, 10) || 1) + +d.dataset.d)); update(); return; }
+  const x = e.target.closest('.x'); if (x) { removeRow(x.closest('.mrow')); update(); }
+});
+$('#addRow').addEventListener('click', () => { addRow().querySelector('.mname').focus(); update(); });
+$('#rmRow').addEventListener('click', () => { const rows = $$('#models .mrow'); removeRow(rows[rows.length - 1]); update(); });
+
+const toast = msg => {
+  const t = document.createElement('div'); t.textContent = msg;
+  t.style.cssText = 'position:fixed;left:50%;bottom:40px;transform:translateX(-50%);padding:10px 16px;border-radius:14px;background:var(--menu);color:var(--label);-webkit-backdrop-filter:blur(24px) saturate(180%);backdrop-filter:blur(24px) saturate(180%);box-shadow:0 8px 28px rgba(0,0,0,.16),0 0 0 .5px var(--sep);font-size:14px;font-weight:600;z-index:60';
+  document.body.appendChild(t); setTimeout(() => t.remove(), 1800);
+};
+const shareBtn = $('#shareBtn'), sharePop = $('#sharePop');
+const closeShare = () => { sharePop.classList.remove('show'); shareBtn.setAttribute('aria-expanded', 'false'); };
+shareBtn.addEventListener('click', e => { e.stopPropagation(); const open = !sharePop.classList.contains('show'); sharePop.classList.toggle('show', open); shareBtn.setAttribute('aria-expanded', String(open)); });
+sharePop.addEventListener('click', () => setTimeout(closeShare, 0));
+document.addEventListener('click', e => { if (!e.target.closest('.share-menu')) closeShare(); });
+if (navigator.share) {
+  $('#nativeShare').hidden = false;
+  $('#nativeShare').addEventListener('click', () => { update(); navigator.share({ text: $('#preview').textContent }).catch(() => {}); });
+}
+$('#copyBtn').addEventListener('click', () => {
+  update(); const txt = $('#preview').textContent;
+  (navigator.clipboard ? navigator.clipboard.writeText(txt) : Promise.reject()).then(() => toast('EOD report copied'))
+    .catch(() => { const ta = document.createElement('textarea'); ta.value = txt; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove(); toast('EOD report copied'); });
+});
+$('#waBtn').addEventListener('click', () => { update(); window.open('https://wa.me/?text=' + encodeURIComponent($('#preview').textContent), '_blank', 'noopener'); });
+const top = $('#top');
+window.addEventListener('scroll', () => top.classList.toggle('scrolled', window.scrollY > 4), { passive: true });
+loadStore();
+})();
+"""
+
+SPC_HTML = """<!doctype html>
+<html lang="en"><head><title>SPC Performance</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<script>(function(){try{var d=document.documentElement,t=localStorage.getItem('ap-theme'),v=localStorage.getItem('ap-view');if(t!=='light'&&t!=='dark'){t=matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';localStorage.setItem('ap-theme',t);}if(v!=='phone'&&v!=='desktop'){v=Math.min(screen.width||9999,innerWidth||9999)<700?'phone':'desktop';localStorage.setItem('ap-view',v);}d.dataset.theme=t;if(v==='phone'||v==='desktop'){d.dataset.view=v;if(v==='desktop'){var m=document.querySelector('meta[name=viewport]');if(m)m.setAttribute('content','width=1200, viewport-fit=cover');}}}catch(e){}})();</script>
+<link rel="stylesheet" href="/assets/ov.css?v={{ asset_v }}">
+<script src="/assets/xp.js?v={{ asset_v }}" defer></script>
+<script src="/assets/spc.js?v={{ asset_v }}" defer></script>
+</head><body>
+<header class="top" id="top">
+  <div class="bar">
+    <h1 id="title">SPC Performance</h1>
+    <div class="menu">
+      <button type="button" class="pill" id="storeBtn" aria-haspopup="menu" aria-expanded="false">Stores</button>
+      <div class="ctx" id="storeMenu" role="menu"></div>
+    </div>
+  </div>
+  <div class="datenav"><span id="navLabel">&nbsp;</span></div>
+</header>
+
+<main class="wrap spc" id="wrap">
+  <section class="ch-panel" aria-label="Options">
+    <div class="ch-group" style="--g:#ff9500">
+      <span class="gi"><svg viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="15" rx="3"/><path d="M8 3v4M16 3v4M3.5 10h17"/></svg></span>
+      <div class="gb"><div class="gl">Period</div>
+        <div class="chips" id="presets"></div>
+        <div class="ch-range" id="customRange" hidden>
+          <label>From<input type="date" id="fromDate"></label>
+          <label>To<input type="date" id="toDate"></label>
+        </div>
+      </div>
+    </div>
+    <div class="ch-group" style="--g:#34c759">
+      <span class="gi"><svg viewBox="0 0 24 24"><path d="M4 17l5-5 4 4 7-8"/><path d="M15 8h5v5"/></svg></span>
+      <div class="gb"><div class="gl">View</div>
+        <div class="ctl-rows">
+          <div class="ctl-row"><span class="ctl-lab">Measure</span><div class="seg seg2" id="metricSeg" role="tablist" aria-label="Measure"><span class="thumb"></span>
+            <button type="button" data-metric="v">Value</button><button type="button" data-metric="q">Units</button></div></div>
+          <div class="ctl-row"><span class="ctl-lab">Against</span><div class="seg seg2" id="cmpSeg" role="tablist" aria-label="Compare with"><span class="thumb"></span>
+            <button type="button" data-cmp="prev">vs Previous</button><button type="button" data-cmp="ly">vs LY</button></div></div>
+        </div>
+        <div class="ch-toggles" style="margin-top:10px">
+          <label class="tg"><input type="checkbox" id="optSP"><span>SP combined</span></label>
+          <label class="tg"><input type="checkbox" id="optFF"><span>Foldables grouped</span></label>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <p class="err" id="err" hidden></p>
+
+  <div class="sec-head"><h2>Store Snapshot</h2><span class="sub-note" id="snapNote"></span></div>
+  <section class="kpis" id="kpis"></section>
+
+  <div class="sec-head"><h2>Insights</h2></div>
+  <section class="card"><ul class="ins" id="insights"></ul></section>
+
+  <div class="sec-head"><h2>SPC Scorecard</h2><span class="sub-note" id="tblNote">tap a column to sort</span></div>
+  <section class="card table-card"><div class="tscroll"><table class="cmp" id="spcTable"></table></div></section>
+
+  <div class="sec-head"><h2>Who Sells Each Segment</h2><span class="sub-note" id="heatNote"></span></div>
+  <div class="chips" id="heatMode">
+    <button type="button" data-heat="seg" class="on">Share of each segment</button>
+    <button type="button" data-heat="own">Each SPC's own mix</button>
+  </div>
+  <section class="card table-card"><div class="tscroll"><table class="cmp heat" id="heatTable"></table></div></section>
+
+  <div class="sec-head"><h2>Products × SPC</h2><span class="sub-note" id="prodSpcNote"></span></div>
+  <div class="chips secseg" id="prodSegPick" role="group" aria-label="Segment for Products × SPC" hidden></div>
+  <section class="card table-card"><div class="tscroll"><table class="cmp" id="prodSpcTable"></table></div></section>
+
+  <div id="trendBlock">
+    <div class="sec-head"><h2>Daily Contribution</h2><span class="sub-note" id="trendNote"></span></div>
+    <div class="chips" id="trendMode">
+      <button type="button" data-tmode="daily">Daily</button><button type="button" data-tmode="cum">Cumulative</button><button type="button" data-tmode="share">Share %</button>
+    </div>
+    <section class="card"><div class="trend" id="trend"></div><div class="ch-legend" id="trendLegend"></div></section>
+  </div>
+  <p class="foot" id="updated"></p>
+</main>
+<div class="tip" id="tip" role="tooltip" hidden></div>
+</body></html>"""
+
+SPC_CSS = r"""
+.spc-ctl{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.spc .ch-panel .seg{height:32px}
+.ins{margin:0;padding:0;list-style:none;display:grid;gap:10px}
+.ins li{display:grid;grid-template-columns:26px 1fr;gap:10px;align-items:start;font-size:14px;line-height:1.4}
+.ins li i{width:26px;height:26px;border-radius:8px;display:grid;place-items:center;font-style:normal;font-size:14px;color:#fff}
+.sbar{margin:4px 0 14px}
+.sbar-h{display:flex;justify-content:space-between;font-size:12.5px;color:var(--label2);margin-bottom:6px}
+.sbar-h b{color:var(--label);font-weight:600}
+.sbar-t{display:flex;height:28px;border-radius:9px;overflow:hidden;background:var(--fill)}
+.sbar-t span{display:flex;align-items:center;justify-content:center;min-width:0;font-size:11px;font-weight:700;color:#fff;white-space:nowrap;overflow:hidden;border-right:1.5px solid var(--card)}
+.sbar-t span:last-child{border-right:0}
+.spc .cmp td .dot{display:inline-block;width:9px;height:9px;border-radius:3px;margin-right:7px;vertical-align:baseline}
+.spc .cmp th[data-sort]{cursor:pointer}
+.spc .cmp th[data-sort].on{color:var(--blue)}
+.heat td{text-align:center!important}
+.heat td:first-child{text-align:left!important}
+.spc #spcTable{font-size:13px}
+.spc #spcTable thead th{white-space:normal;min-width:62px;max-width:104px;line-height:1.25;vertical-align:bottom;padding:11px 10px 10px}
+.spc #spcTable tbody td,.spc #spcTable tfoot td{padding:8px 10px}
+.spc #spcTable th:first-child,.spc #spcTable td:first-child{min-width:150px;max-width:210px;padding-left:14px}
+.spc #spcTable td .gc,.spc #spcTable td .pp{min-width:0}
+#prodSpcTable td:first-child{min-width:140px}
+#prodSegPick button small{opacity:.65;font-weight:600;margin-left:2px}
+.cmp tr.grp td{position:static!important;max-width:none!important;overflow:visible!important}
+.cmp tr.grp .grp-lab{position:sticky;left:12px;display:inline-flex;align-items:baseline;gap:6px;max-width:calc(100vw - 48px);white-space:nowrap}
+.cmp tr.grp .grp-lab small{margin-left:4px}
+#prodSpcTable td div{display:flex;flex-direction:column;align-items:flex-end;gap:1px}
+#prodSpcTable td small{font-size:10.5px;color:var(--label2);font-weight:500}
+#prodSpcTable td.best{background:color-mix(in srgb,var(--up) 12%,var(--card))}
+.cmp tr.grp td{position:static;height:auto;padding:10px 14px 8px;background:color-mix(in srgb,var(--label) 5%,var(--card))!important;text-align:left;font-size:12px;font-weight:800;letter-spacing:.04em;text-transform:uppercase;color:var(--label)}
+.cmp tr.grp td small{display:inline;margin-left:10px;font-size:11.5px;font-weight:500;letter-spacing:0;text-transform:none;color:var(--label2)}
+.cmp tr.grp td .dot{display:inline-block;width:9px;height:9px;border-radius:3px;margin-right:7px}
+.heat td div{display:flex;flex-direction:column;align-items:center!important;gap:1px}
+.heat td small{font-size:10.5px;color:var(--label2)}
+.heat td.hc{color:var(--label);font-weight:600}
+.spc-models{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:10px}
+.mcard{background:var(--card);border-radius:16px;padding:12px 14px}
+.mcard h3{margin:0 0 8px;font-size:14px;display:flex;align-items:center;gap:8px}
+.mcard h3 i{width:10px;height:10px;border-radius:3px;display:inline-block}
+.mcard ol{margin:0;padding:0;list-style:none;display:grid;gap:6px;font-size:13px}
+.mcard li{display:flex;justify-content:space-between;gap:10px}
+.mcard li span:last-child{color:var(--label2);white-space:nowrap;font-variant-numeric:tabular-nums}
+.trend{position:relative;width:100%}
+.trend svg{display:block;overflow:visible}
+.trend text{font:10.5px -apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,sans-serif;fill:var(--label2)}
+.trend .gl{stroke:var(--grid);stroke-width:1}
+.trend .ln{fill:none;stroke-width:2.4;stroke-linecap:round;stroke-linejoin:round;transition:opacity .2s}
+.trend .ar{transition:opacity .2s}
+.trend .guide{stroke:var(--label3);stroke-width:1;stroke-dasharray:3 3}
+.trend .hit{fill:transparent;cursor:crosshair}
+.trend.dim .ln:not(.hl),.trend.dim .ar:not(.hl){opacity:.18}
+.ch-legend span[data-s]{cursor:pointer}
+@media (max-width:560px){.spc-ctl{grid-template-columns:1fr}}
+"""
+
+SPC_JS = r"""
+(function(){
+const $ = s => document.querySelector(s);
+const $$ = s => Array.from(document.querySelectorAll(s));
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const store = {
+  get(k){ try { return localStorage.getItem(k); } catch (e) { return null; } },
+  set(k, v){ try { localStorage.setItem(k, v); } catch (e) {} }
+};
+const trimNum = n => n.toFixed(2);
+function compact(v){
+  if (window.AP_FULL) return Math.round(v || 0).toLocaleString('en-IN');   // Quick settings: full numbers
+  const a = Math.abs(v || 0), s = v < 0 ? '-' : '';
+  if (a >= 1e7) return s + trimNum(a / 1e7) + 'Cr';
+  if (a >= 1e5) return s + trimNum(a / 1e5) + 'L';
+  if (a >= 1e3) return s + trimNum(a / 1e3) + 'K';
+  return s + Math.round(a);
+}
+const full = v => Math.round(v || 0).toLocaleString('en-IN');
+const pct = (x, d = 2) => (isFinite(x) ? x.toFixed(d) + '%' : '–');
+const iso = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+const day = s => new Date(s + 'T00:00:00');
+const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x; };
+const PALETTE = ['#0a84ff', '#ff9500', '#34c759', '#af52de', '#ff2d55', '#30b0c7', '#5e5ce6', '#ffcc00', '#a2845e', '#64d2ff', '#ff6482', '#8e8e93'];
+const SEG_COLORS = { sp: '#0a84ff', flagship: '#0a84ff', innovative: '#30b0c7', tab: '#ff9500', npc: '#af52de', wearables: '#ff2d55', accessories: '#34c759' };
+const PRESETS = [['mtd', 'MTD'], ['lm', 'Last month'], ['l7', 'Last 7 days'], ['l30', 'Last 30 days'], ['qtd', 'QTD'], ['ytd', 'YTD'], ['custom', 'Custom']];
+
+let saved = {}, ov = {};
+try { saved = JSON.parse(store.get('spc-state') || '{}'); } catch (e) {}
+try { ov = JSON.parse(store.get('ov-state') || '{}'); } catch (e) {}
+const st = Object.assign({ preset: 'mtd', start: '', end: '', metric: 'v', compare: 'prev', sp: !!ov.sp, ff: ov.ff !== false, sort: 'v', heat: 'seg' }, saved);
+st.sel = StorePicker.saved(); delete st.store;
+let data = null, ctrl = null;
+const save = () => { const { sel, ...rest } = st; store.set('spc-state', JSON.stringify(rest)); };
+const isV = () => st.metric === 'v';
+const fmtM = v => (isV() ? compact(v) : full(v));
+const m = r => (isV() ? r.v : r.q);
+const mb = r => (isV() ? r.bv : r.bq);
+const spm = r => (isV() ? (r.spv || 0) : (r.spq || 0));   // smartphone sales: targets are SP only
+
+function presetRange(p, dmin, dmax){
+  const M = day(dmax);
+  switch (p) {
+    case 'lm': return [new Date(M.getFullYear(), M.getMonth() - 1, 1), new Date(M.getFullYear(), M.getMonth(), 0)];
+    case 'l7': return [addDays(M, -6), M];
+    case 'l30': return [addDays(M, -29), M];
+    case 'qtd': return [new Date(M.getFullYear(), Math.floor(M.getMonth() / 3) * 3, 1), M];
+    case 'ytd': return [new Date(M.getFullYear(), 0, 1), M];
+    case 'custom': return [st.start ? day(st.start) : new Date(M.getFullYear(), M.getMonth(), 1), st.end ? day(st.end) : M];
+    default: return [new Date(M.getFullYear(), M.getMonth(), 1), M];
+  }
+}
+function gchip(cur, base){
+  if (!base) return cur ? '<span class="gc new">New</span>' : '<span class="gc">–</span>';
+  const p = (cur - base) / base * 100, a = Math.abs(p);
+  return `<span class="gc ${p > 0.05 ? 'up' : p < -0.05 ? 'down' : ''}">${p >= 0 ? '↑' : '↓'}${a.toFixed(2)}%</span>`;
+}
+const ppChip = x => `<span class="pp ${x > 0.05 ? 'up' : x < -0.05 ? 'down' : ''}">${x > 0 ? '+' : ''}${x.toFixed(2)}pp</span>`;
+
+function render(){
+  const d = data;
+  $('#err').hidden = !d.error; if (d.error) { $('#err').textContent = d.error; return; }
+  $('#title').textContent = d.store_label || 'All Stores';
+  $('#navLabel').textContent = d.range;
+  StorePicker.mount({ stores: d.stores, selected: d.scope, onChange: sel => { st.sel = sel; load(); } });
+  controls();
+
+  const T = d.total, tm = m(T), tb = mb(T);
+  const spcs = d.spcs.map((r, i) => ({ ...r, color: PALETTE[i % PALETTE.length] }));
+  const active = spcs.filter(r => r.v || r.q);
+  const sorted = active.slice().sort((a, b) => m(b) - m(a));
+  const share = r => (tm ? m(r) / tm * 100 : 0);
+  const bshare = r => (tb ? mb(r) / tb * 100 : 0);
+  const storeAsp = T.q ? T.v / T.q : 0;
+  const flag = d.segments.find(s => /^(flagship|sp)$/i.test(s.name));
+  const flagMix = r => { const s = flag && r.segs[flag.name]; return r.v ? (s ? s[0] : 0) / r.v * 100 : 0; };
+
+  /* snapshot */
+  $('#snapNote').textContent = `${d.range} · vs ${d.base_code} ${d.base_range}`;
+  const top1 = sorted[0], top2 = sorted.slice(0, 2).reduce((a, r) => a + m(r), 0);
+  const tiles = [
+    [isV() ? 'Store value' : 'Store units', fmtM(tm), gchip(tm, tb), `${d.base_code} ${fmtM(tb)}`],
+    [isV() ? 'Store units' : 'Store value', isV() ? full(T.q) : compact(T.v), gchip(isV() ? T.q : T.v, isV() ? T.bq : T.bv), ''],
+    ['Active SPCs', String(active.length), '', `${d.total.days} selling days`],
+    [isV() ? 'Avg value per SPC' : 'Avg units per SPC', fmtM(active.length ? tm / active.length : 0), '', ''],
+  ];   // who leads and how concentrated the store is: first two lines of Insights
+  const un = isV() ? T.unassigned_v : T.unassigned_q;
+  if (un) tiles.push(['Not tagged to an SPC', fmtM(un), '', pct(tm ? un / tm * 100 : 0) + ' of store']);
+  $('#kpis').innerHTML = tiles.map(([k, v, c, sub]) => `<div class="kpi"><small>${k}</small><b>${v}</b>${c ? `<span>${c}</span>` : ''}${sub ? `<span class="pv">${sub}</span>` : ''}</div>`).join('');
+
+  /* insights */
+  const ins = [];
+  if (top1) ins.push(['#0a84ff', '★', `<b>${esc(top1.name)}</b> brings <b>${pct(share(top1))}</b> of store ${isV() ? 'value' : 'units'} (${fmtM(m(top1))}) with ${isV() ? pct(top1.q / (T.q || 1) * 100) + ' of the units' : pct(top1.v / (T.v || 1) * 100) + ' of the value'}.`]);
+  if (sorted.length > 2) ins.push(['#ff9500', '◔', `Top 2 SPCs make up <b>${pct(top2 / (tm || 1) * 100)}</b> of the store; the other ${sorted.length - 2} share ${pct(100 - top2 / (tm || 1) * 100)}.`]);
+  const deltas = active.map(r => ({ r, dv: m(r) - mb(r) })).sort((a, b) => b.dv - a.dv);
+  if (tb && deltas.length) {
+    const g = deltas[0], l = deltas[deltas.length - 1];
+    if (g.dv > 0) ins.push(['#34c759', '↑', `<b>${esc(g.r.name)}</b> added the most vs ${d.base_code}: <b>+${fmtM(g.dv)}</b>, worth ${ppChip(g.dv / tb * 100)} of store growth.`]);
+    if (l.dv < 0) ins.push(['#ff3b30', '↓', `<b>${esc(l.r.name)}</b> dropped the most vs ${d.base_code}: <b>−${fmtM(-l.dv)}</b> (${ppChip(l.dv / tb * 100)}).`]);
+  }
+  const aspList = active.filter(r => r.q).map(r => ({ r, asp: r.v / r.q })).sort((a, b) => b.asp - a.asp);
+  if (aspList.length > 1) ins.push(['#af52de', '◆', `Highest ASP: <b>${esc(aspList[0].r.name)}</b> at ${compact(aspList[0].asp)} (${Math.round(aspList[0].asp / (storeAsp || 1) * 100)} vs store 100). Lowest: ${esc(aspList[aspList.length - 1].r.name)} at ${compact(aspList[aspList.length - 1].asp)}.`]);
+  if (flag && flag.v) { const fl = active.slice().sort((a, b) => flagMix(b) - flagMix(a))[0]; if (fl) ins.push(['#30b0c7', '▲', `Richest premium mix: <b>${esc(fl.name)}</b>, ${pct(flagMix(fl))} of their value is ${esc(flag.name)} (store ${pct(flag.v / (T.v || 1) * 100)}).`]); }
+  const withT = active.filter(r => r.target && r.target[st.metric]);
+  if (withT.length) { const best = withT.map(r => ({ r, a: spm(r) / r.target[st.metric] * 100 })).sort((a, b) => b.a - a.a); ins.push(['#5e5ce6', '◎', `SP target achievement leader: <b>${esc(best[0].r.name)}</b> at ${pct(best[0].a)}; lowest ${esc(best[best.length - 1].r.name)} at ${pct(best[best.length - 1].a)}.`]); }
+  $('#insights').innerHTML = ins.length ? ins.map(([c, ic, t]) => `<li><i style="background:${c}">${ic}</i><span>${t}</span></li>`).join('') : '<li><i style="background:#8e8e93">i</i><span>No SPC sales in this period.</span></li>';
+
+
+  /* contribution table */
+  const cols = [
+    ['name', 'SPC', r => `<span class="dot" style="background:${r.color}"></span>${esc(r.name)}`, r => r.name],
+    ['v', 'Value', r => compact(r.v), r => r.v],
+    ['vs', 'Value share', r => pct(T.v ? r.v / T.v * 100 : 0), r => r.v],
+    ['q', 'Units', r => full(r.q), r => r.q],
+    ['qs', 'Unit share', r => pct(T.q ? r.q / T.q * 100 : 0), r => r.q],
+    ['asp', 'ASP', r => (r.q ? compact(r.v / r.q) : '–'), r => (r.q ? r.v / r.q : 0)],
+    ['aspi', 'ASP index', r => (r.q && storeAsp ? `<span class="pp ${r.v / r.q >= storeAsp ? 'up' : 'down'}">${Math.round(r.v / r.q / storeAsp * 100)}</span>` : '–'), r => (r.q ? r.v / r.q : 0)],
+    ...(flag ? [['fm', `${flag.name} mix`, r => pct(flagMix(r)), flagMix]] : []),
+    ['pd', isV() ? 'Value / day' : 'Units / day', r => (r.days ? (isV() ? compact(m(r) / r.days) : (m(r) / r.days).toFixed(2)) : '–'), r => (r.days ? m(r) / r.days : 0)],
+    ['gr', `Growth vs ${d.base_code}`, r => gchip(m(r), mb(r)), r => (mb(r) ? (m(r) - mb(r)) / mb(r) : 9e9)],
+    ['cg', 'Growth contrib.', r => (tb ? ppChip((m(r) - mb(r)) / tb * 100) : '–'), r => m(r) - mb(r)],
+    ['sd', 'Share Δ', r => (tb && tm ? ppChip(share(r) - bshare(r)) : '–'), r => share(r) - bshare(r)],
+    ['ta', 'SP target ach.', r => (r.target && r.target[st.metric] ? `<span class="pp ${spm(r) >= r.target[st.metric] ? 'up' : ''}">${pct(spm(r) / r.target[st.metric] * 100)}</span>` : '–'), r => (r.target && r.target[st.metric] ? spm(r) / r.target[st.metric] : -1)],
+  ];
+  // to beat the whole previous month (or quarter / year) while it is still running
+  const bt = d.beat, fm = r => (isV() ? r.fv : r.fq), left = bt ? bt.days_left : 0;
+  const beatCell = (now, full) => (!full ? '–' : now >= full ? `<span class="pp up">✓ ${now > full ? '+' + fmtM(now - full) : 'level'}</span>`
+    : `${fmtM(full - now)}${left ? `<small class="sub">${isV() ? compact((full - now) / left) : ((full - now) / left).toFixed(1)}/day</small>` : ''}`);
+  if (bt) cols.push(['bt', `To beat ${bt.code}`, r => beatCell(m(r), fm(r)), r => (fm(r) ? fm(r) - m(r) : -9e9)]);
+  const storeTgt = spcs.reduce((s, r) => s + (r.target && r.target[st.metric] || 0), 0);  // SPC targets added up
+  const storeSp = spcs.reduce((s, r) => s + spm(r), 0);
+  const sc = cols.find(c => c[0] === st.sort) || cols[1];
+  const rows = spcs.filter(r => r.v || r.q || r.bv || r.bq).sort((a, b) => (sc[0] === 'name' ? a.name.localeCompare(b.name) : sc[3](b) - sc[3](a)));
+  $('#tblNote').textContent = `${isV() ? 'value' : 'units'} measures${bt ? ` · To beat ${bt.code}: all of ${bt.range}, with ${bt.days_left} day${bt.days_left === 1 ? '' : 's'} left` : ''} · tap a column to sort`;
+  $('#spcTable').innerHTML = `<thead><tr>${cols.map(c => `<th data-sort="${c[0]}" class="${c[0] === st.sort ? 'on' : ''}">${c[1]}</th>`).join('')}</tr></thead>
+    <tbody>${rows.map(r => `<tr>${cols.map(c => `<td>${c[2](r)}</td>`).join('')}</tr>`).join('')}</tbody>
+    <tfoot><tr><td>Store</td><td>${compact(T.v)}</td><td>100%</td><td>${full(T.q)}</td><td>100%</td><td>${compact(storeAsp)}</td><td>100</td>${flag ? `<td>${pct(flag.v / (T.v || 1) * 100)}</td>` : ''}<td>${d.total.days ? (isV() ? compact(tm / d.total.days) : (tm / d.total.days).toFixed(2)) : '–'}</td><td>${gchip(tm, tb)}</td><td>${tb ? ppChip((tm - tb) / tb * 100) : '–'}</td><td>${tb && tm ? ppChip(0) : '–'}</td><td>${storeTgt ? `<span class="pp ${storeSp >= storeTgt ? 'up' : ''}">${pct(storeSp / storeTgt * 100)}</span>` : '–'}</td>${bt ? `<td>${beatCell(tm, isV() ? bt.v : bt.q)}</td>` : ''}</tr></tfoot>`;
+
+  /* heat map */
+  const segs = d.segments;
+  const mode = st.heat;
+  $$('#heatMode [data-heat]').forEach(b => b.classList.toggle('on', b.dataset.heat === mode));
+  $('#heatNote').textContent = mode === 'seg' ? `who sells each segment · ${isV() ? 'value' : 'units'}` : `how each SPC's ${isV() ? 'value' : 'units'} splits`;
+  const cellVal = (r, s) => ((r.segs[s.name] || [0, 0])[isV() ? 0 : 1]);
+  $('#heatTable').innerHTML = `<thead><tr><th>SPC</th>${segs.map(s => `<th><span class="dot" style="background:${SEG_COLORS[s.name.toLowerCase()] || '#8e8e93'}"></span>${esc(s.name)}</th>`).join('')}</tr></thead>
+    <tbody>${sorted.map(r => `<tr><td><span class="dot" style="background:${r.color}"></span>${esc(r.name)}</td>${segs.map(s => {
+      const v = cellVal(r, s), den = mode === 'seg' ? (isV() ? s.v : s.q) : m(r);
+      const p = den ? v / den * 100 : 0;
+      const col = SEG_COLORS[s.name.toLowerCase()] || '#8e8e93';
+      return `<td class="hc" style="background:color-mix(in srgb,${col} ${Math.round(Math.min(100, p) * 0.55)}%,transparent)"><div><span>${v ? pct(p) : '–'}</span><small>${v ? fmtM(v) : ''}</small></div></td>`;
+    }).join('')}</tr>`).join('')}</tbody>`;
+
+  /* products by SPC: each product's total, who sold it, and the growth vs the base window */
+  const allProds = (d.products || []).slice().sort((x, y) => m(y) - m(x));
+  const pIdx = isV() ? 0 : 1;
+  const pseg = {};
+  allProds.forEach(p => { (pseg[p.seg || 'Other'] = pseg[p.seg || 'Other'] || []).push(p); });
+  const allOrder = Object.keys(pseg).sort((a, b) => pseg[b].reduce((s, p) => s + m(p), 0) - pseg[a].reduce((s, p) => s + m(p), 0));
+  // segment chips: All, or one segment's products only
+  if (st.prodSeg && !pseg[st.prodSeg]) st.prodSeg = '';
+  $('#prodSegPick').hidden = allOrder.length < 2;
+  $('#prodSegPick').innerHTML = [['', 'All', allProds.length]].concat(allOrder.map(g => [g, g, pseg[g].length]))
+    .map(([k, t, n]) => `<button type="button" data-prodseg="${esc(k)}" class="${(st.prodSeg || '') === k ? 'on' : ''}">${esc(t)} <small>${n}</small></button>`).join('');
+  const segOrder = st.prodSeg ? [st.prodSeg] : allOrder;
+  const prods = st.prodSeg ? pseg[st.prodSeg] : allProds;
+  const ptot = prods.reduce((s, p) => s + m(p), 0);
+  $('#prodSpcNote').textContent = `${prods.length} products${st.prodSeg ? ' in ' + st.prodSeg : ''} · ${isV() ? 'value' : 'units'} · Share is of ${st.prodSeg ? 'the segment' : 'the store'} · cell = SPC amount and share of the product · best seller highlighted`;
+  const ncol = 4 + sorted.length;
+  $('#prodSpcTable').innerHTML = `<thead><tr><th>Product</th><th>Store</th><th>Share</th><th>Growth vs ${d.base_code}</th>${sorted.map(r => `<th><span class="dot" style="background:${r.color}"></span>${esc(r.name)}</th>`).join('')}</tr></thead>
+    <tbody>${segOrder.map(sg => { const ps = pseg[sg], st_ = ps.reduce((s, p) => s + m(p), 0);
+      return `<tr class="grp"><td colspan="${ncol}"><span class="grp-lab"><span class="dot" style="background:${SEG_COLORS[sg.toLowerCase()] || '#8e8e93'}"></span>${esc(sg)}<small>${ps.length} products · ${fmtM(st_)} · ${ptot ? pct(st_ / ptot * 100) : '–'}</small></span></td></tr>` + ps.map(p => {
+      const best = sorted.reduce((b, r) => ((p.by[r.name] || [0, 0])[pIdx] > ((p.by[b] || [0, 0])[pIdx]) ? r.name : b), '');
+      return `<tr><td title="${esc(p.name)}">${esc(p.name)}</td><td>${fmtM(m(p))}</td><td>${ptot ? pct(m(p) / ptot * 100) : '–'}</td><td>${gchip(m(p), mb(p))}</td>${sorted.map(r => {
+        const x = (p.by[r.name] || [0, 0])[pIdx];
+        return `<td class="${x && r.name === best ? 'best' : ''}">${x ? `<div><span>${fmtM(x)}</span><small>${pct(m(p) ? x / m(p) * 100 : 0)}</small></div>` : '–'}</td>`;
+      }).join('')}</tr>`;
+    }).join(''); }).join('') || '<tr><td>No product sales in this period</td></tr>'}</tbody>
+    <tfoot><tr><td>${st.prodSeg ? esc(st.prodSeg) + ' total' : 'Total'}</td><td>${fmtM(ptot)}</td><td>100.00%</td><td>${gchip(ptot, prods.reduce((s, p) => s + mb(p), 0))}</td>${sorted.map(r => `<td>${fmtM(st.prodSeg ? prods.reduce((s, p) => s + ((p.by[r.name] || [0, 0])[pIdx]), 0) : m(r))}</td>`).join('')}</tr></tfoot>`;
+
+  /* top models */
+
+  /* daily trend: smooth lines (daily / cumulative) or stacked share bands */
+  const tr = d.trend;
+  $('#trendBlock').hidden = !tr;
+  if (tr) drawTrend(tr, sorted);
+  $('#updated').textContent = `${d.updated ? 'Updated ' + d.updated + ' · ' : ''}data ${d.dmin} to ${d.dmax}`;
+  if (window.addExportButtons) window.addExportButtons();
+}
+
+let tipData = null;
+const tip = $('#tip');
+/* Catmull-Rom through the points as cubic Béziers, kept inside the plot so curves never dip below zero */
+function smooth(pts, lo, hi){
+  if (!pts.length) return '';
+  let d = `M${pts[0][0]},${pts[0][1]}`;
+  const cl = y => Math.max(lo, Math.min(hi, y));
+  for (let i = 0; i < pts.length - 1; i++) {
+    const p0 = pts[i - 1] || pts[i], p1 = pts[i], p2 = pts[i + 1], p3 = pts[i + 2] || p2;
+    d += `C${p1[0] + (p2[0] - p0[0]) / 6},${cl(p1[1] + (p2[1] - p0[1]) / 6)} ${p2[0] - (p3[0] - p1[0]) / 6},${cl(p2[1] - (p3[1] - p1[1]) / 6)} ${p2[0]},${p2[1]}`;
+  }
+  return d;
+}
+function drawTrend(tr, sorted){
+  const mode = st.tmode || 'daily';
+  $$('#trendMode [data-tmode]').forEach(b => b.classList.toggle('on', b.dataset.tmode === mode));
+  const n = tr.days.length;
+  const raw = sorted.map(r => ({ r, vals: ((isV() ? tr.v : tr.q)[r.name] || []).map(x => x || 0) }));
+  const tot = tr.days.map((_, i) => raw.reduce((a, s) => a + s.vals[i], 0));
+  let series = raw;
+  if (mode === 'cum') series = raw.map(s => { let c = 0; return { ...s, vals: s.vals.map(v => (c += v)) }; });
+  if (mode === 'share') series = raw.map(s => ({ ...s, vals: s.vals.map((v, i) => (tot[i] ? v / tot[i] * 100 : 0)) }));
+  const box = $('#trend');
+  const W = Math.max(300, Math.floor(box.getBoundingClientRect().width) - 2), H = 250;
+  const m = { l: 46, r: 14, t: 12, b: 28 }, pw = W - m.l - m.r, ph = H - m.t - m.b;
+  const maxV = mode === 'share' ? 100 : Math.max(1, ...series.flatMap(s => s.vals));
+  const p = Math.pow(10, Math.floor(Math.log10(maxV))), top = mode === 'share' ? 100 : [1, 1.2, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10].find(x => maxV / p <= x) * p;
+  const X = i => m.l + (n === 1 ? pw / 2 : i / (n - 1) * pw), Y = v => m.t + ph - v / top * ph;
+  const fmtY = v => (mode === 'share' ? Math.round(v) + '%' : fmtM(v));
+  let g = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="Daily contribution by SPC"><defs>`;
+  series.forEach((s, k) => { g += `<linearGradient id="tg${k}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${s.r.color}" stop-opacity="${mode === 'share' ? 0.9 : 0.22}"/><stop offset="1" stop-color="${s.r.color}" stop-opacity="${mode === 'share' ? 0.75 : 0}"/></linearGradient>`; });
+  g += '</defs>';
+  [0, .25, .5, .75, 1].forEach(f => { const v = top * f; g += `<line class="gl" x1="${m.l}" x2="${W - m.r}" y1="${Y(v)}" y2="${Y(v)}"/><text x="${m.l - 7}" y="${Y(v) + 3.5}" text-anchor="end">${fmtY(v)}</text>`; });
+  const every = Math.max(1, Math.ceil(n / Math.floor(pw / 52)));
+  tr.labels.forEach((l, i) => { if (i % every === 0 || i === n - 1) g += `<text x="${X(i)}" y="${H - 8}" text-anchor="middle">${esc(l)}</text>`; });
+  if (mode === 'share') {
+    const base = tr.days.map(() => 0);
+    series.forEach((s, k) => {
+      const lowPts = base.map((b, i) => [X(i), Y(b)]);
+      const upVals = base.map((b, i) => b + s.vals[i]);
+      const upPts = upVals.map((v, i) => [X(i), Y(v)]);
+      const upper = smooth(upPts, m.t, m.t + ph), lower = smooth(lowPts.slice().reverse(), m.t, m.t + ph).replace(/^M/, 'L');
+      g += `<path class="ar" data-s="${k}" d="${upper}${lower}Z" fill="url(#tg${k})"/>`;
+      upVals.forEach((v, i) => { base[i] = v; });
+    });
+  } else {
+    series.forEach((s, k) => {
+      const pts = s.vals.map((v, i) => [X(i), Y(v)]);
+      const line = smooth(pts, m.t, m.t + ph);
+      g += `<path class="ar" data-s="${k}" d="${line}L${X(n - 1)},${Y(0)}L${X(0)},${Y(0)}Z" fill="url(#tg${k})"/>`;
+      g += `<path class="ln" data-s="${k}" d="${line}" stroke="${s.r.color}"/>`;
+      const last = pts[pts.length - 1];
+      g += `<circle cx="${last[0]}" cy="${last[1]}" r="3.5" fill="${s.r.color}" stroke="var(--card)" stroke-width="1.5"/>`;
+    });
+  }
+  g += `<line class="guide" id="tGuide" x1="0" x2="0" y1="${m.t}" y2="${m.t + ph}" visibility="hidden"/><g id="tDots"></g>`;
+  const step = n > 1 ? pw / (n - 1) : pw;
+  tr.days.forEach((_, i) => { g += `<rect class="hit" data-i="${i}" x="${X(i) - step / 2}" y="${m.t}" width="${step}" height="${ph}"/>`; });
+  box.innerHTML = g + '</svg>';
+  $('#trendNote').textContent = mode === 'share' ? 'each SPC\'s share of the day' : mode === 'cum' ? `running ${isV() ? 'value' : 'units'} through the period` : `${isV() ? 'value' : 'units'} per day · peak ${fmtM(Math.max(...tot))}`;
+  $('#trendLegend').innerHTML = sorted.map((r, k) => `<span data-s="${k}"><i style="background:${r.color}"></i>${esc(r.name)}</span>`).join('');
+  tipData = { tr, series, raw, tot, X, Y, mode };
+}
+function showTip(i, x, y){
+  if (!tipData) return;
+  const { tr, series, raw, tot, X, Y, mode } = tipData;
+  const guide = $('#tGuide');
+  if (guide) {
+    guide.setAttribute('x1', X(i)); guide.setAttribute('x2', X(i)); guide.setAttribute('visibility', 'visible');
+    let acc = 0;
+    $('#tDots').innerHTML = series.map(s => { const v = mode === 'share' ? (acc += s.vals[i]) : s.vals[i]; return `<circle cx="${X(i)}" cy="${Y(v)}" r="4" fill="${s.r.color}" stroke="var(--card)" stroke-width="2"/>`; }).join('');
+  }
+  const head = mode === 'cum' ? `Running total to ${tr.labels[i]}` : tr.labels[i];
+  const rows = series.map((s, k) => ({ s, k, v: s.vals[i], day: raw[k].vals[i] })).filter(o => o.v || o.day).sort((a, b) => b.v - a.v);
+  const total = mode === 'cum' ? series.reduce((a, s) => a + s.vals[i], 0) : tot[i];
+  tip.innerHTML = `<h4>${esc(head)}</h4><div class="tv">${mode === 'share' ? fmtM(tot[i]) : fmtM(total)}</div>` + rows.map(o => `<div class="tl"><span><i style="background:${o.s.r.color}"></i>${esc(o.s.r.name)}</span><span>${mode === 'share' ? o.v.toFixed(2) + '% · ' + fmtM(o.day) : fmtM(o.v) + (total ? ' · ' + (o.v / total * 100).toFixed(2) + '%' : '')}</span></div>`).join('');
+  tip.hidden = false;
+  const r = tip.getBoundingClientRect();
+  let left = x + 14, topY = y - r.height - 12;
+  if (left + r.width > innerWidth - 8) left = x - r.width - 14;
+  if (topY < 8) topY = y + 16;
+  tip.style.left = Math.max(8, left) + 'px'; tip.style.top = Math.max(8, topY) + 'px';
+}
+function hideTip(){ tip.hidden = true; const g = $('#tGuide'); if (g) g.setAttribute('visibility', 'hidden'); const dd = $('#tDots'); if (dd) dd.innerHTML = ''; }
+$('#trend').addEventListener('pointermove', e => { if (e.pointerType === 'touch') return; const c = e.target.closest('.hit'); if (c) showTip(+c.dataset.i, e.clientX, e.clientY); });
+$('#trend').addEventListener('pointerleave', hideTip);
+$('#trend').addEventListener('click', e => { const c = e.target.closest('.hit'); if (c) showTip(+c.dataset.i, e.clientX, e.clientY); });
+window.addEventListener('scroll', hideTip, { passive: true });
+$('#trendLegend').addEventListener('pointerover', e => { const s = e.target.closest('[data-s]'); if (!s) return; $('#trend').classList.add('dim'); $$(`#trend [data-s="${s.dataset.s}"]`).forEach(x => x.classList.add('hl')); });
+$('#trendLegend').addEventListener('pointerout', () => { $('#trend').classList.remove('dim'); $$('#trend .hl').forEach(x => x.classList.remove('hl')); });
+$('#trendMode').addEventListener('click', e => { const b = e.target.closest('[data-tmode]'); if (!b) return; st.tmode = b.dataset.tmode; save(); if (data && data.trend) render(); });
+let rsz = null;
+window.addEventListener('resize', () => { clearTimeout(rsz); rsz = setTimeout(() => { if (data && !data.error) render(); }, 160); });
+
+function controls(){
+  const d = data;
+  $('#presets').innerHTML = PRESETS.map(([k, t]) => `<button type="button" data-preset="${k}" class="${st.preset === k ? 'on' : ''}">${t}</button>`).join('');
+  $('#customRange').hidden = st.preset !== 'custom';
+  $('#fromDate').value = d.start; $('#toDate').value = d.end;
+  $('#fromDate').min = $('#toDate').min = d.dmin; $('#fromDate').max = $('#toDate').max = d.dmax;
+  $('#metricSeg').style.setProperty('--i', isV() ? 0 : 1);
+  $('#cmpSeg').style.setProperty('--i', st.compare === 'ly' ? 1 : 0);
+  $$('#metricSeg button').forEach(b => b.setAttribute('aria-selected', String(b.dataset.metric === st.metric)));
+  $$('#cmpSeg button').forEach(b => b.setAttribute('aria-selected', String(b.dataset.cmp === st.compare)));
+  $('#cmpSeg [data-cmp=prev]').textContent = 'vs ' + (st.compare === 'prev' ? d.base_code : 'Previous');
+  $('#optSP').checked = st.sp; $('#optFF').checked = st.ff;
+}
+
+async function load(){
+  save();
+  if (ctrl) ctrl.abort();
+  const mine = ctrl = new AbortController();
+  $('#wrap').classList.add('loading');
+  const q = new URLSearchParams({ compare: st.compare, sp: st.sp ? '1' : '0', ff: st.ff ? '1' : '0' });
+  st.sel.forEach(s => q.append('store', s));
+  if (data && !data.error) { const [a, b] = presetRange(st.preset, data.dmin, data.dmax); q.set('start', iso(a)); q.set('end', iso(b)); }
+  try {
+    const res = await fetch('/api/spc?' + q, { signal: mine.signal });
+    const d = await res.json();
+    const first = !data || data.error;
+    data = d;
+    if (!d.error) st.sel = d.scope || [];
+    if (first && !d.error && st.preset !== 'mtd') return load();
+    render();
+  } catch (e) {
+    if (e.name !== 'AbortError') { data = { error: 'Could not reach the server. Please try again.' }; render(); }
+  } finally { if (mine === ctrl) $('#wrap').classList.remove('loading'); }
+}
+
+document.addEventListener('click', e => {
+  const p = e.target.closest('[data-preset]');
+  if (p) { st.preset = p.dataset.preset; if (st.preset === 'custom' && data && !data.error) { st.start = data.start; st.end = data.end; } load(); return; }
+  const mt = e.target.closest('[data-metric]'); if (mt) { st.metric = mt.dataset.metric; save(); render(); return; }
+  const c = e.target.closest('[data-cmp]'); if (c && c.dataset.cmp !== st.compare) { st.compare = c.dataset.cmp; load(); return; }
+  const s = e.target.closest('th[data-sort]'); if (s) { st.sort = s.dataset.sort; save(); render(); return; }
+  const h = e.target.closest('[data-heat]'); if (h) { st.heat = h.dataset.heat; save(); render(); return; }
+  const ps = e.target.closest('[data-prodseg]'); if (ps) { st.prodSeg = ps.dataset.prodseg; save(); render(); return; }
+});
+['fromDate', 'toDate'].forEach(id => $('#' + id).addEventListener('change', () => { st.preset = 'custom'; st.start = $('#fromDate').value; st.end = $('#toDate').value; load(); }));
+[['optSP', 'sp'], ['optFF', 'ff']].forEach(([id, k]) => $('#' + id).addEventListener('change', e => { st[k] = e.target.checked; load(); }));
+const top = $('#top');
+window.addEventListener('scroll', () => top.classList.toggle('scrolled', window.scrollY > 4), { passive: true });
+load();
+})();
+"""
+
+TABLE_CSS = r"""
+/* one table look everywhere: even rows, tinted header, sticky first column that stays opaque */
+.table-card{padding:0;overflow:hidden;border-radius:16px}
+.tscroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+.cmp{width:100%;min-width:100%;border-collapse:separate;border-spacing:0;font-size:13.5px;line-height:1.3}
+.cmp thead th{position:sticky;top:0;z-index:2;padding:11px 14px;background:color-mix(in srgb,var(--label) 4%,var(--card));
+  border-bottom:.5px solid var(--sep);font-size:11.5px;font-weight:600;letter-spacing:.02em;color:var(--label2);text-align:right;vertical-align:bottom;white-space:nowrap}
+.cmp th small{display:block;margin-top:2px;font-weight:400;font-size:10.5px;color:var(--label3)}
+.cmp tbody td,.cmp tfoot td{height:46px;padding:8px 14px;text-align:right;vertical-align:middle;white-space:nowrap;font-variant-numeric:tabular-nums;
+  border-top:.5px solid var(--sep);background:var(--card)}
+.cmp tbody tr:first-child td{border-top:0}
+.cmp tbody tr:nth-child(even) td{background:color-mix(in srgb,var(--label) 2%,var(--card))}
+.cmp tbody tr:hover td{background:color-mix(in srgb,var(--blue) 7%,var(--card))}
+.cmp th:first-child,.cmp td:first-child{position:sticky;left:0;z-index:1;text-align:left;min-width:150px;max-width:240px;overflow:hidden;text-overflow:ellipsis;
+  box-shadow:inset -.5px 0 0 var(--sep)}
+.cmp thead th:first-child{z-index:3}
+.cmp td:first-child{font-weight:600;color:var(--label)}
+.cmp tfoot td{height:48px;font-weight:700;background:color-mix(in srgb,var(--blue) 6%,var(--card));border-top:1px solid var(--sep)}
+.cmp tfoot td .more{font-weight:500}
+.cmp td .gc,.cmp td .pp{vertical-align:middle}
+.cmp td div{display:flex;flex-direction:column;align-items:flex-end;gap:3px}
+.heat td,.heat th{text-align:center}
+.heat td{min-width:84px}
+.eod-t td{height:52px}
+.x-holder .cmp thead th{position:static}
+/* options panels (Charts, SPC): calm neutral controls, colour only as a soft accent on what is selected */
+.ch-panel{background:var(--card);box-shadow:0 0 0 .5px var(--sep),0 6px 22px rgba(0,0,0,.05)}
+.ch-group{padding:13px 0}
+.gi{width:30px;height:30px;border-radius:9px;background:var(--g);box-shadow:none}
+.gi svg{width:17px;height:17px}
+.ch-group{grid-template-columns:30px minmax(0,1fr)}
+.gl{color:var(--label2);font-size:11px;letter-spacing:.05em;margin-bottom:8px}
+.ch-panel .chips button{background:var(--fill);color:var(--label);font-weight:500;box-shadow:none}
+.ch-panel .chips button:hover{background:color-mix(in srgb,var(--g) 9%,var(--fill))}
+.ch-panel .chips button.on{background:color-mix(in srgb,var(--g) 16%,transparent);color:color-mix(in srgb,var(--g) 85%,var(--label));font-weight:600;box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--g) 35%,transparent)}
+.ch-panel .seg{background:var(--fill)}
+.ch-panel .seg .thumb{background:var(--thumb);box-shadow:0 2px 6px rgba(0,0,0,.12),0 0 0 .5px rgba(0,0,0,.04)}
+.ch-panel .seg button[aria-selected=true]{color:color-mix(in srgb,var(--g) 85%,var(--label))}
+.ch-panel select,.ch-panel input[type=date]{background-color:var(--fill);border:1px solid transparent;font-weight:500;
+background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%238e8e93' stroke-width='2.5' stroke-linecap='round'%3E%3Cpath d='M7 10l5 5 5-5'/%3E%3C/svg%3E")}
+.ch-panel select:hover,.ch-panel input[type=date]:hover{border-color:color-mix(in srgb,var(--g) 30%,transparent)}
+.ch-panel select:focus,.ch-panel input:focus{outline:none;border-color:var(--g);box-shadow:0 0 0 3px color-mix(in srgb,var(--g) 18%,transparent)}
+.ch-panel .tg span{background:var(--fill);color:var(--label2);font-weight:500}
+.ch-panel .tg input:checked+span{background:color-mix(in srgb,var(--g) 16%,transparent);color:color-mix(in srgb,var(--g) 85%,var(--label));font-weight:600;box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--g) 35%,transparent)}
+
+/* highlighted header and totals */
+.cmp thead th{background:color-mix(in srgb,var(--blue) 12%,var(--card));color:var(--label);font-size:11px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;
+  border-bottom:1.5px solid color-mix(in srgb,var(--blue) 35%,transparent);padding-top:12px;padding-bottom:11px}
+.cmp thead th small{text-transform:none;letter-spacing:0;font-weight:500;color:var(--label2)}
+.cmp thead th[data-sort].on,.cmp thead th.on{color:var(--blue)}
+.cmp tfoot td{background:color-mix(in srgb,var(--blue) 16%,var(--card));color:var(--label);font-weight:800;
+  border-top:1.5px solid color-mix(in srgb,var(--blue) 40%,transparent)}
+.cmp tfoot td:first-child{text-transform:uppercase;letter-spacing:.04em;font-size:12px}
+.cmp thead th:first-child{background:color-mix(in srgb,var(--blue) 12%,var(--card))}
+.cmp tfoot td:first-child{background:color-mix(in srgb,var(--blue) 16%,var(--card))}
+.cmp tfoot td:first-child:has(.more){background:var(--card)}
+.cmp tfoot td:has(.more){background:var(--card);border-top:.5px solid var(--sep);font-weight:500;text-transform:none;letter-spacing:0}
+#storeTable tfoot td,#spcAchTable tfoot td{padding:10px 14px;font-weight:800}
+.spc #spcTable tfoot td{padding:10px 10px;font-weight:800}
+.spc #spcTable tfoot td:first-child{padding-left:14px}
+"""
+PAGE_HEAD = """<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<script>(function(){try{var d=document.documentElement,t=localStorage.getItem('ap-theme'),v=localStorage.getItem('ap-view');if(t!=='light'&&t!=='dark'){t=matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';localStorage.setItem('ap-theme',t);}if(v!=='phone'&&v!=='desktop'){v=Math.min(screen.width||9999,innerWidth||9999)<700?'phone':'desktop';localStorage.setItem('ap-view',v);}d.dataset.theme=t;if(v==='phone'||v==='desktop'){d.dataset.view=v;if(v==='desktop'){var m=document.querySelector('meta[name=viewport]');if(m)m.setAttribute('content','width=1200, viewport-fit=cover');}}}catch(e){}})();</script>
+<link rel="stylesheet" href="/assets/ov.css?v={{ asset_v }}">
+<script src="/assets/xp.js?v={{ asset_v }}" defer></script>"""
+
+STORE_TOP = """<header class="top" id="top">
+  <div class="bar">
+    <h1 id="title">All Stores</h1>
+    <div class="menu"><button type="button" class="pill" id="storeBtn">Stores</button><div class="ctx" id="storeMenu" role="menu"></div></div>
+  </div>
+  <div class="datenav"><span id="navLabel">&nbsp;</span></div>
+</header>"""
+
+COMPARE_HTML = """<!doctype html>
+<html lang="en"><head><title>Comparison</title>""" + PAGE_HEAD + """
+<script src="/assets/cmp.js?v={{ asset_v }}" defer></script>
+</head><body>""" + STORE_TOP + """
+<main class="wrap cmpg" id="wrap">
+  <section class="ch-panel" aria-label="Options">
+    <div class="ch-group" style="--g:#ff9500">
+      <span class="gi"><svg viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="15" rx="3"/><path d="M8 3v4M16 3v4M3.5 10h17"/></svg></span>
+      <div class="gb"><div class="gl">Period</div>
+        <div class="chips" id="presets"></div>
+        <div class="ch-range" id="customRange" hidden><label>From<input type="date" id="fromDate"></label><label>To<input type="date" id="toDate"></label></div>
+      </div>
+    </div>
+    <div class="ch-group" style="--g:#34c759">
+      <span class="gi"><svg viewBox="0 0 24 24"><path d="M4 17l5-5 4 4 7-8"/><path d="M15 8h5v5"/></svg></span>
+      <div class="gb"><div class="gl">View</div>
+        <div class="ctl-rows">
+          <div class="ctl-row"><span class="ctl-lab">Compare</span><div class="seg seg2" id="bySeg" role="tablist" aria-label="What to compare"><span class="thumb"></span><button type="button" data-by="store">Stores</button><button type="button" data-by="spc">SPCs of a store</button></div></div>
+          <div class="ctl-row"><span class="ctl-lab">Measure</span><div class="seg seg2" id="metricSeg" role="tablist" aria-label="Measure"><span class="thumb"></span><button type="button" data-metric="v">Value</button><button type="button" data-metric="q">Units</button></div></div>
+          <div class="ctl-row"><span class="ctl-lab">Against</span><div class="seg seg2" id="cmpSeg" role="tablist" aria-label="Compare with"><span class="thumb"></span><button type="button" data-cmp="prev">vs Previous</button><button type="button" data-cmp="ly">vs LY</button></div></div>
+        </div>
+        <p class="tg-hint" id="pickHint"></p>
+        <div class="chips spc-pick" id="spcPick" hidden></div>
+      </div>
+    </div>
+  </section>
+  <p class="err" id="err" hidden></p>
+  <p class="na-note" id="naNote" role="status" hidden></p>
+
+  <div class="sec-head"><h2 id="sideHead">Store Performance</h2><span class="sub-note" id="sideNote">tap a column to sort</span></div>
+  <section class="card table-card"><div class="tscroll"><table class="cmp" id="sideTable"></table></div></section>
+
+  <div class="sec-head"><h2>Segment Share</h2><span class="sub-note" id="mixNote"></span></div>
+  <section class="card table-card"><div class="tscroll"><table class="cmp heat" id="mixTable"></table></div></section>
+
+  <div class="sec-head"><h2>Business Scorecard</h2><span class="sub-note" id="scNote"></span></div>
+  <section class="card table-card"><div class="tscroll"><table class="cmp score" id="scoreTable"></table></div></section>
+
+  <div class="sec-head"><h2>SP Price Tiers</h2><span class="sub-note" id="tierNote"></span></div>
+  <section class="card tiers" id="tierBars"></section>
+
+  <div class="sec-head"><h2>Weekday Pattern</h2><span class="sub-note" id="wkNote"></span></div>
+  <section class="card table-card"><div class="tscroll"><table class="cmp heat" id="wkTable"></table></div></section>
+
+  <div id="trendBlock">
+    <div class="sec-head"><h2>Daily Trend</h2><span class="sub-note" id="trendNote"></span></div>
+    <div class="chips" id="trendMode"><button type="button" data-tmode="daily">Daily heatmap</button><button type="button" data-tmode="cum">Running total</button></div>
+    <section class="card"><div class="trend" id="trend"></div><div class="ch-legend" id="trendLegend"></div></section>
+  </div>
+
+  <div class="sec-head"><h2 id="topHead">Best Sellers by Store</h2></div>
+  <section class="spc-models" id="topModels"></section>
+  <p class="foot" id="updated"></p>
+</main>
+<div class="tip" id="tip" role="tooltip" hidden></div>
+</body></html>"""
+
+ACT_TOP = STORE_TOP.replace('<div class="datenav"><span id="navLabel">&nbsp;</span></div>', '''<div class="datenav">
+    <button type="button" class="arrow" id="prevBtn" aria-label="Previous month"><svg viewBox="0 0 24 24"><path d="M14 7l-5 5 5 5"/></svg></button>
+    <span id="navLabel">&nbsp;</span>
+    <button type="button" class="arrow" id="nextBtn" aria-label="Next month"><svg viewBox="0 0 24 24"><path d="M10 7l5 5-5 5"/></svg></button>
+  </div>''')   # Activations & Claims steps through sale months
+
+ACT_HTML = """<!doctype html>
+<html lang="en"><head><title>Activations & Claims</title>""" + PAGE_HEAD + """
+<script src="/assets/act.js?v={{ asset_v }}" defer></script>
+</head><body>""" + ACT_TOP + """
+<main class="wrap actg" id="wrap">
+  <p class="err" id="err" hidden></p>
+  <div class="chips act-months" id="monthChips" role="group" aria-label="Sale month"></div>
+  <div class="sec-head"><h2>Pending Summary</h2><span class="sub-note" id="sumNote"></span></div>
+  <section class="kpis" id="kpis"></section>
+
+  <div class="sec-head"><h2>Waiting Time</h2><span class="sub-note">days since the sale</span></div>
+  <section class="card" id="ages"></section>
+
+  <div class="sec-head"><h2>Pending Activations</h2><span class="sub-note" id="listNote"></span></div>
+  <div class="act-tools">
+    <input type="search" id="q" placeholder="Search model, SPC, IMEI…" autocomplete="off" aria-label="Search pending activations">
+    <div class="chips" id="ageChips"></div>
+  </div>
+  <section class="card table-card"><div class="tscroll"><table class="cmp" id="actTable"></table></div></section>
+
+  <div class="grid2">
+    <div id="byStoreBlock"><div class="sec-head"><h2>Pending by Store</h2></div><section class="card table-card"><div class="tscroll"><table class="cmp" id="byStore"></table></div></section></div>
+    <div><div class="sec-head"><h2>Pending by SPC</h2></div><section class="card table-card"><div class="tscroll"><table class="cmp" id="bySpc"></table></div></section></div>
+  </div>
+  <div id="claimBlock">
+    <div class="sec-head"><h2>Claim Quality</h2><span class="sub-note" id="clNote"></span></div>
+    <section class="card table-card"><div class="tscroll"><table class="cmp" id="clTable"></table></div></section>
+  </div>
+  <p class="foot" id="updated"></p>
+</main>
+</body></html>"""
+
+NEW_CSS = r"""
+/* store comparison */
+.rank{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:10px}
+.rk{display:grid;grid-template-columns:30px minmax(0,1fr);gap:10px;align-items:start;background:var(--card);border-radius:16px;padding:12px 14px}
+.rk-n{width:30px;height:30px;border-radius:9px;display:grid;place-items:center;color:#fff;font-weight:800;font-size:14px}
+.rk-b{min-width:0;display:grid;gap:6px}
+.rk-t{display:flex;justify-content:space-between;align-items:baseline;gap:8px;min-width:0}
+.rk-name{font-size:14.5px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.rk-t span{font-size:20px;font-weight:800;letter-spacing:-.01em;font-variant-numeric:tabular-nums;white-space:nowrap}
+.grid2>*{min-width:0}
+.rk-bar{height:6px;border-radius:3px;background:var(--fill);overflow:hidden}
+.rk-bar i{display:block;height:100%;border-radius:3px}
+.rk small{font-size:12px;color:var(--label2)}
+.cmpg .cmp td .dot,.actg .cmp td .dot{display:inline-block;width:9px;height:9px;border-radius:3px;margin-right:7px}
+.cmpg #sideTable th{white-space:normal;min-width:70px;max-width:110px;line-height:1.25}
+/* stores without an equal comparison period: amber tint and label, out of growth */
+.gc.na{background:color-mix(in srgb,#ff9500 18%,transparent);color:#c76a00;min-width:0}
+:root[data-theme=dark] .gc.na{color:#ffb340}
+.cmpg #sideTable tr.na td{background:color-mix(in srgb,#ff9500 7%,var(--card,transparent))}
+.cmpg #sideTable tr.na td:first-child{box-shadow:inset 3px 0 0 #ff9500}
+.na-v{color:var(--label2);display:inline-flex;flex-direction:column;align-items:flex-end;line-height:1.2}
+.na-v small{font-size:10.5px;color:#c76a00}
+.na-cnt{display:block;font-size:10.5px;font-weight:500;color:var(--label2);margin-top:2px}
+.rk.na{box-shadow:inset 0 0 0 1.5px color-mix(in srgb,#ff9500 55%,transparent)}
+.na-note{margin:0 0 14px;padding:10px 14px;border-radius:14px;font-size:13.5px;line-height:1.45;color:var(--label);
+  background:color-mix(in srgb,#ff9500 12%,transparent);box-shadow:inset 0 0 0 .5px color-mix(in srgb,#ff9500 45%,transparent)}
+.na-note small{color:var(--label2)}
+#cmpSeg button:disabled{opacity:.35;cursor:not-allowed}
+/* daily heatmap */
+.hm-wrap{overflow-x:auto;margin:-2px 0 0;padding:0}
+.hm{border-collapse:separate;border-spacing:2px;font-size:10.5px;width:100%;table-layout:fixed}
+.hm col.c-name{width:86px}
+.hm col.c-tot{width:50px}
+.hm th{font-weight:600;color:var(--label2);padding:0 0 4px;text-align:center;overflow:hidden}
+.hm th.we{color:var(--label)}
+.hm td{height:20px;border-radius:4px;background:color-mix(in srgb,#0a84ff var(--p,0%),var(--fill))}
+.hm td.zero{background:var(--fill);opacity:.55}
+.hm td.we:not(.hm-tot){box-shadow:inset 0 -2px 0 color-mix(in srgb,var(--label) 22%,transparent)}
+.hm .hm-name{position:sticky;left:0;z-index:1;background:var(--card);padding:0 8px 0 2px;text-align:left;font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;border-radius:0}
+.hm .hm-name i{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:middle}
+.hm .hm-tot{background:none;padding:0 0 0 6px;text-align:right;font-size:11.5px;font-weight:700;white-space:nowrap}
+.hm-key{display:flex;align-items:center;gap:8px;margin:10px 2px 0;font-size:11.5px;color:var(--label2);flex-wrap:wrap}
+.hm-key i{width:90px;height:8px;border-radius:4px;background:linear-gradient(90deg,var(--fill),#0a84ff)}
+.hm-key em{font-style:normal;margin-left:auto}
+.x-holder .hm-wrap{overflow:visible!important}
+.x-holder .hm .hm-name{position:static!important;max-width:none!important;overflow:visible!important}
+.x-holder .hm{table-layout:auto!important}
+.cmpg #sideTable .beat-d{display:block;font-size:11px;font-weight:500;color:var(--label2)}
+.cmpg #sideTable .vb{display:block;width:72px;height:4px;margin:0 0 4px auto;border-radius:2px;background:var(--fill);overflow:hidden}
+.cmpg #sideTable .vb i{display:block;height:100%;border-radius:2px}
+.act-months{margin:0 0 6px}
+#clTable tr.low td{background:color-mix(in srgb,#ff9500 7%,var(--card,transparent))}
+#clTable td.rmk{white-space:nowrap;color:var(--label2);font-size:12.5px}
+.act-months small{opacity:.7;font-weight:600;margin-left:2px}
+/* Stores / SPCs toggle and SPC picks */
+.spc-pick{margin-top:8px}
+.spc-pick .pick-more{align-self:center;font-size:12.5px;color:var(--label2);margin-left:4px}
+/* deep analysis */
+.cmpg #scoreTable th{white-space:normal;min-width:70px;max-width:120px;line-height:1.25;cursor:pointer}
+.cmpg #scoreTable td:first-child,.cmpg #clTable td:first-child,.cmpg #wkTable td:first-child{white-space:nowrap}
+.tiers{padding:14px 16px}
+.tb-legend{display:flex;flex-wrap:wrap;gap:6px 14px;margin:0 0 12px;font-size:12.5px;color:var(--label2)}
+.tb-legend span{display:inline-flex;align-items:center;gap:6px}
+.tb-legend i{width:10px;height:10px;border-radius:3px}
+.tb-row{display:grid;grid-template-columns:minmax(90px,160px) 1fr auto;align-items:center;gap:10px;padding:5px 0}
+.tb-name{display:flex;align-items:center;gap:6px;min-width:0;font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tb-name i{width:8px;height:8px;border-radius:50%;flex:none}
+.tb-bar{display:flex;height:20px;border-radius:6px;overflow:hidden;background:var(--fill)}
+.tb-bar i{display:grid;place-items:center;font-style:normal;font-size:10.5px;font-weight:700;color:#fff;min-width:0;overflow:hidden}
+.tb-bar em{font-size:12px;color:var(--label2);padding:0 8px;align-self:center}
+.tb-n{font-size:12px;color:var(--label2);white-space:nowrap;font-variant-numeric:tabular-nums}
+@media (max-width:640px){.tb-row{grid-template-columns:1fr;gap:4px}.tb-n{justify-self:end}}
+html[data-view=phone] .tb-row{grid-template-columns:1fr;gap:4px}
+html[data-view=phone] .tb-n{justify-self:end}
+#wkTable td.best span{font-weight:800}
+#clTable td.rmk{white-space:nowrap;color:var(--label2);font-size:12.5px}
+.cmpg #clTable tr.na td{background:color-mix(in srgb,#ff9500 7%,var(--card,transparent))}
+#cmpSeg button.na:not([aria-selected=true])::after{display:none!important}
+#cmpSeg button.na:not(:disabled)::after{content:"";display:inline-block;width:6px;height:6px;margin-left:5px;border-radius:50%;background:#ff9500;vertical-align:middle}
+.ok90{color:var(--up);font-weight:600}
+/* activation pending */
+.actg .kpis{grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}
+.age{display:grid;grid-template-columns:86px minmax(0,1fr) 46px 64px;align-items:center;gap:10px;padding:6px 0;font-size:13.5px}
+.age span{color:var(--label2)}
+.age b{text-align:right;font-variant-numeric:tabular-nums}
+.age small{text-align:right;color:var(--label2);font-variant-numeric:tabular-nums}
+.age-bar{height:10px;border-radius:5px;background:var(--fill);overflow:hidden}
+.age-bar i{display:block;height:100%;border-radius:5px}
+.act-tools{display:grid;gap:10px;margin-bottom:10px}
+.act-tools input{width:100%;height:40px;padding:0 14px;border:0;border-radius:12px;background:var(--card);box-shadow:0 0 0 .5px var(--sep);color:var(--label);font:inherit;font-size:16px}
+.act-tools input:focus{outline:2px solid var(--blue)}
+.act-tools .chips{margin:0}
+.dp{display:inline-block;padding:2px 8px;border-radius:9px;background:var(--fill);font-weight:700;font-size:12.5px}
+.dp.warn{background:color-mix(in srgb,#ff9500 18%,transparent);color:#b25e00}
+.dp.down{background:var(--down-bg);color:var(--down)}
+.cmp td.lft{text-align:left;max-width:220px;overflow:hidden;text-overflow:ellipsis}
+.cmp td.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+.cmp td small.sub{display:block;font-size:11px;font-weight:400;color:var(--label2)}
+/* ask data */
+.askg{display:flex;flex-direction:column;min-height:calc(100dvh - var(--hdr-h,96px));padding-bottom:0}
+.chat{flex:1;display:flex;flex-direction:column;gap:12px;padding:8px 0 16px}
+.hello{margin:20px auto 6px;max-width:520px;text-align:center;color:var(--label2);font-size:14px}
+.hello b{display:block;font-size:20px;color:var(--label);margin-bottom:6px}
+.msg{display:flex;gap:8px;align-items:flex-end;max-width:100%}
+.msg.me{justify-content:flex-end}
+.msg .bub{max-width:min(720px,88%);padding:10px 14px;border-radius:18px;font-size:15px;line-height:1.45;overflow-wrap:anywhere}
+.msg.me .bub{background:var(--blue);color:#fff;border-bottom-right-radius:6px}
+.msg.bot .bub{background:var(--card);color:var(--label);border-bottom-left-radius:6px;box-shadow:0 0 0 .5px var(--sep)}
+.msg .av{flex:none;width:28px;height:28px;border-radius:50%;display:grid;place-items:center;background:linear-gradient(160deg,#64d2ff,#30b0c7);color:#fff;font-size:11px;font-weight:800}
+.bub b{font-weight:700}
+.bub .muted,.bub small.muted{color:var(--label2);font-size:12.5px}
+.bub small.muted{display:block;margin-top:6px}
+.ans-t{margin:10px -6px 2px;border-radius:12px;box-shadow:0 0 0 .5px var(--sep)}
+.ans-t .cmp{font-size:13px}
+.ans-t .cmp td,.ans-t .cmp th{height:auto;padding:7px 10px}
+.ans-t .cmp th:first-child,.ans-t .cmp td:first-child{min-width:110px}
+.ans-link{display:inline-block;margin-top:8px;color:var(--blue);font-weight:600;font-size:14px}
+.chips.in{margin:10px 0 0;flex-wrap:wrap}
+.typing{display:flex;gap:5px;padding:14px 16px}
+.typing i{width:7px;height:7px;border-radius:50%;background:var(--label3);animation:blink 1.2s infinite}
+.typing i:nth-child(2){animation-delay:.2s}.typing i:nth-child(3){animation-delay:.4s}
+@keyframes blink{0%,80%,100%{opacity:.25}40%{opacity:1}}
+.ask-chips{flex-wrap:wrap;justify-content:center;margin:0 0 10px}
+.ask-bar{position:sticky;bottom:0;z-index:5;display:flex;align-items:flex-end;gap:8px;margin:0 -16px;padding:10px 16px calc(10px + env(safe-area-inset-bottom));background:color-mix(in srgb,var(--bg) 88%,transparent);-webkit-backdrop-filter:blur(20px);backdrop-filter:blur(20px)}
+.ask-bar textarea{flex:1;min-height:44px;max-height:140px;resize:none;padding:11px 14px;border:0;border-radius:22px;background:var(--card);box-shadow:0 0 0 .5px var(--sep);color:var(--label);font:inherit;font-size:16px;line-height:1.35}
+.ask-bar textarea:focus{outline:2px solid var(--blue)}
+.ask-bar button{flex:none;width:44px;height:44px;border-radius:50%;background:var(--blue);color:#fff;display:grid;place-items:center}
+.ask-bar button svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:2.6;stroke-linecap:round;stroke-linejoin:round}
+.askg ~ .to-top{display:none}
+/* a segment chooser under each units section heading */
+.secseg{flex-wrap:wrap;margin:0 0 10px}
+.secseg.busy{pointer-events:none;cursor:progress}
+.secseg button{font-size:12.5px}
+.ask-bar{flex-wrap:wrap}
+.ask-note{flex-basis:100%;order:3;margin:2px 4px 0;font-size:11.5px;line-height:1.35;color:var(--label2);text-align:center}
+.ac{position:absolute;left:16px;right:16px;bottom:calc(100% - 4px);z-index:6;max-height:min(46vh,320px);overflow:auto;padding:6px;border-radius:16px;
+  background:color-mix(in srgb,var(--card) 97%,transparent);-webkit-backdrop-filter:blur(24px) saturate(180%);backdrop-filter:blur(24px) saturate(180%);
+  box-shadow:0 10px 32px rgba(0,0,0,.2),0 0 0 .5px var(--sep)}
+.ac[hidden]{display:none}
+.ac button{display:flex;align-items:center;justify-content:space-between;gap:12px;width:100%;min-height:40px;padding:8px 12px;border:0;border-radius:11px;background:none;color:var(--label);font:inherit;font-size:14.5px;text-align:left;cursor:pointer}
+.ac button span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ac button i{flex:none;font-style:normal;font-size:11px;font-weight:700;letter-spacing:.03em;text-transform:uppercase;color:var(--label2)}
+.ac button:hover,.ac button.on{background:var(--fill)}
+.ac button.on{box-shadow:inset 0 0 0 1.5px var(--blue)}
+.ans-read{display:flex;flex-wrap:wrap;gap:5px;margin-top:10px;font-size:12px}
+.ans-read .rl{font-weight:700;color:var(--label2);align-self:center;margin-right:2px}
+.ans-read span:not(.rl){padding:3px 8px;border-radius:8px;background:var(--fill);color:var(--label)}
+.ans-read i{font-style:normal;color:var(--label2);margin-right:5px}
+.msg .src{display:block;margin-top:8px;font-size:11px;color:var(--label2)}
+.msg.help .av{background:linear-gradient(160deg,#ffd60a,#ff9500)}
+.ans-steps{margin:8px 0 0;padding-left:20px;display:grid;gap:5px;font-size:14px;line-height:1.45}
+.ans-link{display:inline-block;margin-top:10px;padding:7px 12px;border-radius:10px;background:var(--fill);color:var(--blue);font-weight:600;font-size:13.5px;text-decoration:none}
+.hello .caution{margin-top:10px;padding:10px 12px;border-radius:12px;background:color-mix(in srgb,#ff9500 12%,transparent);color:var(--label);font-size:13.5px;line-height:1.45}
+.hello .caution b{display:inline;font-size:inherit;margin:0;color:#c76a00}
+"""
+
+CMP_JS = r"""
+(function(){
+const $ = s => document.querySelector(s);
+const $$ = s => Array.from(document.querySelectorAll(s));
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const store = { get(k){ try { return localStorage.getItem(k); } catch (e) { return null; } }, set(k, v){ try { localStorage.setItem(k, v); } catch (e) {} } };
+const compact = v => { if (window.AP_FULL) return Math.round(v || 0).toLocaleString('en-IN'); const a = Math.abs(v || 0), s = v < 0 ? '-' : ''; return a >= 1e7 ? s + (a / 1e7).toFixed(2) + 'Cr' : a >= 1e5 ? s + (a / 1e5).toFixed(2) + 'L' : a >= 1e3 ? s + (a / 1e3).toFixed(2) + 'K' : s + Math.round(a); };
+const full = v => Math.round(v || 0).toLocaleString('en-IN');
+const pct = (x, d = 1) => (isFinite(x) ? x.toFixed(d) + '%' : '–');
+const iso = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+const day = s => new Date(s + 'T00:00:00');
+const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x; };
+const PALETTE = ['#0a84ff', '#ff9500', '#34c759', '#af52de', '#ff2d55', '#30b0c7', '#5e5ce6', '#ffcc00', '#a2845e', '#64d2ff', '#ff6482', '#8e8e93'];
+const SEG_COLORS = { sp: '#0a84ff', flagship: '#0a84ff', innovative: '#30b0c7', tab: '#ff9500', npc: '#af52de', wearables: '#ff2d55', accessories: '#34c759' };
+const PRESETS = [['mtd', 'MTD'], ['lm', 'Last month'], ['l7', 'Last 7 days'], ['l30', 'Last 30 days'], ['qtd', 'QTD'], ['ytd', 'YTD'], ['custom', 'Custom']];
+let saved = {};
+try { saved = JSON.parse(store.get('cmp-state') || '{}'); } catch (e) {}
+const st = Object.assign({ preset: 'mtd', start: '', end: '', metric: 'v', compare: 'prev', sort: 'v', tmode: 'daily', by: 'store', home: '', spcs: [], dsort: 'v' }, saved);
+const WD = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+const TIER_C = ['#a2a2a8', '#34c759', '#0a84ff', '#af52de', '#ff9500'];   // Mass grey, Mid green, High blue, Premium purple, Flagship orange
+/* stores come from the link (?store=…) or the shared picker */
+const fromUrl = new URLSearchParams(location.search).getAll('store');
+st.sel = fromUrl.length ? fromUrl : StorePicker.saved();
+let data = null, ctrl = null;
+const save = () => { const { sel, ...rest } = st; store.set('cmp-state', JSON.stringify(rest)); };
+const isV = () => st.metric === 'v';
+const fmtM = v => (isV() ? compact(v) : full(v));
+const m = r => (isV() ? r.v : r.q), mb = r => (isV() ? r.bv : r.bq);
+const gchip = (c, b) => { if (!b) return c ? '<span class="gc new">New</span>' : '<span class="gc">–</span>'; const p = (c - b) / b * 100; return `<span class="gc ${p > 0.05 ? 'up' : p < -0.05 ? 'down' : ''}">${p >= 0 ? '↑' : '↓'}${Math.abs(p).toFixed(2)}%</span>`; };
+/* a store without data for the comparison days: no growth, a clear label instead */
+const okB = r => r.bs === 'ok';
+const naTip = r => `${data.base_code} ${data.base_range}: ${r.bs === 'partial' ? 'only partly covered' : r.bs === 'gap' ? 'days missing' : 'no data'} (${r.bwhy}), so it is not an equal period and is left out of growth`;
+const naChip = r => `<span class="gc na" title="${esc(naTip(r))}">Data not available</span>`;
+const growth = r => (okB(r) ? gchip(m(r), mb(r)) : naChip(r));
+const short = n => { const t = (n.match(/\(([^)]+)\)/) || [])[1]; return t || n.split(/\s[-–]\s/).pop() || n; };
+
+function presetRange(p, dmax){
+  const M = day(dmax);
+  switch (p) {
+    case 'lm': return [new Date(M.getFullYear(), M.getMonth() - 1, 1), new Date(M.getFullYear(), M.getMonth(), 0)];
+    case 'l7': return [addDays(M, -6), M];
+    case 'l30': return [addDays(M, -29), M];
+    case 'qtd': return [new Date(M.getFullYear(), Math.floor(M.getMonth() / 3) * 3, 1), M];
+    case 'ytd': return [new Date(M.getFullYear(), 0, 1), M];
+    case 'custom': return [st.start ? day(st.start) : new Date(M.getFullYear(), M.getMonth(), 1), st.end ? day(st.end) : M];
+    default: return [new Date(M.getFullYear(), M.getMonth(), 1), M];
+  }
+}
+
+function render(){
+  const d = data;
+  $('#err').hidden = !d.error; if (d.error) { $('#err').textContent = d.error; return; }
+  const rows = d.rows.map((r, i) => ({ ...r, color: PALETTE[i % PALETTE.length] }));
+  const bySpc = d.by === 'spc', noun = n => (bySpc ? (n === 1 ? 'SPC' : 'SPCs') : (n === 1 ? 'store' : 'stores'));
+  $('#title').textContent = bySpc ? d.home : d.scope.length >= 2 ? `${d.scope.length} stores` : 'All Stores';
+  $('#navLabel').textContent = `${d.range} · vs ${d.base_code} ${d.base_range}`;
+  if (bySpc) StorePicker.mount({ stores: d.stores, selected: [d.home], multi: false, noAll: true, note: 'Compare the SPCs of one store',
+    onChange: sel => { st.home = sel[0] || ''; st.spcs = []; load(); } });
+  else StorePicker.mount({ stores: d.stores, selected: d.scope, allLabel: 'All Stores (compare every store)', tick: true, onChange: sel => { st.sel = sel; history.replaceState(null, '', '/compare'); load(); } });
+  $('#pickHint').textContent = bySpc
+    ? (d.scope.length >= 2 ? `Comparing ${d.scope.length} of the ${d.spc_all.length} SPCs of ${d.home}.` : `Comparing the ${d.spc_all.length} SPCs who sold at ${d.home}. Tap the store name to switch store; tap names below to compare just some.`)
+    : d.scope.length >= 2 ? `Comparing the ${d.scope.length} stores ticked in Stores.` : 'Comparing every store. Tick two or more in Stores to compare just those.';
+  const pk = $('#spcPick'), picked = st.spcs.length ? st.spcs : [];
+  pk.hidden = !bySpc || d.spc_all.length < 3;
+  if (!pk.hidden) pk.innerHTML = `<button type="button" data-spcpick="" class="${picked.length ? '' : 'on'}">All SPCs</button>`
+    + d.spc_all.map(n => `<button type="button" data-spcpick="${esc(n)}" class="${picked.includes(n) ? 'on' : ''}">${esc(n)}</button>`).join('')
+    + (picked.length === 1 ? '<span class="pick-more">Pick one more to compare just these</span>' : '');
+  $('#topHead').textContent = bySpc ? 'Best Sellers by SPC' : 'Best Sellers by Store';
+  $('#sideHead').textContent = bySpc ? 'SPC Performance' : 'Store Performance';
+  controls();
+  const tot = rows.reduce((s, r) => s + m(r), 0);
+  const cmpRows = rows.filter(okB), na = rows.filter(r => !okB(r));   // growth only over stores with equal periods
+  const ctot = cmpRows.reduce((s, r) => s + m(r), 0), btot = cmpRows.reduce((s, r) => s + mb(r), 0);
+  const growthNote = na.length ? ` (${cmpRows.length} of ${rows.length} ${noun(rows.length)})` : '';
+  const gapB = (d.bases || {})[d.compare] && d.bases[d.compare].sheet_gap ? d.bases[d.compare] : null;   // a day missing from the whole sheet
+  const own = na.filter(r => r.bs !== 'gap');
+  const nb = $('#naNote');
+  nb.hidden = !na.length && !d.switched;
+  const sw = d.switched && (d.bases || {})[d.switched];
+  nb.innerHTML = (d.switched ? `<b>Data not available for ${esc(sw ? `${sw.code} ${sw.range}` : d.switched === 'ly' ? 'last year' : 'the previous period')}</b>`
+      + (sw && sw.sheet_gap ? ` (the sheet has no sales from any store on ${esc(sw.sheet_gap)})` : ` in these ${noun(2)}`) + `, so this compares with ${esc(d.base_code)} ${esc(d.base_range)}. ` : '')
+    + (gapB ? `<b>Data not available</b>: the sheet has no sales from any store on ${esc(gapB.sheet_gap)}${gapB.gap_in_cur ? ' in the period you picked' : ` (inside ${esc(d.base_code)} ${esc(d.base_range)})`}, so the periods are not equal and growth is left out. `
+      + (gapB.gap_in_cur ? 'Pick dates without that day to compare.' : 'Upload a sheet that includes that day to compare.') : '')
+    + (own.length ? `<b>Data not available</b> for ${esc(d.base_code)} ${esc(d.base_range)} in ${own.length} of ${rows.length} ${noun(rows.length)}: `
+      + own.slice(0, 4).map(r => `${esc(short(r.name))} <small>(${esc(r.bwhy)})</small>`).join(', ') + (own.length > 4 ? ` and ${own.length - 4} more` : '')
+      + `. ${own.length === 1 ? 'It is' : 'They are'} highlighted and left out of growth.` : '');
+  /* the ranking lives in the table: sorted by value, with a bar for each one's size */
+  const max = Math.max(1, ...rows.map(m));
+  $('#sideNote').textContent = `${isV() ? 'value' : 'units'} · ${d.range} · total ${fmtM(tot)} · growth ${cmpRows.length ? gchip(ctot, btot).replace(/<[^>]+>/g, '') : '–'}${growthNote}${d.beat ? ` · To beat ${d.beat.code}: all of ${d.beat.range}, with ${d.beat.days_left} day${d.beat.days_left === 1 ? '' : 's'} left` : ''} · tap a column to sort`;
+  /* side by side */
+  const T = r => (r.target ? (isV() ? r.target.v : r.target.q) : null), SPA = r => (isV() ? r.spv : r.spq);
+  const left = d.days_left, cov = d.days_covered;
+  const proj = r => SPA(r) + (cov ? SPA(r) / cov * left : 0);
+  const sum = f => rows.reduce((s, r) => s + f(r), 0);
+  const tq = sum(r => r.q), tv = sum(r => r.v), tT = sum(r => T(r) || 0), tSP = sum(SPA);
+  const lvl = bySpc ? 80 : 90, lf = lvl / 100;   // eligibility: 90% of a store target, 80% of an SPC target
+  // to beat the whole previous month (or quarter / year) while it is still running
+  const fr = r => (isV() ? r.fv : r.fq), bLeft = d.beat ? d.beat.days_left : 0;
+  const beatCell = (now, full) => (!full ? '–' : now >= full ? `<span class="pp up">✓ ${now > full ? '+' + fmtM(now - full) : 'level'}</span>`
+    : `${fmtM(full - now)}${bLeft ? `<small class="beat-d">${isV() ? compact((full - now) / bLeft) : ((full - now) / bLeft).toFixed(1)}/day</small>` : ''}`);
+  const cols = [
+    ['name', bySpc ? 'SPC' : 'Store', r => `<span class="dot" style="background:${r.color}"></span>${esc(r.name)}`, r => r.name, () => 'Total'],
+    ['v', isV() ? 'Value' : 'Units', r => `<span class="vb"><i style="width:${Math.max(2, m(r) / max * 100)}%;background:${r.color}"></i></span>${fmtM(m(r))}`, m, () => fmtM(tot)],
+    ['sh', bySpc ? 'Share of store' : 'Share', r => (tot ? pct(m(r) / tot * 100) : '–'), m, () => '100%'],
+    ['gr', 'Growth vs ' + d.base_code, growth, r => (!okB(r) ? -9e9 : mb(r) ? (m(r) - mb(r)) / mb(r) : 9e9),
+      () => `${cmpRows.length ? gchip(ctot, btot) : '–'}${na.length ? `<small class="na-cnt">${cmpRows.length} of ${rows.length} ${noun(rows.length)}</small>` : ''}`],
+    ...(d.beat ? [['bt', `To beat ${d.beat.code}`, r => (!okB(r) ? '<span class="na-v">–</span>' : beatCell(m(r), fr(r))), r => (okB(r) && fr(r) ? fr(r) - m(r) : -9e9),
+      () => beatCell(cmpRows.reduce((a, r) => a + m(r), 0), cmpRows.reduce((a, r) => a + fr(r), 0))]] : []),
+    ['b', d.base_code, r => (okB(r) ? fmtM(mb(r)) : r.bs === 'partial' ? `<span class="na-v" title="${esc(naTip(r))}">${fmtM(mb(r))}<small>from ${esc(day(r.bfrom).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' }))}</small></span>` : '<span class="na-v">–</span>'), r => (okB(r) ? mb(r) : -1), () => fmtM(btot)],
+    ['o', isV() ? 'Units' : 'Value', r => (isV() ? full(r.q) : compact(r.v)), r => (isV() ? r.q : r.v), () => (isV() ? full(tq) : compact(tv))],
+    ['asp', 'ASP', r => (r.q ? compact(r.v / r.q) : '–'), r => (r.q ? r.v / r.q : 0), () => (tq ? compact(tv / tq) : '–')],
+    ...(bySpc ? [] : [
+      ['spcs', 'Active SPCs', r => full(r.spcs), r => r.spcs, () => full(sum(r => r.spcs))],
+      ['ps', isV() ? 'Value / SPC' : 'Units / SPC', r => (r.spcs ? fmtM(m(r) / r.spcs) : '–'), r => (r.spcs ? m(r) / r.spcs : 0), () => ''],
+    ]),
+    ['pd', isV() ? 'Value / day' : 'Units / day', r => (r.days ? (isV() ? compact(m(r) / r.days) : (m(r) / r.days).toFixed(2)) : '–'), r => (r.days ? m(r) / r.days : 0), () => ''],
+  ];
+  if (d.one_month) cols.push(
+    ['t', 'SP target', r => (T(r) ? fmtM(T(r)) : '–'), r => T(r) || 0, () => (tT ? fmtM(tT) : '–')],
+    ['ach', 'SP ach%', r => (T(r) ? `<span class="pp ${SPA(r) >= T(r) ? 'up' : ''}">${pct(SPA(r) / T(r) * 100)}</span>` : '–'), r => (T(r) ? SPA(r) / T(r) : -1), () => (tT ? pct(tSP / tT * 100) : '–')],
+    ['need', `Required for ${lvl}%`, r => (!T(r) ? '–' : SPA(r) >= T(r) * lf ? '<span class="ok90">✓ reached</span>' : fmtM(T(r) * lf - SPA(r))), r => (T(r) ? Math.max(0, T(r) * lf - SPA(r)) : -1), () => (tT ? fmtM(Math.max(0, tT * lf - tSP)) : '–')],
+    ['proj', 'SP projected', r => `${fmtM(proj(r))}${T(r) ? ` <span class="pp ${proj(r) >= T(r) ? 'up' : 'down'}">${pct(proj(r) / T(r) * 100)}</span>` : ''}`, proj, () => fmtM(sum(proj))]);
+  const sc = cols.find(c => c[0] === st.sort) || cols[1];
+  const list = rows.slice().sort((a, b) => (sc[0] === 'name' ? a.name.localeCompare(b.name) : sc[3](b) - sc[3](a)));
+  $('#sideTable').innerHTML = `<thead><tr>${cols.map(c => `<th data-sort="${c[0]}" class="${c[0] === st.sort ? 'on' : ''}">${c[1]}</th>`).join('')}</tr></thead>
+    <tbody>${list.map(r => `<tr${okB(r) ? '' : ' class="na"'}>${cols.map(c => `<td>${c[2](r)}</td>`).join('')}</tr>`).join('')}</tbody>
+    <tfoot><tr>${cols.map(c => `<td>${c[4]()}</td>`).join('')}</tr></tfoot>`;
+  renderDeep(d, rows, bySpc, noun);
+  /* segment mix: each store's split */
+  const segs = d.segments;
+  const segTot = s => rows.reduce((a, r) => a + ((r.segs[s] || [0, 0])[isV() ? 0 : 1]), 0);
+  $('#mixNote').textContent = `share of each store's ${isV() ? 'value' : 'units'}`;
+  $('#mixTable').innerHTML = `<thead><tr><th>Store</th>${segs.map(s => `<th><span class="dot" style="background:${SEG_COLORS[s.toLowerCase()] || '#8e8e93'}"></span>${esc(s)}</th>`).join('')}</tr></thead>
+    <tbody>${list.map(r => `<tr><td><span class="dot" style="background:${r.color}"></span>${esc(r.name)}</td>${segs.map(s => {
+      const x = (r.segs[s] || [0, 0])[isV() ? 0 : 1], p = m(r) ? x / m(r) * 100 : 0, col = SEG_COLORS[s.toLowerCase()] || '#8e8e93';
+      return `<td class="hc" style="background:color-mix(in srgb,${col} ${Math.round(Math.min(100, p) * 0.55)}%,transparent)"><div><span>${x ? pct(p) : '–'}</span><small>${x ? fmtM(x) : ''}</small></div></td>`; }).join('')}</tr>`).join('')}</tbody>
+    <tfoot><tr><td>All selected</td>${segs.map(s => `<td>${tot ? pct(segTot(s) / tot * 100) : '–'}</td>`).join('')}</tr></tfoot>`;
+  /* top models */
+  $('#topModels').innerHTML = list.map(r => `<div class="mcard"><h3><i style="background:${r.color}"></i>${esc(short(r.name))}</h3><ol>${r.top.map(([n, q, v]) => `<li><span>${esc(n)}</span><span>${full(q)} · ${compact(v)}</span></li>`).join('') || '<li><span>No sales</span><span></span></li>'}</ol></div>`).join('');
+  /* trend */
+  $('#trendBlock').hidden = !d.labels;
+  if (d.labels) drawTrend(d, rows);
+  $('#updated').textContent = `${d.updated ? 'Updated ' + d.updated + ' · ' : ''}data to ${day(d.dmax).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })} · targets are for smartphones (SP) only`;
+  if (window.addExportButtons) window.addExportButtons();
+}
+
+let tipData = null;
+const tip = $('#tip');
+/* ---------- deep analysis: every business measure the sheet allows ---------- */
+const DEEP_MAX = 40;
+function renderDeep(d, rows, bySpc, noun){
+  const D = r => r.deep || {}, T_ = d.tiers || [];
+  const tierQ = r => T_.reduce((a, t) => a + ((D(r).tiers || {})[t] || [0])[0], 0);
+  const premQ = r => ['High', 'Premium', 'Flagship'].reduce((a, t) => a + ((D(r).tiers || {})[t] || [0])[0], 0);
+  const best = r => { const w = D(r).week || []; const mx = Math.max(0, ...w); return mx > 0 ? w.indexOf(mx) : -1; };
+  const name = r => `<span class="dot" style="background:${r.color}"></span>${esc(r.name)}`;
+  const byVal = rows.slice().sort((a, b) => b.v - a.v), dl = byVal.slice(0, DEEP_MAX);
+  const many = rows.length > DEEP_MAX ? ` · top ${DEEP_MAX} of ${rows.length} ${noun(rows.length)} by value` : '';
+  /* scorecard */
+  const cols = [
+    ['name', bySpc ? 'SPC' : 'Store', name, r => r.name],
+    ['asp', 'ASP', r => (r.q ? compact(r.v / r.q) : '–'), r => (r.q ? r.v / r.q : 0), 'Average selling price (value ÷ units)'],
+    ['prem', 'High-end SP', r => (tierQ(r) ? pct(premQ(r) / tierQ(r) * 100) : '–'), r => (tierQ(r) ? premQ(r) / tierQ(r) : -1), 'Share of smartphone units in the High, Premium and Flagship price tiers'],
+    ['days', 'Selling days', r => `${r.days} / ${d.days_covered}`, r => r.days, 'Days with at least one sale, out of the days in the period'],
+    ['best', 'Best day', r => (best(r) >= 0 ? WD[best(r)] : '–'), best, 'Weekday with the most value'],
+    ...(bySpc ? [] : [
+      ['spcs', 'SPCs', r => full(r.spcs), r => r.spcs],
+      ['city', 'City', r => esc(D(r).city || '–'), r => D(r).city || ''],
+    ]),
+  ];
+  const sc = cols.find(c => c[0] === st.dsort) || cols[1];
+  const sl = dl.slice().sort((a, b) => { const x = sc[3](a), y = sc[3](b); return typeof x === 'string' ? x.localeCompare(y) : y - x; });
+  $('#scNote').textContent = `${d.range}${many} · tap a column to sort`;
+  $('#scoreTable').innerHTML = `<thead><tr>${cols.map(c => `<th data-dsort="${c[0]}" class="${c[0] === sc[0] ? 'on' : ''}"${c[4] ? ` title="${esc(c[4])}"` : ''}>${c[1]}</th>`).join('')}</tr></thead>
+    <tbody>${sl.map(r => `<tr>${cols.map(c => `<td>${c[2](r)}</td>`).join('')}</tr>`).join('')}</tbody>`;
+  /* SP price tiers */
+  $('#tierNote').textContent = `share of smartphone units by price tier${many}`;
+  $('#tierBars').innerHTML = `<div class="tb-legend">${T_.map((t, i) => `<span><i style="background:${TIER_C[i]}"></i>${t}</span>`).join('')}</div>`
+    + dl.map(r => { const n = tierQ(r);
+      return `<div class="tb-row"><span class="tb-name" title="${esc(r.name)}"><i style="background:${r.color}"></i>${esc(short(r.name))}</span>
+        <div class="tb-bar">${n ? T_.map((t, i) => { const x = (D(r).tiers || {})[t] || [0, 0], sh = x[0] / n * 100;
+          return sh ? `<i style="width:${sh}%;background:${TIER_C[i]}" title="${t}: ${full(x[0])} units · ${compact(x[1])} · ${pct(sh)}">${sh >= 12 ? Math.round(sh) + '%' : ''}</i>` : ''; }).join('') : '<em>No smartphone sales</em>'}</div>
+        <span class="tb-n">${full(n)} SP · ${pct(n ? premQ(r) / n * 100 : 0)} high-end</span></div>`; }).join('');
+  /* weekday pattern */
+  $('#wkNote').textContent = `share of each ${noun(1)}'s value by weekday${many}`;
+  $('#wkTable').innerHTML = `<thead><tr><th>${bySpc ? 'SPC' : 'Store'}</th>${WD.map(w => `<th>${w}</th>`).join('')}</tr></thead><tbody>${dl.map(r => {
+    const w = D(r).week || [], t = w.reduce((a, b) => a + b, 0), mx = Math.max(0, ...w);
+    return `<tr><td>${name(r)}</td>${WD.map((_, i) => { const sh = t ? w[i] / t * 100 : 0;
+      return `<td class="hc${w[i] === mx && mx ? ' best' : ''}" style="background:color-mix(in srgb,#0a84ff ${Math.round(Math.min(100, sh * 2.2))}%,transparent)"><div><span>${t ? pct(sh) : '–'}</span><small>${w[i] ? compact(w[i]) : ''}</small></div></td>`; }).join('')}</tr>`; }).join('')}</tbody>`;
+}
+
+const TREND_MAX = 30, RACE_MAX = 10;
+function drawHeat(d, rows){
+  const n = d.labels.length, start = day(d.start);
+  const list = rows.slice().sort((a, b) => m(b) - m(a)).slice(0, TREND_MAX);
+  const wk = i => { const x = addDays(start, i).getDay(); return x === 0 || x === 6; };
+  const head = `<tr><th class="hm-name">${d.by === 'spc' ? 'SPC' : 'Store'}</th>${d.labels.map((l, i) => `<th class="${wk(i) ? 'we' : ''}" title="${esc(l)}">${esc(l.split(' ')[0])}</th>`).join('')}<th class="hm-tot">Total</th></tr>`;
+  const body = list.map(r => {
+    const vals = (isV() ? r.dv : r.dq) || [], mx = Math.max(0, ...vals);
+    return `<tr><td class="hm-name" title="${esc(r.name)}"><i style="background:${r.color}"></i>${esc(short(r.name))}</td>${vals.map((v, i) => {
+      const p = mx ? v / mx : 0;
+      return `<td class="${wk(i) ? 'we' : ''}${v ? '' : ' zero'}" style="--p:${Math.round(p * 100)}%" title="${esc(short(r.name))} · ${esc(d.labels[i])}: ${fmtM(v)}${v && v === mx ? ' (best day)' : ''}"></td>`; }).join('')}<td class="hm-tot">${fmtM(m(r))}</td></tr>`;
+  }).join('');
+  const minW = 86 + 50 + n * 9 + 4;   // cells (7px + 2px gap) shrink to fit; only very long ranges scroll
+  $('#trend').innerHTML = `<div class="hm-wrap"><table class="hm" style="min-width:${minW}px"><colgroup><col class="c-name">${'<col>'.repeat(n)}<col class="c-tot"></colgroup>${head}${body}</table></div>
+    <div class="hm-key"><span>No sales</span><i></i><span>That ${d.by === 'spc' ? 'SPC' : 'store'}'s best day</span>${rows.length > TREND_MAX ? `<em>Top ${TREND_MAX} of ${rows.length} by ${isV() ? 'value' : 'units'}</em>` : ''}</div>`;
+  $('#trendNote').textContent = `${isV() ? 'value' : 'units'} per day · shaded by each row's best day`;
+  $('#trendLegend').innerHTML = '';
+  tipData = null;
+}
+function drawTrend(d, rows){
+  const mode = st.tmode === 'cum' ? 'cum' : 'daily';
+  $$('#trendMode [data-tmode]').forEach(b => b.classList.toggle('on', b.dataset.tmode === mode));
+  if (mode === 'daily') { drawHeat(d, rows); return; }
+  rows = rows.slice().sort((a, b) => m(b) - m(a)).slice(0, RACE_MAX);   // a readable race: the leaders only
+  const n = d.labels.length;
+  const series = rows.map(r => { let c = 0; const raw = (isV() ? r.dv : r.dq) || []; return { r, vals: mode === 'cum' ? raw.map(v => (c += v)) : raw }; });
+  const box = $('#trend');
+  const W = Math.max(300, Math.floor(box.getBoundingClientRect().width) - 2), H = 250;
+  const mg = { l: 48, r: 14, t: 12, b: 28 }, pw = W - mg.l - mg.r, ph = H - mg.t - mg.b;
+  const maxV = Math.max(1, ...series.flatMap(s => s.vals));
+  const p10 = Math.pow(10, Math.floor(Math.log10(maxV))), top = [1, 1.2, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10].find(x => maxV / p10 <= x) * p10;
+  const X = i => mg.l + (n === 1 ? pw / 2 : i / (n - 1) * pw), Y = v => mg.t + ph - v / top * ph;
+  let g = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="Daily sales by store">`;
+  [0, .25, .5, .75, 1].forEach(f => { const v = top * f; g += `<line class="gl" x1="${mg.l}" x2="${W - mg.r}" y1="${Y(v)}" y2="${Y(v)}"/><text x="${mg.l - 7}" y="${Y(v) + 3.5}" text-anchor="end">${fmtM(v)}</text>`; });
+  const every = Math.max(1, Math.ceil(n / Math.floor(pw / 52)));
+  d.labels.forEach((l, i) => { if (i % every === 0 || i === n - 1) g += `<text x="${X(i)}" y="${H - 8}" text-anchor="middle">${esc(l)}</text>`; });
+  series.forEach((s, k) => { g += `<path class="ln" data-s="${k}" d="${s.vals.map((v, i) => (i ? 'L' : 'M') + X(i) + ',' + Y(v)).join('')}" stroke="${s.r.color}"/>`; });
+  g += `<line class="guide" id="tGuide" x1="0" x2="0" y1="${mg.t}" y2="${mg.t + ph}" visibility="hidden"/>`;
+  const step = n > 1 ? pw / (n - 1) : pw;
+  d.labels.forEach((_, i) => { g += `<rect class="hit" data-i="${i}" x="${X(i) - step / 2}" y="${mg.t}" width="${step}" height="${ph}"/>`; });
+  box.innerHTML = g + '</svg>';
+  $('#trendNote').textContent = `running ${isV() ? 'value' : 'units'} through the period · top ${Math.min(RACE_MAX, rows.length)} by ${isV() ? 'value' : 'units'}`;
+  $('#trendLegend').innerHTML = series.map((s, k) => `<span data-s="${k}"><i style="background:${s.r.color}"></i>${esc(short(s.r.name))}</span>`).join('');
+  tipData = { d, series, X };
+}
+function showTip(i, x, y){
+  if (!tipData) return;
+  const { d, series, X } = tipData, gd = $('#tGuide');
+  if (gd) { gd.setAttribute('x1', X(i)); gd.setAttribute('x2', X(i)); gd.setAttribute('visibility', 'visible'); }
+  const rows = series.map(s => ({ s, v: s.vals[i] || 0 })).sort((a, b) => b.v - a.v);
+  tip.innerHTML = `<h4>${esc(d.labels[i])}</h4>` + rows.map(o => `<div class="tl"><span><i style="background:${o.s.r.color}"></i>${esc(short(o.s.r.name))}</span><span>${fmtM(o.v)}</span></div>`).join('');
+  tip.hidden = false;
+  const r = tip.getBoundingClientRect();
+  let left = x + 14, top = y - r.height - 12;
+  if (left + r.width > innerWidth - 8) left = x - r.width - 14;
+  if (top < 8) top = y + 16;
+  tip.style.left = Math.max(8, left) + 'px'; tip.style.top = Math.max(8, top) + 'px';
+}
+function hideTip(){ tip.hidden = true; const gd = $('#tGuide'); if (gd) gd.setAttribute('visibility', 'hidden'); }
+$('#trend').addEventListener('pointermove', e => { if (e.pointerType === 'touch') return; const c = e.target.closest('.hit'); if (c) showTip(+c.dataset.i, e.clientX, e.clientY); });
+$('#trend').addEventListener('pointerleave', hideTip);
+$('#trend').addEventListener('click', e => { const c = e.target.closest('.hit'); if (c) showTip(+c.dataset.i, e.clientX, e.clientY); });
+window.addEventListener('scroll', hideTip, { passive: true });
+let rsz = null;
+window.addEventListener('resize', () => { clearTimeout(rsz); rsz = setTimeout(() => { if (data && !data.error) render(); }, 160); });
+
+function controls(){
+  const d = data;
+  $('#presets').innerHTML = PRESETS.map(([k, t]) => `<button type="button" data-preset="${k}" class="${st.preset === k ? 'on' : ''}">${t}</button>`).join('');
+  $('#customRange').hidden = st.preset !== 'custom';
+  $('#fromDate').value = d.start; $('#toDate').value = d.end;
+  $('#fromDate').min = $('#toDate').min = d.dmin; $('#fromDate').max = $('#toDate').max = d.dmax;
+  $('#metricSeg').style.setProperty('--i', isV() ? 0 : 1);
+  $('#cmpSeg').style.setProperty('--i', st.compare === 'ly' ? 1 : 0);
+  $$('#metricSeg button').forEach(b => b.setAttribute('aria-selected', String(b.dataset.metric === st.metric)));
+  $$('#cmpSeg button').forEach(b => b.setAttribute('aria-selected', String(b.dataset.cmp === st.compare)));
+  $('#cmpSeg [data-cmp=prev]').textContent = 'vs ' + (st.compare === 'prev' ? d.base_code : 'Previous');
+  $('#bySeg').style.setProperty('--i', st.by === 'spc' ? 1 : 0);
+  $$('#bySeg button').forEach(b => b.setAttribute('aria-selected', String(b.dataset.by === st.by)));
+  $$('#cmpSeg button').forEach(b => {
+    const x = (d.bases || {})[b.dataset.cmp]; if (!x) return;
+    const off = !x.ok, some = x.partial + x.none + (x.gap || 0);
+    b.disabled = off; b.classList.toggle('na', off || some > 0);
+    b.title = off ? `Data not available for ${x.code} ${x.range}${x.sheet_gap ? ` (the sheet has no data for ${x.sheet_gap})` : ' in any compared store'}` : some ? `Data not available for ${x.code} ${x.range} in ${some} of ${x.ok + some} stores` : `${x.code} ${x.range}`;
+  });
+}
+async function load(){
+  save();
+  if (ctrl) ctrl.abort();
+  const mine = ctrl = new AbortController();
+  $('#wrap').classList.add('loading');
+  const q = new URLSearchParams({ compare: st.compare, by: st.by });
+  if (st.by === 'spc') { if (st.home) q.set('home', st.home); if (st.spcs.length >= 2) st.spcs.forEach(s => q.append('spc', s)); }
+  else st.sel.forEach(s => q.append('store', s));
+  if (data && !data.error) { const [a, b] = presetRange(st.preset, data.dmax); q.set('start', iso(a)); q.set('end', iso(b)); }
+  try {
+    const res = await fetch('/api/compare?' + q, { signal: mine.signal });
+    const d = await res.json();
+    const first = !data || data.error;
+    data = d;
+    if (!d.error) {
+      st.compare = d.compare || st.compare;   // the server may switch to the comparison that has data
+      if (d.by === 'spc') st.home = d.home; else st.sel = d.scope || [];
+    }
+    if (first && !d.error && st.preset !== 'mtd') return load();
+    render();
+  } catch (e) {
+    if (e.name !== 'AbortError') { data = { error: 'Could not reach the server. Please try again.' }; render(); }
+  } finally { if (mine === ctrl) $('#wrap').classList.remove('loading'); }
+}
+document.addEventListener('click', e => {
+  const p = e.target.closest('[data-preset]');
+  if (p) { st.preset = p.dataset.preset; if (st.preset === 'custom' && data && !data.error) { st.start = data.start; st.end = data.end; } load(); return; }
+  const mt = e.target.closest('[data-metric]'); if (mt) { st.metric = mt.dataset.metric; save(); render(); return; }
+  const c = e.target.closest('[data-cmp]'); if (c && c.dataset.cmp !== st.compare) { st.compare = c.dataset.cmp; load(); return; }
+  const s = e.target.closest('th[data-sort]'); if (s) { st.sort = s.dataset.sort; save(); render(); return; }
+  const t = e.target.closest('[data-tmode]'); if (t) { st.tmode = t.dataset.tmode; save(); render(); return; }
+  const by = e.target.closest('[data-by]'); if (by && by.dataset.by !== st.by) { st.by = by.dataset.by; st.sort = 'v'; st.dsort = 'v'; load(); return; }
+  const sp = e.target.closest('[data-spcpick]');
+  if (sp) {   // optional: compare just some SPCs (two or more); "All SPCs" clears the picks
+    const n = sp.dataset.spcpick, cur = st.spcs.slice(), k = cur.indexOf(n);
+    if (!n) st.spcs = []; else { if (k >= 0) cur.splice(k, 1); else cur.push(n); st.spcs = cur; }
+    if (st.spcs.length === 1) { save(); render(); return; }   // wait for a second pick
+    load(); return;
+  }
+  const ds = e.target.closest('th[data-dsort]'); if (ds) { st.dsort = ds.dataset.dsort; save(); render(); }
+});
+['fromDate', 'toDate'].forEach(id => $('#' + id).addEventListener('change', () => { st.preset = 'custom'; st.start = $('#fromDate').value; st.end = $('#toDate').value; load(); }));
+const top = $('#top');
+window.addEventListener('scroll', () => top.classList.toggle('scrolled', window.scrollY > 4), { passive: true });
+load();
+})();
+"""
+
+ACT_JS = r"""
+(function(){
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const compact = v => { if (window.AP_FULL) return Math.round(v || 0).toLocaleString('en-IN'); const a = Math.abs(v || 0); return a >= 1e7 ? (a / 1e7).toFixed(2) + 'Cr' : a >= 1e5 ? (a / 1e5).toFixed(2) + 'L' : a >= 1e3 ? (a / 1e3).toFixed(2) + 'K' : String(Math.round(a)); };
+const full = v => Math.round(v || 0).toLocaleString('en-IN');
+const fmtD = s => new Date(s + 'T00:00:00').toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+const AGES = [['', 'All'], ['0-3', '0–3 days'], ['4-7', '4–7 days'], ['8-15', '8–15 days'], ['16-', '16+ days']];
+const st = { sel: StorePicker.saved(), q: '', age: '', sort: 'days', dir: -1, month: '' };   // '' = the current month
+let data = null;
+const ageOk = (r, a) => { if (!a) return true; const [lo, hi] = a.split('-'); return r.days >= +lo && (hi === '' || r.days <= +hi); };
+const daysCls = d => (d > 15 ? 'down' : d > 7 ? 'warn' : '');
+
+function renderList(){
+  const d = data, q = st.q.trim().toLowerCase();
+  let rows = d.rows.filter(r => ageOk(r, st.age) && (!q || [r.fam, r.spc, r.store, r.imei, r.model, r.status, r.remark].some(x => String(x || '').toLowerCase().includes(q))));
+  const key = { days: r => r.days, v: r => r.v, sale: r => r.sale, fam: r => r.fam, spc: r => r.spc, store: r => r.store }[st.sort] || (r => r.days);
+  rows.sort((a, b) => { const x = key(a), y = key(b); return (x < y ? -1 : x > y ? 1 : 0) * st.dir; });
+  $('#ageChips').innerHTML = AGES.map(([k, t]) => `<button type="button" data-age="${k}" class="${st.age === k ? 'on' : ''}">${t}</button>`).join('');
+  $('#listNote').textContent = `${rows.length} of ${d.rows.length} shown · oldest first`;
+  const th = (k, t) => `<th data-sort="${k}" class="${st.sort === k ? 'on' : ''}">${t}${st.sort === k ? (st.dir < 0 ? ' ↓' : ' ↑') : ''}</th>`;
+  const showStore = !(d.scope.length === 1);
+  $('#actTable').innerHTML = `<thead><tr>${th('fam', 'Model')}${th('v', 'Value')}${th('sale', 'Sale date')}${th('spc', 'SPC')}${showStore ? th('store', 'Store') : ''}${th('days', 'Days pending')}<th>IMEI</th><th>Status</th></tr></thead>
+    <tbody>${rows.slice(0, 600).map(r => `<tr><td title="${esc(r.fam)}">${esc(r.fam || '–')}${r.model ? `<small class="sub">${esc(r.model)}</small>` : ''}</td><td>${compact(r.v)}</td><td>${fmtD(r.sale)}</td>
+      <td>${esc(r.spc || '–')}</td>${showStore ? `<td class="lft" title="${esc(r.store)}">${esc(r.store || '–')}</td>` : ''}<td><span class="dp ${daysCls(r.days)}">${r.days} day${r.days === 1 ? '' : 's'}</span></td>
+      <td class="mono">${esc(r.imei || '–')}</td><td class="lft">${esc(r.status || '–')}${r.remark && r.remark.toUpperCase() !== 'CORRECT' ? `<small class="sub">${esc(r.remark)}</small>` : ''}</td></tr>`).join('') || `<tr><td>No pending activations${q || st.age ? ' match' : ''}.</td></tr>`}</tbody>
+    ${rows.length > 600 ? `<tfoot><tr><td colspan="8">Showing the first 600; narrow it with search or the days filter.</td></tr></tfoot>` : ''}`;
+}
+function render(){
+  const d = data;
+  $('#err').hidden = !d.error; if (d.error) { $('#err').textContent = d.error; return; }
+  $('#title').textContent = d.store_label;
+  const ms = d.months || [], mi = ms.findIndex(x => x.key === d.month), cur = ms[mi];
+  $('#navLabel').textContent = d.month === 'all' ? 'All months' : cur ? cur.label : '';
+  $('#prevBtn').disabled = d.month === 'all' ? !ms.length : mi <= 0;
+  $('#nextBtn').disabled = d.month === 'all' || mi >= ms.length - 1;
+  // this month, the latest few months with pending sales, and All months
+  const recent = ms.slice().reverse().filter((x, i) => i === 0 || x.n).slice(0, 4);
+  if (cur && !recent.some(x => x.key === cur.key)) recent.push(cur);
+  $('#monthChips').innerHTML = recent.map(x => `<button type="button" data-month="${x.key}" class="${x.key === d.month ? 'on' : ''}">${x.key === d.current_month ? 'This month' : esc(x.label.replace(/ \d{4}$/, m => (x.key.slice(0, 4) === d.current_month.slice(0, 4) ? '' : m)))}${x.n ? ` <small>${full(x.n)}</small>` : ''}</button>`).join('')
+    + `<button type="button" data-month="all" class="${d.month === 'all' ? 'on' : ''}">All months <small>${full(ms.reduce((a, x) => a + x.n, 0))}</small></button>`;
+  StorePicker.mount({ stores: d.stores, selected: d.scope, onChange: sel => { st.sel = sel; load(); } });
+  const s = d.summary;
+  $('#sumNote').textContent = `${d.month === 'all' ? 'all months' : 'sold in ' + (cur ? cur.label : '')} · no activation date yet, waiting counted to ${fmtD(d.today)}`;
+  renderClaims(d, cur);
+  $('#kpis').innerHTML = [['Pending sales', full(s.n), ''], ['Value pending', compact(s.v), ''], ['Average wait', s.avg_days + ' days', ''],
+    ['Oldest', s.max_days + ' days', ''], ['Over 7 days', full(s.over7), s.n ? Math.round(s.over7 / s.n * 100) + '% of pending' : '']]
+    .map(([k, v, sub]) => `<div class="kpi"><small>${k}</small><b>${v}</b>${sub ? `<span class="pv">${sub}</span>` : ''}</div>`).join('');
+  const mx = Math.max(1, ...d.buckets.map(b => b.n));
+  $('#ages').innerHTML = d.buckets.map((b, i) => `<div class="age"><span>${b.label}</span><div class="age-bar"><i style="width:${b.n / mx * 100}%;background:${['#34c759', '#30b0c7', '#ff9500', '#ff6b3d', '#ff3b30'][i]}"></i></div><b>${full(b.n)}</b><small>${compact(b.v)}</small></div>`).join('');
+  const tbl = (rows, label) => `<thead><tr><th>${label}</th><th>Pending</th><th>Value</th><th>Oldest</th></tr></thead><tbody>${rows.map(r => `<tr><td title="${esc(r.name)}">${esc(r.name)}</td><td>${full(r.n)}</td><td>${compact(r.v)}</td><td><span class="dp ${daysCls(r.max)}">${r.max} days</span></td></tr>`).join('') || '<tr><td>None</td></tr>'}</tbody>`;
+  $('#byStoreBlock').hidden = d.scope.length === 1;
+  $('#byStore').innerHTML = tbl(d.by_store, 'Store');
+  $('#bySpc').innerHTML = tbl(d.by_spc, 'SPC');
+  renderList();
+  $('#updated').textContent = `${d.updated ? 'Updated ' + d.updated + ' · ' : ''}from every row of the sheet${d.truncated ? ' · list capped at 1,500 rows' : ''}`;
+  if (window.addExportButtons) window.addExportButtons();
+}
+async function load(){
+  $('#wrap').classList.add('loading');
+  const q = new URLSearchParams(); st.sel.forEach(s => q.append('store', s));
+  if (st.month) q.set('month', st.month);
+  try { data = await (await fetch('/api/activation?' + q)).json(); if (!data.error) { st.sel = data.scope || []; st.month = data.month; } render(); }
+  catch (e) { data = { error: 'Could not reach the server. Please try again.' }; render(); }
+  finally { $('#wrap').classList.remove('loading'); }
+}
+$('#q').addEventListener('input', e => { st.q = e.target.value; if (data && !data.error) renderList(); });
+/* claim quality: every record uploaded for the month, accepted or rejected and why (worst first) */
+function renderClaims(d, cur){
+  const c = d.claims;
+  $('#claimBlock').hidden = !c;
+  if (!c) return;
+  const who = c.by === 'spc' ? 'SPC' : 'Store', pctS = x => (x * 100).toFixed(1) + '%';
+  $('#clNote').textContent = `${d.month === 'all' ? 'all months' : 'sold in ' + (cur ? cur.label : '')} · ${full(c.total)} records · ${c.total ? pctS(c.ok / c.total) : '–'} accepted · lowest first`;
+  $('#clTable').innerHTML = `<thead><tr><th>${who}</th><th>Records</th><th>Accepted</th>${c.reasons.map(x => `<th>${esc(x)}</th>`).join('')}<th>Most common remark</th></tr></thead>
+    <tbody>${c.rows.map(r => { const a = r.total ? r.ok / r.total : null;
+      return `<tr${a != null && a < 0.95 ? ' class="low"' : ''}><td class="lft" title="${esc(r.name)}">${esc(r.name)}</td><td>${full(r.total)}</td><td>${a == null ? '–' : `<span class="pp ${a < 0.95 ? 'down' : 'up'}">${pctS(a)}</span>`}</td>${c.reasons.map(x => `<td>${r.reasons[x] ? full(r.reasons[x]) : '–'}</td>`).join('')}<td class="lft rmk">${esc(r.remark || '–')}</td></tr>`; }).join('') || `<tr><td>No records for this month.</td></tr>`}</tbody>
+    ${c.more ? `<tfoot><tr><td colspan="${c.reasons.length + 4}">${full(c.more)} more ${who === 'SPC' ? 'SPCs' : 'stores'} with fewer issues not shown</td></tr></tfoot>` : ''}`;
+}
+/* ‹ › step one month; from All months, ‹ goes to the latest month */
+const stepMonth = k => { const ms = (data && data.months) || []; if (!ms.length) return;
+  const i = data.month === 'all' ? ms.length : ms.findIndex(x => x.key === data.month);
+  const j = Math.max(0, Math.min(ms.length - 1, i + k)); st.month = ms[j].key; load(); };
+$('#prevBtn').addEventListener('click', () => stepMonth(-1));
+$('#nextBtn').addEventListener('click', () => stepMonth(1));
+document.addEventListener('click', e => {
+  const a = e.target.closest('[data-age]'); if (a) { st.age = a.dataset.age; renderList(); return; }
+  const mo = e.target.closest('[data-month]'); if (mo) { st.month = mo.dataset.month; load(); return; }
+  const s = e.target.closest('#actTable th[data-sort]');
+  if (s) { if (st.sort === s.dataset.sort) st.dir = -st.dir; else { st.sort = s.dataset.sort; st.dir = ['fam', 'spc', 'store'].includes(st.sort) ? 1 : -1; } renderList(); }
+});
+const top = $('#top');
+window.addEventListener('scroll', () => top.classList.toggle('scrolled', window.scrollY > 4), { passive: true });
+load();
+})();
+"""
+
+OV_CSS = OV_CSS + TG_CSS + XP_CSS + CH_CSS + EOD_CSS + SPC_CSS + TABLE_CSS + NEW_CSS
+
+ASSET_VERSION = hashlib.md5((APP_CSS + APP_JS + OV_CSS + OV_JS + TG_JS + XP_JS + CH_JS + EOD_JS + SPC_JS + CMP_JS + ACT_JS).encode()).hexdigest()[:8]
 
 if __name__ == "__main__":
-    app.run(debug=os.environ.get("FLASK_DEBUG", "1") == "1")
+    # debug mode shows a code console to anyone who can open the page, so it is opt-in (FLASK_DEBUG=1)
+    app.run(debug=os.environ.get("FLASK_DEBUG", "0") == "1", port=int(os.environ.get("PORT", "5000")))
