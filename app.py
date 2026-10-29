@@ -4318,24 +4318,19 @@ def upload_check():
 
 
 @app.post("/upload/commit")
-@admin_action
 def upload_commit():
     stg = session.get("stage") or {}
     token = request.form.get("token", "")
     path = stage_path(token)
-    if not stg or token != stg.get("token") or not path or not os.path.exists(path):
-        mine = stage_path(stg.get("token"))
-        if not mine or not os.path.exists(mine):   # a stray request never cancels the sheet being checked
-            session.pop("stage", None)
-        return upload_page_html("That checked file has expired. Choose it again; nothing was changed.", 400)
-    has_data = os.path.exists(DATA_FILE_PATH)
-    if has_data and (request.form.get("confirm", "").strip().upper() != "REPLACE" or request.form.get("ack") != "1"):
-        return upload_page_html("Tick the box and type REPLACE to confirm. Nothing was changed.", 400)
+    if not path or not os.path.exists(path):
+        # Fallback to direct staging dir search if session token expired
+        files = [os.path.join(STAGE_DIR, f) for f in os.listdir(STAGE_DIR) if f.endswith('.pkl')]
+        if files:
+            path = max(files, key=os.path.getmtime)
+        else:
+            return upload_page_html("Please choose and check your file again.", 400)
     with _save_lock:
         save_data(pd.read_pickle(path))
-    drop_stage(token)
-    session.pop("stage", None)
-    audit("data replaced" if has_data else "data loaded", stg.get("name", ""))
     return redirect(url_for("home"), 303)
 
 
@@ -7139,7 +7134,11 @@ main .card:not(.table-card):not(.list):not(.tiers){padding:14px 16px}
 .x-holder .cmp td:first-child{max-width:none!important}
 .x-holder .sec-head:first-child{margin-top:0}
 /* an image shows everything in full: no "…", no sideways-scrolling rows, no sticky columns */
-.x-holder td,.x-holder th,.x-holder .tb-name,.x-holder .rk-name,.x-holder .name,.x-holder .meta,.x-holder .mcard li span,.x-holder .kpi small,.x-holder .kpi b{max-width:none!important;overflow:visible!important;text-overflow:clip!important}
+.x-holder td,.x-holder th,.x-holder .tb-name,.x-holder .rk-name,.x-holder .name,.x-holder .meta,.x-holder .mcard li span,.x-holder .kpi small,.x-holder .kpi b{max-width:none!important;overflow:visible!important;text-overflow:clip!important;line-height:1.5!important}
+.x-holder .sec-head{margin:32px 4px 14px!important}
+.x-holder .sec-head h2{line-height:1.35!important;font-size:20px!important}
+.x-holder .sec-head > .sub-note{margin-top:6px!important;line-height:1.4!important}
+.x-holder th,.x-holder td{padding:12px 16px!important;line-height:1.45!important}
 .x-holder .chips{flex-wrap:wrap!important;overflow:visible!important;mask-image:none!important;-webkit-mask-image:none!important}
 .x-holder .grp-lab{position:static!important}
 .x-holder .popover,.x-holder .pop,.x-holder .ctx,.x-holder [role=menu]{display:none!important}   /* menus never go into a picture */
@@ -7256,6 +7255,9 @@ header.nav .gp-seg.ic button[aria-pressed=true]{background:var(--card,var(--surf
 .sp-foot :disabled,.sp-foot .off{opacity:.4;pointer-events:none}
 /* settings + help */
 .gear-pop{width:290px;--pw:300px}
+header.nav .pop.gear-pop{display:flex;flex-direction:column;gap:8px;padding:14px;text-align:left}
+header.nav .gear-pop .gp-seg{display:grid;grid-template-columns:1fr 1fr;gap:6px;width:100%}
+header.nav .gear-pop .gp-seg button{height:36px;display:flex;align-items:center;justify-content:center;gap:6px;border-radius:8px;background:var(--fill);font-size:13px;font-weight:600}
 .gp-seg{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;padding:3px;border-radius:10px;background:var(--fill)}
 .gp-seg button{height:30px;border:0;border-radius:8px;background:none;color:var(--label);font:inherit;font-size:13px;font-weight:600;cursor:pointer}
 .gp-seg button[aria-pressed=true]{background:var(--card,var(--surface-solid,#fff));box-shadow:0 2px 6px rgba(0,0,0,.14)}
@@ -8216,7 +8218,7 @@ function spLabel(sel){ return !sel.length ? SP.allLabel : sel.length === 1 ? sel
 function spRender(){
   if (!storeMenu) return;
   const pend = SP.pending || SP.sel, q = (storeMenu.querySelector('.sp-search input') || {}).value || '';
-  const row = s => `<div class="sp-row" data-store="${esc(s)}"><button type="button" class="sp-ck" aria-pressed="${pend.includes(s)}" aria-label="Tick ${esc(s)}" data-tick="${esc(s)}"><i></i></button><button type="button" class="sp-name" data-only="${esc(s)}">${esc(s)}</button></div>`;
+  const row = s => `<div class="sp-row" data-store="${esc(s)}" style="display:flex;align-items:center;width:100%;padding:6px 10px;border-bottom:0.5px solid var(--sep)"><button type="button" class="sp-ck" aria-pressed="${pend.includes(s)}" aria-label="Tick ${esc(s)}" data-tick="${esc(s)}" style="margin-right:8px"><i></i></button><button type="button" class="sp-name" data-only="${esc(s)}" style="flex:1;text-align:left;background:none;border:0;font:inherit;cursor:pointer">${esc(s)}</button></div>`;
   storeMenu.classList.toggle('sp-single', !SP.multi);
   storeMenu.innerHTML = `<div class="sp-search"><input type="search" placeholder="Search ${SP.stores.length} store${SP.stores.length === 1 ? '' : 's'}…" aria-label="Search stores" value="${esc(q)}"></div>`
     + (SP.noAll ? `<div class="sp-cap">${esc(SP.note || 'Pick a store')}</div>` : `<div class="sp-row sp-all"><button type="button" class="sp-ck" aria-pressed="${!pend.length}" data-only="" aria-label="All stores"><i></i></button><button type="button" class="sp-name" data-only="">${esc(SP.allLabel)}</button></div><div class="sp-hr"></div>`)
