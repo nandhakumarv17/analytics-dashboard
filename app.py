@@ -23,8 +23,21 @@ from flask import Flask, Response, jsonify, make_response, redirect, render_temp
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 128 * 1024 * 1024  # 128 MB uploads: room for the full sheet saved back as CSV
 
-UPLOAD_DIR = os.environ.get("DASHBOARD_UPLOAD_DIR", "/tmp/dashboard_uploads")
+# Everything that must survive a restart (the uploaded sheet, its original file, the passcode, targets) lives in one folder.
+# It used to default to /tmp, which the system empties; it now sits next to this file. On a host with a temporary disk,
+# point DASHBOARD_UPLOAD_DIR at a persistent volume.
+_LEGACY_DIR = "/tmp/dashboard_uploads"
+UPLOAD_DIR = os.environ.get("DASHBOARD_UPLOAD_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard_data")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+if UPLOAD_DIR != _LEGACY_DIR and os.path.isdir(_LEGACY_DIR) and not os.listdir(UPLOAD_DIR):
+    try:   # one-time move of data left in the old temporary folder
+        import shutil
+        for _n in os.listdir(_LEGACY_DIR):
+            _src = os.path.join(_LEGACY_DIR, _n)
+            if os.path.isfile(_src):
+                shutil.copy2(_src, os.path.join(UPLOAD_DIR, _n))
+    except OSError:
+        pass
 DATA_FILE_PATH = os.path.join(UPLOAD_DIR, "shared_data.pkl")
 META_FILE_PATH = os.path.join(UPLOAD_DIR, "metadata.json")
 
@@ -322,6 +335,9 @@ def get_state():
         return dict(_state)
 
 
+SOURCE_FILE = os.path.join(UPLOAD_DIR, "source_current.bin")     # the file exactly as it was uploaded or pulled, kept until the next one
+SOURCE_META = os.path.join(UPLOAD_DIR, "source_current.json")
+DRIVE_LINK_FILE = os.path.join(UPLOAD_DIR, "drive_link.txt")
 PREV_DATA_PATH = os.path.join(UPLOAD_DIR, "shared_data.prev.pkl")
 PREV_META_PATH = os.path.join(UPLOAD_DIR, "metadata.prev.json")
 
@@ -381,6 +397,7 @@ SECRET_FILE = os.path.join(UPLOAD_DIR, ".session_key")
 STAGE_DIR = os.path.join(UPLOAD_DIR, "staged")
 os.makedirs(STAGE_DIR, exist_ok=True)
 UNLOCK_MIN, STAGE_MIN = 15, 30
+REMEMBER_DAYS = 30   # "keep me unlocked on this device": the passcode is asked once a month, not every 15 minutes
 MAX_TRIES, GLOBAL_TRIES, LOCK_MIN = 5, 20, 15
 PASS_MIN_LEN, PASS_ITER = 6, 240_000
 _tries = {}   # who -> [wrong tries, first wrong try, locked until]; "*" counts every device together
@@ -405,14 +422,12 @@ def _session_key():
 
 
 app.secret_key = _session_key()
-app.config.update(SESSION_COOKIE_NAME="ap_admin", SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Strict")
-
-
-DEFAULT_PASSCODE = " "  # Single spacebar click is the default password for everything
+app.config.update(SESSION_COOKIE_NAME="ap_admin", SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Strict",
+                  PERMANENT_SESSION_LIFETIME=timedelta(days=REMEMBER_DAYS))
 
 
 def admin_info():
-    """Always returns an active passcode record; defaults to a single spacebar (' ') so setup is never required."""
+    """The stored passcode record; the old UPLOAD_PIN setting stands in until a passcode is set here."""
     try:
         with open(ADMIN_FILE) as fh:
             a = json.load(fh)
@@ -420,7 +435,9 @@ def admin_info():
             return a
     except (OSError, ValueError):
         pass
-    return {"default_space": True, "ver": "space-default", "set": "Default (Spacebar)"}
+    if UPLOAD_PIN:
+        return {"env": True, "ver": "env-" + hashlib.sha256(UPLOAD_PIN.encode()).hexdigest()[:12]}
+    return None
 
 
 def _pass_hash(code, salt, n=PASS_ITER):
@@ -428,13 +445,6 @@ def _pass_hash(code, salt, n=PASS_ITER):
 
 
 def set_passcode(code):
-    if code == DEFAULT_PASSCODE:
-        try:
-            if os.path.exists(ADMIN_FILE):
-                os.remove(ADMIN_FILE)
-        except OSError:
-            pass
-        return admin_info()
     salt = secrets.token_hex(16)
     a = {"salt": salt, "iter": PASS_ITER, "hash": _pass_hash(code, salt), "ver": secrets.token_hex(8),
          "set": datetime.now().strftime("%d %b %Y, %I:%M %p")}
@@ -446,25 +456,21 @@ def set_passcode(code):
 
 
 def passcode_ok(code):
-    if code == DEFAULT_PASSCODE:
-        return True
     a = admin_info()
-    if not a or code is None or code == "":
+    if not a or not code:
         return False
-    if a.get("default_space"):
-        return code == DEFAULT_PASSCODE
     if a.get("env"):
         return hmac.compare_digest(code.encode("utf-8"), UPLOAD_PIN.encode("utf-8"))
     return hmac.compare_digest(_pass_hash(code, a["salt"], a.get("iter", PASS_ITER)), a["hash"])
 
 
 def passcode_problem(code, again):
+    if len(code) < PASS_MIN_LEN:
+        return f"Use at least {PASS_MIN_LEN} characters."
+    if len(set(code)) < 3 or code in ("123456", "1234567", "12345678", "654321", "password", "qwerty"):
+        return "That passcode is too easy to guess. Mix in more different characters."
     if code != again:
         return "The two passcodes don't match."
-    if code == DEFAULT_PASSCODE:
-        return ""
-    if len(code) < 1:
-        return "Enter a passcode (or press Spacebar once)."
     return ""
 
 
@@ -521,14 +527,16 @@ def is_unlocked(extend=False):
     if not a or session.get("ver") != a["ver"] or session.get("until", 0) < time.time():
         return False
     if extend:   # actions keep it open; just looking at the page does not
-        session["until"] = time.time() + UNLOCK_MIN * 60
+        session["until"] = time.time() + (REMEMBER_DAYS * 86400 if session.get("rem") else UNLOCK_MIN * 60)
     return True
 
 
-def unlock_session():
+def unlock_session(remember=False):
     stage = session.get("stage")
     session.clear()
-    session.update(ver=admin_info()["ver"], until=time.time() + UNLOCK_MIN * 60, csrf=secrets.token_urlsafe(24))
+    session.permanent = bool(remember)   # a remembered browser keeps its cookie for REMEMBER_DAYS; otherwise it ends with the browser
+    session.update(ver=admin_info()["ver"], until=time.time() + (REMEMBER_DAYS * 86400 if remember else UNLOCK_MIN * 60),
+                   csrf=secrets.token_urlsafe(24), rem=bool(remember))
     if stage:
         session["stage"] = stage
 
@@ -616,7 +624,7 @@ def clean_stage():
 
 
 def drop_stage(token):
-    for ext in ("pkl", "json"):
+    for ext in ("pkl", "json", "raw"):
         fp = stage_path(token, ext)
         if fp and os.path.exists(fp):
             os.remove(fp)
@@ -703,7 +711,8 @@ def restore_previous():
     if not os.path.exists(PREV_DATA_PATH):
         raise ValueError("there is no previous upload to restore")
     with _save_lock:
-        for cur, prev in ((DATA_FILE_PATH, PREV_DATA_PATH), (META_FILE_PATH, PREV_META_PATH)):
+        for cur, prev in ((DATA_FILE_PATH, PREV_DATA_PATH), (META_FILE_PATH, PREV_META_PATH),
+                          (SOURCE_FILE, SOURCE_FILE + ".prev"), (SOURCE_META, SOURCE_META + ".prev")):
             have_cur, have_prev = os.path.exists(cur), os.path.exists(prev)
             if have_cur:
                 os.replace(cur, cur + ".swap")
@@ -714,13 +723,171 @@ def restore_previous():
         os.utime(DATA_FILE_PATH)   # a fresh time, so every page reloads the restored sheet
 
 
+# ---------- the original file is kept as uploaded, and a sheet can come from this device or a Google Drive link ----------
+def source_info():
+    """Where the data loaded now came from (file name, size, how it arrived); None when it was loaded before this was kept."""
+    try:
+        with open(SOURCE_META, encoding="utf-8") as fh:
+            m = json.load(fh)
+        return m if os.path.exists(SOURCE_FILE) else None
+    except (OSError, ValueError):
+        return None
+
+
+def keep_source(raw, name, via):
+    """Called when a sheet is confirmed: the file as it arrived replaces the previously kept one (which stays one step back)."""
+    if os.path.exists(SOURCE_FILE):
+        os.replace(SOURCE_FILE, SOURCE_FILE + ".prev")
+        if os.path.exists(SOURCE_META):
+            os.replace(SOURCE_META, SOURCE_META + ".prev")
+    tmp = SOURCE_FILE + ".tmp"
+    with open(tmp, "wb") as fh:
+        fh.write(raw)
+    os.replace(tmp, SOURCE_FILE)
+    size = f"{len(raw) / 1048576:.2f} MB" if len(raw) > 1048576 else f"{max(1, len(raw) // 1024)} KB"
+    with open(SOURCE_META, "w", encoding="utf-8") as fh:
+        json.dump({"name": name, "size": size, "via": via, "saved": datetime.now().strftime("%d %b %Y, %I:%M %p"),
+                   "sha": hashlib.sha256(raw).hexdigest()[:12]}, fh)
+
+
+def saved_drive_link():
+    try:
+        with open(DRIVE_LINK_FILE, encoding="utf-8") as fh:
+            return fh.read().strip()[:400]
+    except OSError:
+        return ""
+
+
+_FOLDER_RE = re.compile(r"drive\.google\.com/(?:drive/(?:u/\d+/)?folders/|folderview\?id=|open\?id=)([A-Za-z0-9_-]{10,})|[?&]id=([A-Za-z0-9_-]{20,})")
+
+
+def drive_folder_id(link):
+    """The folder id in a Drive folder link, or '' when the link is not a folder link."""
+    if "/folders/" not in link and "folderview" not in link:
+        return ""
+    m = _FOLDER_RE.search(link)
+    return (m.group(1) or m.group(2)) if m else ""
+
+
+def _drive_date(txt):
+    """'Oct 29, 2026' / '10/29/26' / 'Oct 29' / '3:45 PM' (today) -> datetime; unknown text -> the oldest date."""
+    txt = re.sub(r"\s+", " ", (txt or "").strip())
+    for fmt in ("%b %d, %Y", "%m/%d/%y", "%m/%d/%Y", "%d %b %Y", "%b %d %Y"):
+        try:
+            return datetime.strptime(txt, fmt)
+        except ValueError:
+            pass
+    try:
+        d = datetime.strptime(txt, "%b %d")
+        return d.replace(year=datetime.now().year)
+    except ValueError:
+        pass
+    try:
+        t = datetime.strptime(txt, "%I:%M %p")
+        return datetime.now().replace(hour=t.hour, minute=t.minute, second=0, microsecond=0)
+    except ValueError:
+        return datetime.min
+
+
+def list_drive_folder(fid):
+    """[(file id, name, modified datetime)] of a folder shared as 'Anyone with the link' (read from its public page; no sign-in)."""
+    import html as _html
+    import urllib.request
+    req = urllib.request.Request(f"https://drive.google.com/embeddedfolderview?id={fid}#list",
+                                 headers={"User-Agent": "Mozilla/5.0 SalesDashboard/1.0", "Accept-Language": "en-US,en;q=0.9"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        page = r.read().decode("utf-8", "replace")
+    out = []
+    for chunk in page.split('id="entry-')[1:]:
+        fid_ = re.match(r"([A-Za-z0-9_-]{10,})", chunk)
+        title = re.search(r'flip-entry-title">(.*?)</div>', chunk, re.S)
+        mod = re.search(r'flip-entry-last-modified">\s*<div>(.*?)</div>', chunk, re.S)
+        if fid_ and title:
+            out.append((fid_.group(1), _html.unescape(re.sub(r"<[^>]+>", "", title.group(1))).strip(),
+                        _drive_date(_html.unescape(mod.group(1)) if mod else "")))
+    return out
+
+
+def fetch_drive_source(link):
+    """A Drive folder link (newest Excel/CSV file inside it) or a Drive file / Google Sheet link -> (bytes, file name)."""
+    link = (link or "").strip()
+    if not link.lower().startswith("https://"):
+        raise ValueError("paste the full https:// link from Google Drive (Share → Copy link)")
+    fid = drive_folder_id(link)
+    name = ""
+    if fid:
+        files = [f for f in list_drive_folder(fid) if f[1].lower().rsplit(".", 1)[-1] in ("xlsx", "xls", "csv")]
+        if not files:
+            raise ValueError("no .xlsx, .xls or .csv file was found in that folder. Check that the folder is shared as "
+                             "'Anyone with the link · Viewer' and holds the sheet")
+        files.sort(key=lambda f: (f[2], f[1]), reverse=True)   # newest first; the name breaks ties (e.g. sales_2026-10-29.xlsx)
+        fid_file, name = files[0][0], files[0][1]
+        url = f"https://drive.usercontent.google.com/download?id={fid_file}&export=download&confirm=t"
+    else:
+        url = drive_url(link)
+        if "google" in link and url == link:
+            raise ValueError("that does not look like a Google Drive folder, file or Sheet link")
+    raw, disp = _download(url)
+    if raw.lstrip()[:15].startswith(_HTML_START):
+        m = re.search(r"[?&]id=([A-Za-z0-9_-]+)", url)
+        if m and not fid:   # a bare file id can also be a Google Sheet
+            raw, disp = _download(f"https://docs.google.com/spreadsheets/d/{m.group(1)}/export?format=xlsx")
+        if raw.lstrip()[:15].startswith(_HTML_START):
+            raise ValueError("Google Drive sent a web page instead of the file. Share it as 'Anyone with the link · Viewer'")
+    if not name:
+        m = re.search(r"filename\*?=(?:UTF-8'')?\"?([^\";]+)", disp)
+        name = urllib.parse.unquote(m.group(1)) if m else ""
+    if raw[:4] == b"PK\x03\x04":
+        ext = "xlsx"
+    elif raw[:4] == b"\xd0\xcf\x11\xe0":
+        ext = "xls"
+    else:
+        ext = "csv"
+    if not name.lower().endswith("." + ext):
+        name = (name.rsplit(".", 1)[0] if name else "drive_sheet") + "." + ext
+    if len(raw) > app.config["MAX_CONTENT_LENGTH"]:
+        raise ValueError("that file is over 128 MB")
+    return raw, name[:120]
+
+
+def stage_sheet(raw, name, via):
+    """Reads and checks a new sheet, keeps it staged, and shows the comparison. Returns an error message or ''."""
+    try:
+        df = read_upload(raw, name)
+        if df.empty:
+            raise ValueError("the file has no rows")
+    except Exception as exc:  # noqa: BLE001 - shown to the admin; the data is untouched
+        audit("file refused", f"{name}: {exc}")
+        return f"Couldn't read that file: {exc}. Your current data was not changed."
+    problems = check_new_sheet(df)
+    if problems:
+        audit("file refused", f"{name}: " + "; ".join(problems))
+        return "This doesn't look like the raw sales sheet: " + "; ".join(problems) + ". Your current data was not changed."
+    old = session.get("stage")
+    if old:
+        drop_stage(old.get("token"))
+    token = secrets.token_urlsafe(24)
+    df.to_pickle(stage_path(token))
+    with open(stage_path(token, "raw"), "wb") as fh:
+        fh.write(raw)
+    review = compare_sheets(sheet_summary(df), current_summary())
+    review.update(name=name, via=via, size=f"{len(raw) / 1048576:.2f} MB" if len(raw) > 1048576 else f"{max(1, len(raw) // 1024)} KB",
+                  sha=hashlib.sha256(raw).hexdigest()[:12])
+    with open(stage_path(token, "json"), "w", encoding="utf-8") as fh:
+        json.dump(review, fh)
+    session["stage"] = {"token": token, "name": name, "via": via}
+    audit("file checked", f"{name} ({via}) · {review['new']['rows']} rows · {review['new']['range']}")
+    return ""
+
+
 def upload_page_html(error=None, status=200, notice=None):
     """The one page for data access; what it shows depends on whether this browser is unlocked."""
     clean_stage()
     a = admin_info()
     ctx = {"error": error, "notice": notice, "unlock_min": UNLOCK_MIN, "min_len": PASS_MIN_LEN, "lock_left": 0,
            "local": is_local_request(), "has_data": os.path.exists(DATA_FILE_PATH), "current": None, "csrf": "",
-           "log": [], "review": None, "stage": None, "env_pin": bool(a and a.get("env")), "pass_set": (a or {}).get("set", "")}
+           "log": [], "review": None, "stage": None, "remembered": False, "remember_days": REMEMBER_DAYS,
+           "src_info": source_info(), "drive_link": saved_drive_link(), "env_pin": bool(a and a.get("env")), "pass_set": (a or {}).get("set", "")}
     if not a:
         view = "setup" if ctx["local"] else "setup_remote"
     elif not is_unlocked():
@@ -729,6 +896,7 @@ def upload_page_html(error=None, status=200, notice=None):
     else:
         view = "manage"
         ctx.update(current=current_data_info(), csrf=session.get("csrf", ""), log=audit_recent(),
+                   remembered=bool(session.get("rem")),
                    minutes_left=max(1, -int(-(session["until"] - time.time()) // 60)))
         stg = session.get("stage") or {}
         meta = stage_path(stg.get("token"), "json")
@@ -958,22 +1126,46 @@ def group_pref(key, default):
     return default if v not in ("0", "1") else v == "1"
 
 
-def regroup(frame, sp=False, ff=True, ss=None):
+_TAB_CONN = re.compile(r"\s*\b(?:5g|4g|lte|wi-?fi|wifi|cellular)\b", re.I)
+_WATCH = re.compile(r"^\s*(?:galaxy\s+)?watch\s*(\d+|ultra\s*\d*|fe|classic)?", re.I)
+
+
+def family_name(n, tab=True, watch=True):
+    """One name per product family: 'Tab S12 5G' / 'Tab S12 Wifi' -> 'Tab S12'; 'Watch9 40mm' / 'Watch 9 LTE 44mm' -> 'Watch9'."""
+    t = str(n).strip()
+    if tab and re.match(r"(?i)^\s*(?:galaxy\s+)?tab\b", t):
+        out = re.sub(r"\s+", " ", _TAB_CONN.sub("", t)).strip()
+        return out if out and out != t else None
+    if watch:
+        m = _WATCH.match(t)
+        if m:
+            core = re.sub(r"\s+", " ", (m.group(1) or "")).strip().title()
+            out = "Watch" + (core if core and core[0].isdigit() else (" " + core if core else ""))
+            if re.search(r"(?i)\bclassic\b", t) and "Classic" not in out:
+                out += " Classic"
+            return out if out != t else None
+    return None
+
+
+def regroup(frame, sp=False, ff=True, ss=None, tab=None, watch=None):
     """Optional roll-ups, each switched in Quick settings: Flagship + Innovative -> SP (sp);
-    Fold / Flip N -> FFN (ff, 'Foldables grouped'); S N, S N+, S N Ultra, S N FE -> SNF (ss, 'S series grouped')."""
+    Fold / Flip N -> FFN (ff, 'Foldables grouped'); S N, S N+, S N Ultra, S N FE -> SNF (ss, 'S series grouped');
+    a Tab's Wi-Fi / 5G / LTE versions as one (tab, 'Tab families'); a Watch's sizes and LTE / BT as one (watch, 'Watch families')."""
     ss = group_pref("ss", True) if ss is None else ss
-    if not (sp or ff or ss) or frame is None or frame.empty:
+    tab = group_pref("tab", True) if tab is None else tab
+    watch = group_pref("watch", True) if watch is None else watch
+    if not (sp or ff or ss or tab or watch) or frame is None or frame.empty:
         return frame
     frame = frame.copy()
     if sp:
         frame["seg"] = frame["seg"].replace({"Flagship": "SP", "Innovative": "SP"})
-    if ff or ss:
+    if ff or ss or tab or watch:
         def roll(n):
             g = series_name(n)
-            if not g:
-                return None
-            return g if (ff if g.startswith("FF") else ss) else None
-        m = {n: roll(n) for n in frame["fam"].unique() if roll(n)}
+            if g:
+                return g if (ff if g.startswith("FF") else ss) else None
+            return family_name(n, tab, watch)
+        m = {n: r for n in frame["fam"].unique() if (r := roll(n))}
         if m:
             frame["fam"] = frame["fam"].replace(m)
     return frame
@@ -1563,7 +1755,7 @@ def targets_data(st, month_s, sel_args, seg_pick=""):
     if len(sel) != 1:   # one store at a time: the first one picked, else the latest store with a target, else the top seller
         sel = [sel[0]] if sel else [default_target_store(daily, stores)]
     d_all = scope_rows(daily, sel)
-    d = sp_rows(d_all)                                   # strictly smartphones
+    d = sp_rows(d_all).assign(seg="SP")                  # strictly smartphones, as one SP figure (no Flagship / Innovative split)
     dmin, dmax = daily["day"].min(), daily["day"].max()
     first, last = dmin.replace(day=1), (dmax.replace(day=1) + pd.DateOffset(months=2))
     months = []
@@ -1665,7 +1857,20 @@ def targets_data(st, month_s, sel_args, seg_pick=""):
     }
 
 
-CH_BUILTIN = (("seg", "Segment"), ("fam", "Model"), ("spc", "SPC"), ("store", "Store"))
+CH_BUILTIN = (("seg", "Segment"), ("fam", "Model"), ("spc", "SPC"), ("store", "Store"), ("catn", "Category"), ("pb", "Price bracket"))
+# price brackets by the price of one unit (Tentative DP ÷ units on the row)
+PRICE_BRACKETS = [(15000, "Under 15K"), (25000, "15K–25K"), (40000, "25K–40K"), (70000, "40K–70K"), (100000, "70K–1L"), (float("inf"), "1L+")]
+PB_ORDER = [lab for _, lab in PRICE_BRACKETS]
+
+
+def price_bracket(unit):
+    try:
+        u = float(unit)
+    except (TypeError, ValueError):
+        return ""
+    if not u > 0:
+        return ""
+    return next(lab for hi, lab in PRICE_BRACKETS if u < hi)
 CH_TIME = (("day", "Day"), ("week", "Week"), ("month", "Month"), ("weekday", "Weekday"))
 CH_SKIP = re.compile(r"date|code|imei|remark|upload|validat|status|by$|emi|gap|^sale|^act|serial|mobile|phone", re.I)
 CH_SPLIT_MAX = 6
@@ -1703,6 +1908,9 @@ def chart_frame(st):
         "v": pd.to_numeric(df[dp_col], errors="coerce").fillna(0) if dp_col else 0.0,
     })
     f["cat"] = category_of(df, f["seg"])
+    f["catn"] = f["cat"].map(lambda c: CAT_NAMES.get(c, "Other") if c else "Other")
+    unit = f["v"] / f["q"].where(f["q"] > 0)
+    f["pb"] = unit.map(price_bracket).fillna("")
     extras = []
     for c in cols:
         if c in used or CH_SKIP.search(c) or pd.api.types.is_numeric_dtype(df[c]) or pd.api.types.is_datetime64_any_dtype(df[c]):
@@ -1889,7 +2097,18 @@ def spc_data(st, args):
     compare = "ly" if args.get("compare") == "ly" else "prev"
     pa, pb, code = spc_base_window(a, b, compare)
 
-    base = seg_only(regroup(scope_rows(f, sel), args.get("sp") == "1", args.get("ff", "1") == "1"), args)
+    scoped = regroup(scope_rows(f, sel), args.get("sp") == "1", args.get("ff", "1") == "1")
+    # filters: segment, product category and price bracket, on value or units alike
+    win = scoped[(scoped["day"] >= a) & (scoped["day"] <= b)]
+    filt_opts = {"segs": [x for x in win.groupby("seg")["v"].sum().sort_values(ascending=False).index if x],
+                 "cats": [x for x in win.groupby("catn")["v"].sum().sort_values(ascending=False).index if x],
+                 "pbs": [x for x in PB_ORDER if (win["pb"] == x).any()]}
+    base = seg_only(scoped, args)
+    want_cat, want_pb = (args.get("cat") or "").strip(), (args.get("pb") or "").strip()
+    if want_cat:
+        base = base[base["catn"] == want_cat]
+    if want_pb:
+        base = base[base["pb"] == want_pb]
     cur = base[(base["day"] >= a) & (base["day"] <= b)]
     prev = base[(base["day"] >= pa) & (base["day"] <= pb)]
     named = cur[cur["spc"] != ""]
@@ -1952,6 +2171,33 @@ def spc_data(st, args):
         products.append({"name": str(k), "seg": fseg.get(k, ""), "v": round(float(x["v"])), "q": round(float(x["q"])),
                          "bv": round(float(bp["v"])) if bp is not None else 0, "bq": round(float(bp["q"])) if bp is not None else 0, "by": by})
 
+    # who sells each price bracket and each category
+    def cells(col, order):
+        g = named[named[col] != ""].groupby(["spc", col])[["v", "q"]].sum()
+        tot = cur[cur[col] != ""].groupby(col)[["v", "q"]].sum()
+        keys = [k for k in order if k in tot.index] + [k for k in tot.index if k not in order]
+        return {"keys": keys, "tot": {k: [round(float(tot.at[k, "v"])), round(float(tot.at[k, "q"]))] for k in keys},
+                "by": {n: {k: [round(float(r["v"])), round(float(r["q"]))] for (sn, k), r in g.iterrows() if sn == n} for n in by_spc.index}}
+    brackets, categories = cells("pb", PB_ORDER), cells("catn", list(CAT_NAMES.values()))
+    # SPC history, store by store: each SPC month by month (the filters above apply)
+    try:
+        n_months = max(2, min(24, int(args.get("months", 6))))
+    except ValueError:
+        n_months = 6
+    m_end = b.replace(day=1)
+    m_keys = [(m_end - pd.DateOffset(months=i)).strftime("%Y-%m") for i in range(n_months - 1, -1, -1)]
+    hist = base[(base["day"] >= pd.Timestamp(m_keys[0] + "-01")) & (base["day"] <= b) & (base["spc"] != "")]
+    hg = hist.assign(m=hist["day"].dt.strftime("%Y-%m")).groupby(["store", "spc", "m"])[["v", "q"]].sum()
+    history = {"months": [{"key": k, "label": f"{pd.Timestamp(k + '-01'):%b %y}", "partial": k == b.strftime("%Y-%m") and b < pd.Timestamp(k + "-01") + pd.offsets.MonthEnd(0)} for k in m_keys],
+               "stores": []}
+    for stn in sorted({x[0] for x in hg.index}):
+        rows_h = {}
+        for (sn, sp_, mk), r in hg.iterrows():
+            if sn == stn:
+                rows_h.setdefault(sp_, {})[mk] = [round(float(r["v"])), round(float(r["q"]))]
+        order_h = sorted(rows_h, key=lambda n: -sum(x[0] for x in rows_h[n].values()))
+        history["stores"].append({"store": stn, "rows": [{"spc": n, "m": rows_h[n]} for n in order_h]})
+
     days = list(pd.date_range(a, b, freq="D"))
     daily = named.groupby(["day", "spc"])["v"].sum()
     dq = named.groupby(["day", "spc"])["q"].sum()
@@ -1972,6 +2218,9 @@ def spc_data(st, args):
                   "days": int(cur["day"].nunique())},
         "segments": [{"name": s, "v": round(float(seg_tot.at[s, "v"])), "q": round(float(seg_tot.at[s, "q"]))} for s in seg_order],
         "spcs": rows, "trend": trend, "products": products, "updated": updated_note(),
+        "filters": {**filt_opts, "seg": (args.get("seg") or "").strip(), "cat": want_cat, "pb": want_pb},
+        "brackets": brackets, "categories": categories, "history": history,
+        "tags": day_tags(days) if len(days) <= 120 else {},
         "beat": {"code": bw[2], "range": fmt_range(bw[0], bw[1]), "days_left": bw[3],
                  "v": round(float(full["v"].sum())), "q": round(float(full["q"].sum()))} if bw else None,
     }
@@ -2032,7 +2281,8 @@ def periods_data(st, gran, sel_args, sp=False, ff=True, mode="", date_s=""):
         v, q = window(w["s"], w["eff"])
         bases = [{"key": b["key"], "code": b["code"], "range": b["range"], "v": round(x[0]), "q": round(x[1])}
                  for b in lab["bases"] for x in [window(*w["bases"][b["key"]])]]
-        rows.append({"label": lab["label"], "range": lab["ranges"]["cur"], "partial": w["partial"], "code": lab["codes"]["cur"],
+        rows.append({"tag": day_tags([s]).get(s.strftime("%Y-%m-%d")) if gran == "day" else None,
+                     "label": lab["label"], "range": lab["ranges"]["cur"], "partial": w["partial"], "code": lab["codes"]["cur"],
                      "v": round(v), "q": round(q), "days": int(((tot.index >= w["s"]) & (tot.index <= w["eff"])).sum()),
                      "bases": bases})
     return {"gran": gran, "scope": sel, "rows": rows, "dmax": dmax.strftime("%Y-%m-%d"), "within": within, "follow": follow}
@@ -3875,7 +4125,7 @@ APP_HELP = [
 APP_HELP_BY_ID = {h["id"]: h for h in APP_HELP}
 PAGE_NAMES = {"/": "Overview", "/charts": "Chart Builder", "/spc": "SPC Performance", "/compare": "Comparison",
               "/targets": "Target vs Achievement", "/eod": "EOD Report", "/activation": "Activations & Claims",
-              "/review": "Review Meeting", "/zero": "Zero Sell-Out", "/stock": "Stock & Sell-Out", "/roster": "Duty Roster",
+              "/review": "Review Meeting", "/zero": "Sell-Out Gap Analysis", "/prices": "Price & Offers", "/stock": "Stock & Sell-Out", "/roster": "Duty Roster",
               "/campaigns": "Campaign Multipliers"}
 HELP_INTENT = re.compile(r"\bhow (?:do|can|to|should|does|would|will)\b|\bhow (?:is|are)\b.*\b(?:calculat|worked? out|count|comput|defin|done|made)\w*"
                          r"|\bwhere (?:is|are|can|do|does)\b|\bwhat (?:is|are|does|do)\b.*\b(?:mean|meaning|stand for|page|button|show|shows|for)\b"
@@ -4214,6 +4464,22 @@ def download_data(which):
         "Content-Disposition": f'attachment; filename="sales_data_{which}_{stamp}.csv"', "Cache-Control": "no-store"})
 
 
+@app.get("/download/original")
+def download_original():
+    """The file exactly as it was uploaded or pulled from Drive; kept until the next upload. Admin only."""
+    if not is_unlocked(extend=True):
+        return redirect(url_for("upload_page"))
+    info = source_info()
+    if not info:
+        return Response("No original file is kept for the current data.", status=404, mimetype="text/plain")
+    audit("downloaded", "original file")
+    with open(SOURCE_FILE, "rb") as fh:
+        body = fh.read()
+    name = re.sub(r'[^A-Za-z0-9._ -]+', "_", info.get("name", "sales_sheet"))
+    return Response(body, mimetype="application/octet-stream", headers={
+        "Content-Disposition": f'attachment; filename="{name}"', "Cache-Control": "no-store"})
+
+
 @app.get("/upload")
 def upload_page():
     return upload_page_html()
@@ -4269,8 +4535,8 @@ def upload_unlock():
         elif left <= 3:
             msg += f" {left} {'try' if left == 1 else 'tries'} left before it locks for {LOCK_MIN} minutes."
         return upload_page_html(msg, 403)
-    unlock_session()
-    audit("unlocked")
+    unlock_session(remember=request.form.get("remember") == "1")
+    audit("unlocked", f"remembered for {REMEMBER_DAYS} days" if session.get("rem") else "")
     return redirect(url_for("upload_page"), 303)
 
 
@@ -4289,48 +4555,56 @@ def upload_check():
     if not f or not f.filename:
         return upload_page_html("Choose a file first.", 400)
     name = os.path.basename(f.filename)[:120]
+    bad = stage_sheet(f.read(), name, "this device")
+    return upload_page_html(bad, 400) if bad else redirect(url_for("upload_page"), 303)
+
+
+@app.post("/upload/drive")
+@admin_action
+def upload_drive():
+    """Second way to bring a sheet in: pull it from a Google Drive folder (newest Excel/CSV file) or file link."""
+    link = request.form.get("link", "").strip()
+    if not link:
+        return upload_page_html("Paste the Google Drive folder link first.", 400)
     try:
-        raw = f.read()
-        df = read_upload(raw, name)
-        if df.empty:
-            raise ValueError("the file has no rows")
+        raw, name = fetch_drive_source(link)
     except Exception as exc:  # noqa: BLE001 - shown to the admin; the data is untouched
-        audit("file refused", f"{name}: {exc}")
-        return upload_page_html(f"Couldn't read that file: {exc}. Your current data was not changed.", 400)
-    problems = check_new_sheet(df)
-    if problems:
-        audit("file refused", f"{name}: " + "; ".join(problems))
-        return upload_page_html("This doesn't look like the raw sales sheet: " + "; ".join(problems)
-                                + ". Your current data was not changed.", 400)
-    old = session.get("stage")
-    if old:
-        drop_stage(old.get("token"))
-    token = secrets.token_urlsafe(24)
-    df.to_pickle(stage_path(token))
-    review = compare_sheets(sheet_summary(df), current_summary())
-    review.update(name=name, size=f"{len(raw) / 1048576:.2f} MB" if len(raw) > 1048576 else f"{max(1, len(raw) // 1024)} KB",
-                  sha=hashlib.sha256(raw).hexdigest()[:12])
-    with open(stage_path(token, "json"), "w", encoding="utf-8") as fh:
-        json.dump(review, fh)
-    session["stage"] = {"token": token, "name": name}
-    audit("file checked", f"{name} · {review['new']['rows']} rows · {review['new']['range']}")
+        audit("drive pull failed", str(exc)[:200])
+        return upload_page_html(f"Couldn't pull the sheet from Google Drive: {exc}. Your current data was not changed.", 400)
+    bad = stage_sheet(raw, name, "Google Drive")
+    if bad:
+        return upload_page_html(bad, 400)
+    try:
+        with open(DRIVE_LINK_FILE, "w", encoding="utf-8") as fh:
+            fh.write(link[:400])
+    except OSError:
+        pass
     return redirect(url_for("upload_page"), 303)
 
 
 @app.post("/upload/commit")
+@admin_action
 def upload_commit():
     stg = session.get("stage") or {}
     token = request.form.get("token", "")
     path = stage_path(token)
-    if not path or not os.path.exists(path):
-        # Fallback to direct staging dir search if session token expired
-        files = [os.path.join(STAGE_DIR, f) for f in os.listdir(STAGE_DIR) if f.endswith('.pkl')]
-        if files:
-            path = max(files, key=os.path.getmtime)
-        else:
-            return upload_page_html("Please choose and check your file again.", 400)
+    if not stg or token != stg.get("token") or not path or not os.path.exists(path):
+        mine = stage_path(stg.get("token"))
+        if not mine or not os.path.exists(mine):   # a stray request never cancels the sheet being checked
+            session.pop("stage", None)
+        return upload_page_html("That checked file has expired. Choose it again; nothing was changed.", 400)
+    has_data = os.path.exists(DATA_FILE_PATH)
+    if has_data and (request.form.get("confirm", "").strip().upper() != "REPLACE" or request.form.get("ack") != "1"):
+        return upload_page_html("Tick the box and type REPLACE to confirm. Nothing was changed.", 400)
+    raw_path = stage_path(token, "raw")
     with _save_lock:
         save_data(pd.read_pickle(path))
+        if raw_path and os.path.exists(raw_path):
+            with open(raw_path, "rb") as fh:
+                keep_source(fh.read(), stg.get("name", "sheet"), stg.get("via", "this device"))
+    drop_stage(token)
+    session.pop("stage", None)
+    audit("data replaced" if has_data else "data loaded", stg.get("name", ""))
     return redirect(url_for("home"), 303)
 
 
@@ -4372,7 +4646,7 @@ def upload_passcode():
     if bad:
         return upload_page_html(bad + " The passcode was not changed.", 400)
     set_passcode(code)
-    unlock_session()   # this browser stays unlocked; every other unlocked browser is signed out
+    unlock_session(remember=bool(session.get("rem")))   # this browser stays unlocked; every other unlocked browser is signed out
     audit("passcode changed")
     return upload_page_html(notice="Passcode changed. Any other browser that was unlocked has been locked.")
 
@@ -4381,7 +4655,8 @@ def upload_passcode():
 def upload_status():
     a = admin_info()
     on = is_unlocked()
-    out = {"protected": bool(a), "unlocked": on, "minutes": max(0, int((session.get("until", 0) - time.time()) // 60)) if on else 0}
+    out = {"protected": bool(a), "unlocked": on, "remembered": bool(on and session.get("rem")),
+           "minutes": max(0, int((session.get("until", 0) - time.time()) // 60)) if on else 0}
     if on:   # same-origin pages only (no CORS), so other sites can't read it
         out["csrf"] = session.get("csrf", "")
     return jsonify(out)
@@ -4492,7 +4767,8 @@ def asset_act_js():
 @app.get("/assets/<name>.js")
 def asset_new_js(name):
     body = {"cmp": globals().get("CMP_JS"), "act": globals().get("ACT_JS"), "rv": globals().get("RV_JS"), "zr": globals().get("ZR_JS"),
-            "stk": globals().get("STK_JS"), "rs": globals().get("RS_JS"), "cp": globals().get("CP_JS")}.get(name)
+            "stk": globals().get("STK_JS"), "rs": globals().get("RS_JS"), "cp": globals().get("CP_JS"),
+            "pr": globals().get("PR_JS")}.get(name)
     if body is None:
         return Response("not found", status=404)
     return Response(body, mimetype="application/javascript", headers={"Cache-Control": "public, max-age=31536000, immutable"})
@@ -4548,8 +4824,27 @@ MACROS = """
 
 UPLOAD_HTML = """<!doctype html>
 <html lang="en"><head><title>Data & upload</title>""" + HEAD + """</head>
-<body class="upload-page"{% if view in ('manage', 'review') %} data-unlock-min="{{ minutes_left }}"{% endif %}>""" + MACROS + """
+<body class="upload-page"{% if view in ('manage', 'review') and not remembered %} data-unlock-min="{{ minutes_left }}"{% endif %}>""" + MACROS + """
 {{ sprite|safe }}
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+<symbol id="u-cloud" viewBox="0 0 24 24"><path d="M7 18.2a4.4 4.4 0 01-.6-8.76A6 6 0 0117.8 8.9 4.7 4.7 0 0117 18.2"/><path d="M12 20.5v-8M8.9 15.2L12 12l3.1 3.2"/></symbol>
+<symbol id="u-laptop" viewBox="0 0 24 24"><rect x="4.5" y="5" width="15" height="10.5" rx="2"/><path d="M2.5 19h19"/></symbol>
+<symbol id="u-driveglyph" viewBox="0 0 24 24"><path d="M8.6 3.8h6.8l6 10.4h-6.8z" fill="#fbbc04" stroke="none"/><path d="M8.6 3.8L2 15.2l3.4 5.9L12 9.7z" fill="#1fa463" stroke="none"/><path d="M5.4 21.1h13.2l3-5.2H8.4z" fill="#4285f4" stroke="none"/></symbol>
+<symbol id="u-link" viewBox="0 0 24 24"><path d="M10 14a4 4 0 005.7 0l3-3a4 4 0 00-5.7-5.7l-1 1"/><path d="M14 10a4 4 0 00-5.7 0l-3 3A4 4 0 0011 18.7l1-1"/></symbol>
+<symbol id="u-lock" viewBox="0 0 24 24"><rect x="5" y="10.5" width="14" height="10" rx="2.5"/><path d="M8.5 10.5V8a3.5 3.5 0 017 0v2.5"/></symbol>
+<symbol id="u-shield" viewBox="0 0 24 24"><path d="M12 3l7.5 2.8v5.6c0 4.6-3.1 8.2-7.5 9.6-4.4-1.4-7.5-5-7.5-9.6V5.8z"/><path d="M8.8 12.2l2.3 2.3 4.2-4.6"/></symbol>
+<symbol id="u-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></symbol>
+<symbol id="u-download" viewBox="0 0 24 24"><path d="M12 4v10.5M7.8 10.6L12 14.8l4.2-4.2"/><path d="M5 19.5h14"/></symbol>
+<symbol id="u-rows" viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="15" rx="3"/><path d="M3.5 10h17M3.5 15h17M9.5 10v9.5"/></symbol>
+<symbol id="u-cal" viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="15.5" rx="3.5"/><path d="M8 3v4M16 3v4M3.5 10h17"/></symbol>
+<symbol id="u-file" viewBox="0 0 24 24"><path d="M7 3.5h6.5L19 9v10a1.5 1.5 0 01-1.5 1.5h-10A1.5 1.5 0 016 19V5A1.5 1.5 0 017 3.5z"/><path d="M13.5 3.5V9H19M9 13.5h6M9 16.5h4"/></symbol>
+<symbol id="u-history" viewBox="0 0 24 24"><path d="M4 12a8 8 0 102.6-5.9L4 8.5"/><path d="M4 4v4.5h4.5M12 8v4.2l2.8 1.6"/></symbol>
+<symbol id="u-check" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M8.4 12.3l2.5 2.5 4.8-5.2"/></symbol>
+<symbol id="u-scan" viewBox="0 0 24 24"><path d="M4 8V6a2 2 0 012-2h2M16 4h2a2 2 0 012 2v2M20 16v2a2 2 0 01-2 2h-2M8 20H6a2 2 0 01-2-2v-2"/><path d="M7.5 12h9"/></symbol>
+<symbol id="u-folder" viewBox="0 0 24 24"><path d="M3.5 7.5a2 2 0 012-2h3.6l2 2.2h7.4a2 2 0 012 2V17.5a2 2 0 01-2 2h-13a2 2 0 01-2-2z"/></symbol>
+<symbol id="u-db" viewBox="0 0 24 24"><ellipse cx="12" cy="6" rx="7.5" ry="3"/><path d="M4.5 6v6c0 1.7 3.4 3 7.5 3s7.5-1.3 7.5-3V6M4.5 12v6c0 1.7 3.4 3 7.5 3s7.5-1.3 7.5-3v-6"/></symbol>
+<symbol id="u-key" viewBox="0 0 24 24"><circle cx="8" cy="15" r="3.8"/><path d="M10.8 12.3L19.5 3.5M16 7l2.5 2.5M13.5 9.5L15.5 11.5"/></symbol>
+</defs></svg>
 <header class="nav glass"><span class="brand"><span class="brand-mark"></span></span>{{ controls() }}</header>
 {% macro doc(ext, color, cls='', ext_id='', badge_id='') %}
 <svg class="doc-ic {{ cls }}" viewBox="0 0 64 80" aria-hidden="true">
@@ -4583,7 +4878,7 @@ UPLOAD_HTML = """<!doctype html>
   <filter id="filesShadow" x="-20%" y="-20%" width="140%" height="150%"><feDropShadow dx="0" dy="2.5" stdDeviation="2.5" flood-color="#0050c8" flood-opacity=".28"/></filter>
 </defs></svg>
 <main class="upload-wrap up2">
-  <div class="files-hero" aria-hidden="true">{{ files_icon() }}</div>
+  {% if view not in ('manage', 'review') %}<div class="files-hero" aria-hidden="true">{{ files_icon() }}</div>{% endif %}
   {% macro lockic() %}<svg class="lk-ic" viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="10.5" width="14" height="10" rx="2.5"/><path d="M8.5 10.5V8a3.5 3.5 0 017 0v2.5"/></svg>{% endmacro %}
   {% macro msgs() %}{% if error %}<div class="alert" role="alert">{{ error }}</div>{% endif %}{% if notice %}<div class="ok-note" role="status">{{ notice }}</div>{% endif %}{% endmacro %}
   {% macro back() %}{% if has_data %}<a class="up-back" href="/">‹ Back to dashboard</a>{% endif %}{% endmacro %}
@@ -4610,62 +4905,98 @@ UPLOAD_HTML = """<!doctype html>
 
   {% elif view == 'unlock' %}
   <h1 class="hero-title">Data & upload.</h1>
-  <p class="hero-sub">Press <b>Spacebar</b> once (default passcode) to unlock.</p>
+  <p class="hero-sub">Enter the admin passcode to replace or download the sales data.</p>
   <form class="upload-card glass" action="/upload/unlock" method="post" autocomplete="off">
     {{ msgs() }}
     {% if lock_left %}<div class="alert" role="alert">Too many wrong passcodes. Try again in {{ lock_left }} minute{{ '' if lock_left == 1 else 's' }}.</div>{% endif %}
     <label class="pin-field">Admin passcode<input type="password" name="code" autocomplete="current-password" required {{ 'disabled' if lock_left else 'autofocus' }}></label>
+    <label class="rw-ack remember"><input type="checkbox" name="remember" value="1"><span>Keep me unlocked on this device for {{ remember_days }} days</span></label>
     <button type="submit" class="btn-primary block" {{ 'disabled' if lock_left }}>{{ lockic() }}Unlock</button>
-    <p class="upload-note">Unlocks this browser for {{ unlock_min }} minutes. Viewing the dashboard never needs the passcode.</p>
+    <p class="upload-note">Otherwise this browser unlocks for {{ unlock_min }} minutes. Only tick the box on your own computer or phone. Viewing the dashboard never needs the passcode.</p>
   </form>
   {{ back() }}
 
   {% elif view == 'manage' %}
-  <h1 class="hero-title">Data & upload.</h1>
-  <div class="up-status"><span class="up-open">{{ lockic() }}Unlocked · locks after {{ minutes_left }} min without use</span>
-    <form action="/upload/lock" method="post"><button type="submit" class="up-lockbtn">Lock now</button></form></div>
+  <div class="hero-orb" aria-hidden="true"><i></i><i></i><span class="orb-core"><svg class="ui"><use href="#u-cloud"/></svg></span></div>
+  <h1 class="hero-title">Data &amp; upload.</h1>
+  <p class="hero-sub">Bring in a sales sheet from this device or a Google Drive folder. The file you confirm stays saved until you replace it.</p>
+  <div class="up-status up-rise"><span class="up-open"><svg class="ui"><use href="#u-shield"/></svg>{% if remembered %}Unlocked on this device{% else %}Unlocked · locks after {{ minutes_left }} min without use{% endif %}</span>
+    <form action="/upload/lock" method="post"><button type="submit" class="up-lockbtn"><svg class="ui"><use href="#u-lock"/></svg>Lock now</button></form></div>
   {{ msgs() }}
-  <ol class="up-steps" aria-label="Steps"><li class="on">Keep a copy</li><li class="on">Choose the sheet</li><li>Check &amp; confirm</li></ol>
+  <ol class="up-steps" aria-label="Steps" style="--p:0"><li class="on"><i><svg class="ui"><use href="#u-folder"/></svg></i>Choose source</li><li><i><svg class="ui"><use href="#u-scan"/></svg></i>Check</li><li><i><svg class="ui"><use href="#u-check"/></svg></i>Confirm</li></ol>
 
-  <section class="upload-card glass up-sec">
-    <h2>Loaded now</h2>
+  <section class="upload-card glass up-sec up-rise" style="--d:.06s">
+    <div class="sec-top"><span class="ui-tile" style="--c:#30b455"><svg class="ui"><use href="#u-db"/></svg></span><h2>Loaded now</h2>{% if current %}<span class="live-pill"><b></b>Saved</span>{% endif %}</div>
     {% if current %}
-    <p class="up-text"><b>{{ current.range or 'Sales data' }}</b><br>{{ '{:,}'.format(current.rows) }} rows{% if current.updated %} · uploaded {{ current.updated }}{% endif %}</p>
-    <div class="rw-links"><a class="rw-dl" href="/download/current">Download current data (CSV)</a>
-      {% if current.backup %}<a class="rw-dl ghost" href="/download/previous">Previous upload (CSV)</a>{% endif %}</div>
+    <div class="stat-grid">
+      <div class="stat"><span class="stat-ic" style="--c:#0a84ff"><svg class="ui"><use href="#u-cal"/></svg></span><small>Dates</small><b>{{ current.range or 'Sales data' }}</b></div>
+      <div class="stat"><span class="stat-ic" style="--c:#af52de"><svg class="ui"><use href="#u-rows"/></svg></span><small>Rows</small><b>{{ '{:,}'.format(current.rows) }}</b></div>
+      <div class="stat"><span class="stat-ic" style="--c:#ff9500"><svg class="ui"><use href="#u-clock"/></svg></span><small>Uploaded</small><b>{{ current.updated or '–' }}</b></div>
+      <div class="stat"><span class="stat-ic" style="--c:#34c759"><svg class="ui"><use href="#{{ 'u-driveglyph' if src_info and src_info.via == 'Google Drive' else 'u-laptop' }}"/></svg></span><small>Came from</small><b>{{ (src_info.via[:1]|upper ~ src_info.via[1:]) if src_info else 'Earlier upload' }}</b></div>
+    </div>
+    {% if src_info %}<p class="up-file"><svg class="ui"><use href="#u-file"/></svg><span><b>{{ src_info.name }}</b> · {{ src_info.size }} · saved {{ src_info.saved }}</span></p>{% endif %}
+    <div class="rw-links">
+      {% if src_info %}<a class="rw-dl" href="/download/original"><svg class="ui"><use href="#u-download"/></svg>Original file</a>{% endif %}
+      <a class="rw-dl {{ 'ghost' if src_info }}" href="/download/current"><svg class="ui"><use href="#u-download"/></svg>Data (CSV)</a>
+      {% if current.backup %}<a class="rw-dl ghost" href="/download/previous"><svg class="ui"><use href="#u-history"/></svg>Previous (CSV)</a>{% endif %}</div>
     {% if current.backup %}
     <form action="/upload/restore" method="post" class="up-restore" data-confirm="Switch back to the previous upload? The data loaded now becomes the backup, so you can switch again.">
       <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="confirm" value="1">
-      <button type="submit" class="up-link">Restore the previous upload</button>
+      <button type="submit" class="up-link"><svg class="ui"><use href="#u-history"/></svg>Restore the previous upload</button>
     </form>{% endif %}
-    {% else %}<p class="up-text">No sales data is loaded yet.</p>{% endif %}
+    {% else %}<p class="up-text">No sales data is loaded yet. Pick a source below.</p>{% endif %}
   </section>
 
-  <form class="upload-card glass up-sec" action="/upload/check" method="post" enctype="multipart/form-data" id="uploadForm">
-    <h2>New sheet</h2>
-    <input type="hidden" name="csrf" value="{{ csrf }}">
-    <label class="dropzone" id="dropzone" for="file">
-      <span class="dz-doc" id="dzDoc">{{ files_icon('dz-files') }}{{ doc('FILE', '#8e8e93', 'dz-file', 'dzExt', 'dzBadge') }}</span>
-      <span class="dz-text">
-        <span class="dz-title" id="dzTitle">Drop the raw sales sheet here</span>
-        <span class="dz-sub" id="dzSub">Excel or CSV · up to 128 MB</span>
-      </span>
-      <span class="dz-browse" id="dzBrowse">Browse</span>
-    </label>
-    <input id="file" class="sr-only" type="file" name="file" accept=".xlsx,.xls,.csv" required>
-    <button type="submit" class="btn-primary block" id="launchBtn" disabled>Check this sheet</button>
-    <p class="upload-note">Nothing changes yet: the next step shows what is in the sheet and what would change. It needs <b>Date</b> and <b>Tentative DP</b> columns, and works best with <b>Family Name</b>, <b>Segment</b> and <b>Channel Name</b>.</p>
-  </form>
+  <section class="upload-card glass up-sec up-rise src-card" style="--d:.12s" id="srcCard">
+    <div class="sec-top"><span class="ui-tile" style="--c:#0a84ff"><svg class="ui"><use href="#u-cloud"/></svg></span><h2>New sheet</h2></div>
+    <div class="src-tabs" role="tablist" aria-label="Where the sheet comes from">
+      <input type="radio" name="srcTab" id="tabDevice" checked><label for="tabDevice" role="tab"><svg class="ui"><use href="#u-laptop"/></svg>From this device</label>
+      <input type="radio" name="srcTab" id="tabDrive"><label for="tabDrive" role="tab"><svg class="ui"><use href="#u-driveglyph"/></svg>From Google Drive</label>
+      <span class="src-thumb" aria-hidden="true"></span>
+    </div>
+    <div class="src-panels">
+      <form class="src-panel" id="panelDevice" action="/upload/check" method="post" enctype="multipart/form-data">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <label class="dropzone" id="dropzone" for="file">
+          <span class="dz-ring" aria-hidden="true"></span>
+          <span class="dz-doc" id="dzDoc"><svg class="dz-up" viewBox="0 0 24 24" aria-hidden="true"><use href="#u-cloud"/></svg>{{ doc('FILE', '#8e8e93', 'dz-file', 'dzExt', 'dzBadge') }}</span>
+          <span class="dz-text">
+            <span class="dz-title" id="dzTitle">Drop the raw sales sheet here</span>
+            <span class="dz-sub" id="dzSub">Excel or CSV · up to 128 MB</span>
+          </span>
+          <span class="dz-browse" id="dzBrowse">Browse</span>
+        </label>
+        <input id="file" class="sr-only" type="file" name="file" accept=".xlsx,.xls,.csv" required>
+        <button type="submit" class="btn-primary block" id="launchBtn" disabled><svg class="ui"><use href="#u-scan"/></svg><span>Check this sheet</span></button>
+      </form>
+      <form class="src-panel" id="panelDrive" action="/upload/drive" method="post">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <div class="drive-box">
+          <span class="drive-ic" aria-hidden="true"><svg class="ui"><use href="#u-driveglyph"/></svg></span>
+          <span class="dz-text">
+            <span class="dz-title">Pull from a Drive folder</span>
+            <span class="dz-sub">The newest .xlsx / .csv in the folder is used</span>
+          </span>
+        </div>
+        <label class="link-field"><svg class="ui"><use href="#u-link"/></svg>
+          <input type="url" name="link" id="driveLink" value="{{ drive_link }}" placeholder="https://drive.google.com/drive/folders/…" autocomplete="off" spellcheck="false" inputmode="url" required></label>
+        <button type="submit" class="btn-primary block" id="driveBtn"><svg class="ui"><use href="#u-driveglyph"/></svg><span>Pull the newest sheet</span></button>
+        <p class="upload-note">Share the folder as <b>Anyone with the link · Viewer</b>. A single file or Google Sheet link works too.</p>
+      </form>
+    </div>
+    <p class="upload-note src-note">Nothing changes yet: the next step shows what is in the sheet and what would change. It needs <b>Date</b> and <b>Tentative DP</b> columns, and works best with <b>Family Name</b>, <b>Segment</b> and <b>Channel Name</b>.</p>
+    <div class="busy-veil" id="busyVeil" aria-live="polite" hidden><span class="busy-ring"></span><b id="busyText">Reading your sheet…</b><small>This can take a moment for large files.</small></div>
+  </section>
 
   {% if log %}
-  <section class="upload-card glass up-sec">
-    <h2>Recent activity</h2>
+  <section class="upload-card glass up-sec up-rise" style="--d:.18s">
+    <div class="sec-top"><span class="ui-tile" style="--c:#8e8e93"><svg class="ui"><use href="#u-history"/></svg></span><h2>Recent activity</h2></div>
     <ul class="up-log">{% for e in log %}<li><b>{{ e.action|capitalize }}</b>{% if e.detail %} · {{ e.detail }}{% endif %}<small>{{ e.t }} · {{ e.ip }}</small></li>{% endfor %}</ul>
   </section>
   {% endif %}
 
-  <details class="upload-card glass up-sec up-pass">
-    <summary><h2>Change passcode</h2></summary>
+  <details class="upload-card glass up-sec up-pass up-rise" style="--d:.24s">
+    <summary><span class="sec-top"><span class="ui-tile" style="--c:#ff9500"><svg class="ui"><use href="#u-key"/></svg></span><h2>Change passcode</h2></span></summary>
     {% if env_pin %}<p class="up-text">The passcode now comes from the server's UPLOAD_PIN setting. Set one here to replace it.</p>{% elif pass_set %}<p class="up-text">Set {{ pass_set }}.</p>{% endif %}
     <form action="/upload/passcode" method="post" autocomplete="off" class="up-passform">
       <input type="hidden" name="csrf" value="{{ csrf }}">
@@ -4673,20 +5004,21 @@ UPLOAD_HTML = """<!doctype html>
       <label class="pin-field">New passcode<input type="password" name="code" minlength="{{ min_len }}" autocomplete="new-password" required></label>
       <label class="pin-field">Type it again<input type="password" name="again" minlength="{{ min_len }}" autocomplete="new-password" required></label>
       <button type="submit" class="btn-primary block">Change passcode</button>
-      <p class="upload-note">Every other browser that is unlocked gets locked.</p>
+      <p class="upload-note">The passcode is saved on the server and stays the same until you change it here. Every other unlocked browser gets locked.</p>
     </form>
   </details>
   {{ back() }}
 
   {% elif view == 'review' %}
+  <div class="hero-orb sm" aria-hidden="true"><i></i><i></i><span class="orb-core"><svg class="ui"><use href="#u-scan"/></svg></span></div>
   <h1 class="hero-title">Check before replacing.</h1>
-  <div class="up-status"><span class="up-open">{{ lockic() }}Unlocked · locks after {{ minutes_left }} min without use</span>
+  <div class="up-status"><span class="up-open">{{ lockic() }}{% if remembered %}Unlocked on this device{% else %}Unlocked · locks after {{ minutes_left }} min without use{% endif %}</span>
     <form action="/upload/lock" method="post"><button type="submit" class="up-lockbtn">Lock now</button></form></div>
   {{ msgs() }}
-  <ol class="up-steps" aria-label="Steps"><li class="on">Keep a copy</li><li class="on">Choose the sheet</li><li class="on">Check &amp; confirm</li></ol>
+  <ol class="up-steps" aria-label="Steps" style="--p:100"><li class="on"><i><svg class="ui"><use href="#u-folder"/></svg></i>Choose source</li><li class="on"><i><svg class="ui"><use href="#u-scan"/></svg></i>Check</li><li class="on"><i><svg class="ui"><use href="#u-check"/></svg></i>Confirm</li></ol>
   <section class="upload-card glass up-sec">
     <h2>{{ review.name }}</h2>
-    <p class="up-text up-fileinfo">{{ review.size }} · fingerprint {{ review.sha }}</p>
+    <p class="up-text up-fileinfo">{% if review.via %}From {{ review.via }} · {% endif %}{{ review.size }} · fingerprint {{ review.sha }}</p>
     <div class="up-table-wrap"><table class="up-cmp">
       <thead><tr><th></th>{% if review.cur %}<th>Loaded now</th>{% endif %}<th>This sheet</th></tr></thead>
       <tbody>
@@ -5257,6 +5589,110 @@ APP_CSS += r"""
 .upload-card .btn-primary .lk-ic{width:16px;height:16px}
 """
 
+APP_CSS += r"""
+/* data & upload: redesign (icons, tabs, motion) */
+.ui{width:18px;height:18px;flex:none;fill:none;stroke:currentColor;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round}
+.up2{--d:0s}
+.up-rise{animation:upRise .7s var(--ease) both;animation-delay:var(--d,0s)}
+@keyframes upRise{from{opacity:0;transform:translateY(22px) scale(.985)}to{opacity:1;transform:none}}
+.hero-orb{position:relative;width:96px;height:96px;margin:10px auto 22px;display:grid;place-items:center}
+.hero-orb.sm{width:72px;height:72px;margin-bottom:18px}
+.hero-orb i{position:absolute;inset:0;border-radius:50%;border:1.5px solid color-mix(in srgb,var(--blue) 45%,transparent);animation:orbPulse 3.2s var(--ease) infinite}
+.hero-orb i:nth-child(2){animation-delay:1.6s}
+@keyframes orbPulse{0%{transform:scale(.62);opacity:.9}100%{transform:scale(1.55);opacity:0}}
+.orb-core{position:relative;width:68%;height:68%;display:grid;place-items:center;border-radius:28%;color:#fff;
+  background:linear-gradient(145deg,#64d2ff,#0a84ff 55%,#5e5ce6);box-shadow:inset 0 1px 1px rgba(255,255,255,.55),0 10px 28px rgba(10,132,255,.45);animation:orbFloat 4.5s ease-in-out infinite}
+.orb-core .ui{width:52%;height:52%;stroke-width:1.7}
+@keyframes orbFloat{50%{transform:translateY(-5px) rotate(-3deg)}}
+.up2 .hero-sub{max-width:460px;margin-left:auto;margin-right:auto}
+.up-status .up-open .ui,.up-lockbtn .ui,.up-link .ui{width:16px;height:16px}
+.up-lockbtn,.up-link{display:inline-flex;align-items:center;gap:6px}
+/* stepper with a line that fills */
+.up-steps{position:relative;gap:8px}
+.up-steps li{position:relative;z-index:1;transition:background .4s var(--ease),color .3s,transform .4s var(--spring)}
+.up-steps li::before{content:none}
+.up-steps li i{display:grid;place-items:center;width:24px;height:24px;flex:none;border-radius:50%;background:var(--fill);color:var(--label-3);transition:background .4s,color .3s,transform .5s var(--spring)}
+.up-steps li i .ui{width:14px;height:14px}
+.up-steps li.on{background:var(--blue-tint)}
+.up-steps li.on i{background:linear-gradient(145deg,#4aa8ff,#0a84ff);color:#fff;transform:scale(1.06);box-shadow:0 3px 9px rgba(10,132,255,.4)}
+.up-steps::after{content:"";position:absolute;left:12%;right:12%;bottom:-7px;height:3px;border-radius:2px;background:var(--fill);transform-origin:left}
+.up-steps::before{content:"";position:absolute;left:12%;bottom:-7px;height:3px;width:calc(var(--p,0) * .76%);min-width:6%;border-radius:2px;z-index:1;background:linear-gradient(90deg,#64d2ff,#0a84ff);transition:width .9s var(--ease)}
+.up2 .up-steps{margin-bottom:14px}
+/* section headers with icon tiles */
+.sec-top{display:flex;align-items:center;gap:12px}
+.sec-top h2{flex:1;min-width:0}
+.ui-tile,.stat-ic{display:grid;place-items:center;flex:none;color:#fff;background:linear-gradient(160deg,color-mix(in srgb,var(--c) 72%,#fff),var(--c));box-shadow:0 4px 12px color-mix(in srgb,var(--c) 38%,transparent),inset 0 1px 0 rgba(255,255,255,.4)}
+.ui-tile{width:36px;height:36px;border-radius:11px;transition:transform .5s var(--spring)}
+.ui-tile .ui{width:20px;height:20px}
+.upload-card:hover > .sec-top .ui-tile,.up-pass:hover summary .ui-tile{transform:rotate(-6deg) scale(1.07)}
+.live-pill{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:600;color:var(--pos);background:color-mix(in srgb,var(--green) 14%,transparent)}
+.live-pill b{width:7px;height:7px;border-radius:50%;background:var(--green);animation:livePulse 1.8s ease-in-out infinite}
+@keyframes livePulse{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--green) 55%,transparent)}100%{box-shadow:0 0 0 8px transparent}}
+.stat-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.stat{display:grid;grid-template-columns:auto minmax(0,1fr);grid-template-rows:auto auto;column-gap:10px;align-items:center;padding:12px;border-radius:16px;background:var(--fill-2);transition:transform .4s var(--spring),background .2s}
+.stat:hover{transform:translateY(-2px);background:var(--fill)}
+.stat-ic{grid-row:1 / 3;width:34px;height:34px;border-radius:10px}
+.stat small{font-size:11.5px;font-weight:600;letter-spacing:.03em;text-transform:uppercase;color:var(--label-3)}
+.stat b{font-size:14px;font-weight:600;color:var(--label);overflow-wrap:anywhere;line-height:1.25}
+.up-file{display:flex;align-items:center;gap:8px;margin:0;font-size:13px;color:var(--label-2);overflow-wrap:anywhere}
+.up-file .ui{width:17px;height:17px;color:var(--blue)}
+.up-file b{color:var(--label)}
+.rw-dl{gap:7px}
+.rw-dl .ui{width:16px;height:16px}
+/* source tabs: a thumb that slides */
+.src-card{position:relative;overflow:hidden}
+.src-tabs{--i:0;position:relative;display:grid;grid-template-columns:1fr 1fr;padding:4px;border-radius:16px;background:var(--fill);isolation:isolate}
+.src-tabs:has(#tabDrive:checked){--i:1}
+.src-tabs input{position:absolute;opacity:0;pointer-events:none}
+.src-tabs label{display:flex;align-items:center;justify-content:center;gap:8px;height:42px;padding:0 10px;border-radius:12px;font-size:14px;font-weight:600;color:var(--label-3);cursor:pointer;white-space:nowrap;transition:color .3s}
+.src-tabs input:checked + label{color:var(--label)}
+.src-tabs input:focus-visible + label{outline:3px solid color-mix(in srgb,var(--blue) 50%,transparent)}
+.src-tabs label .ui{transition:transform .5s var(--spring)}
+.src-tabs input:checked + label .ui{transform:scale(1.15) rotate(-6deg)}
+.src-thumb{position:absolute;z-index:-1;top:4px;bottom:4px;left:4px;width:calc(50% - 4px);border-radius:12px;background:var(--seg-thumb);box-shadow:0 3px 10px rgba(0,0,0,.14),0 1px 1px rgba(0,0,0,.08),inset 0 .5px 0 var(--spec);transform:translateX(calc(var(--i) * 100%));transition:transform .55s var(--ease)}
+.src-panels{display:grid}
+.src-panel{grid-area:1 / 1;display:grid;gap:14px;align-content:start;transition:opacity .35s,transform .55s var(--ease),visibility 0s}
+.src-card:has(#tabDevice:checked) #panelDrive{opacity:0;visibility:hidden;pointer-events:none;transform:translateX(34px);max-height:0;overflow:hidden;transition:opacity .25s,transform .45s var(--ease),visibility 0s .45s,max-height 0s .45s}
+.src-card:has(#tabDrive:checked) #panelDevice{opacity:0;visibility:hidden;pointer-events:none;transform:translateX(-34px);max-height:0;overflow:hidden;transition:opacity .25s,transform .45s var(--ease),visibility 0s .45s,max-height 0s .45s}
+.src-note{margin-top:0}
+/* the drop zone, livelier */
+.dropzone{position:relative;overflow:hidden;transition:transform .45s var(--spring),border-color .25s,background .3s}
+.dropzone::before{content:"";position:absolute;inset:0;background:linear-gradient(110deg,transparent 30%,color-mix(in srgb,var(--blue) 14%,transparent) 50%,transparent 70%);transform:translateX(-100%);pointer-events:none}
+.dropzone:hover::before,.dropzone.drag::before{animation:dzSheen 1.4s var(--ease) infinite}
+@keyframes dzSheen{to{transform:translateX(100%)}}
+.dz-ring{position:absolute;left:18px;top:50%;width:64px;height:64px;margin-top:-32px;border-radius:50%;border:1.5px solid var(--blue);opacity:0;pointer-events:none}
+.dropzone.drag .dz-ring{animation:orbPulse 1.4s var(--ease) infinite}
+.dz-doc{position:relative;display:grid;place-items:center;width:56px;height:60px}
+.dz-doc .dz-files,.dz-doc .dz-file{grid-area:1 / 1}
+.dz-doc .dz-up{grid-area:1 / 1;width:46px;height:46px;padding:10px;border-radius:15px;fill:none;stroke:#fff;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;background:linear-gradient(145deg,#64d2ff,#0a84ff 60%,#5e5ce6);box-shadow:0 6px 16px rgba(10,132,255,.4);animation:dzBob 2.6s ease-in-out infinite}
+@keyframes dzBob{50%{transform:translateY(-4px)}}
+.dz-doc .dz-files{display:none}
+.dropzone.has-file .dz-doc .dz-up{display:none}
+.dropzone.drag .dz-up{animation-duration:.8s}
+.btn-primary .ui{width:18px;height:18px}
+.btn-primary.block{display:flex;align-items:center;justify-content:center;gap:8px}
+.btn-primary:not(:disabled){animation:btnIn .5s var(--spring)}
+@keyframes btnIn{from{transform:scale(.96)}to{transform:none}}
+.drive-box{display:flex;align-items:center;gap:16px;padding:18px 20px;border-radius:22px;background:var(--fill-2);border:1.5px dashed var(--hairline-strong)}
+.drive-ic{display:grid;place-items:center;width:56px;height:56px;flex:none;border-radius:16px;background:var(--surface-solid);box-shadow:0 0 0 .5px var(--hairline),0 6px 16px rgba(0,0,0,.1);animation:dzBob 3s ease-in-out infinite}
+.drive-ic .ui{width:30px;height:30px}
+.link-field{display:flex;align-items:center;gap:10px;height:48px;padding:0 14px;border-radius:14px;background:var(--fill);color:var(--label-3);transition:box-shadow .25s,background .25s}
+.link-field:focus-within{background:var(--surface-solid);color:var(--blue);box-shadow:0 0 0 2px var(--blue)}
+.link-field input{flex:1;min-width:0;height:100%;border:0;background:none;outline:none;font-size:15px;color:var(--label)}
+/* working state */
+.busy-veil{position:absolute;inset:0;z-index:5;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;text-align:center;border-radius:inherit;
+  background:color-mix(in srgb,var(--surface-solid) 86%,transparent);-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);animation:fadeIn .3s}
+.busy-veil b{font-size:16px;color:var(--label)}
+.busy-veil small{font-size:12.5px;color:var(--label-3)}
+.busy-ring{width:46px;height:46px;border-radius:50%;border:4px solid var(--fill);border-top-color:var(--blue);border-right-color:#5e5ce6;animation:spin .9s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.up-pass summary .sec-top{flex:1}
+.rw-ack.remember{font-weight:500;font-size:13.5px;color:var(--label-2)}
+.up-restore{display:flex}
+@media (max-width:520px){.stat-grid{grid-template-columns:1fr}.src-tabs label{font-size:13px;gap:6px}.up-steps li{font-size:11.5px;padding:8px 6px;gap:5px}.up-steps li i{width:20px;height:20px}}
+@media (prefers-reduced-motion:reduce){.up-rise,.hero-orb i,.orb-core,.dz-up,.drive-ic,.live-pill b,.dropzone::before,.busy-ring{animation:none!important}.src-thumb,.src-panel{transition:none!important}}
+"""
+
 APP_JS = r"""
 (() => {
 'use strict';
@@ -5329,11 +5765,23 @@ if (dz) {
   ['dragenter', 'dragover'].forEach(ev => dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.add('drag'); }));
   ['dragleave', 'drop'].forEach(ev => dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.remove('drag'); }));
   dz.addEventListener('drop', e => { if (e.dataTransfer.files.length) { input.files = e.dataTransfer.files; sync(); } });
-  $('#uploadForm').addEventListener('submit', e => {
+  $('#panelDevice').addEventListener('submit', e => {
     if (ack && !ack.checked) { e.preventDefault(); ack.focus(); return; }
-    btn.classList.add('busy'); btn.textContent = 'Checking…';
+    btn.classList.add('busy'); (btn.querySelector('span') || btn).textContent = 'Checking…';
+    showVeil('Reading your sheet…');
   });
 }
+function showVeil(text){
+  const v = $('#busyVeil'); if (!v) return;
+  $('#busyText').textContent = text; v.hidden = false;
+}
+const pd = $('#panelDrive');
+if (pd) pd.addEventListener('submit', () => {
+  const b = $('#driveBtn'); b.classList.add('busy'); b.querySelector('span').textContent = 'Pulling…';
+  showVeil('Pulling the newest sheet from Google Drive…');
+});
+/* coming back with an error after a Drive pull: reopen the Drive tab */
+if ($('#tabDrive') && /Google Drive/.test(($('.alert') || {}).textContent || '')) $('#tabDrive').checked = true;
 /* data & upload: the replace button waits for the tick and the typed word; confirm before a restore */
 const cf = $('#commitForm');
 if (cf) {
@@ -6213,7 +6661,7 @@ function renderPeriods(){
   const pf = $('#pFollow');
   if (pf) { pf.hidden = !pdata.follow; pf.innerHTML = pdata.follow ? `Follows the top: <b>${esc(pdata.follow)}</b> · <b>${isV() ? 'Value' : 'Units'}</b> · <b>${esc(PBASE_HEAD[want])}</b>${st.sel.length ? ' · <b>' + esc(st.sel.length === 1 ? st.sel[0] : st.sel.length + ' stores') + '</b>' : ''}` : ''; }
   el.innerHTML = `<thead><tr><th>Period</th><th>${isV() ? 'Value' : 'Units'}</th><th>${isV() ? 'Units' : 'Value'}</th><th>ASP</th>${keys.map(k => `<th class="${k === want ? 'on-base' : ''}">${PBASE_HEAD[k] || k}</th>`).join('')}</tr></thead>
-    <tbody>${shown.map(r => `<tr><td>${esc(r.label)}<small>${esc(r.range)}${r.partial ? ' · to date' : ''}</small><div class="pbar"><i style="width:${mv(r) / max * 100}%"></i></div></td>
+    <tbody>${shown.map(r => `<tr class="${window.APDAY ? APDAY.cls(r.tag) : ''}"><td>${esc(r.label)}${window.APDAY ? APDAY.chips(r.tag) : ''}<small>${esc(r.range)}${r.partial ? ' · to date' : ''}</small><div class="pbar"><i style="width:${mv(r) / max * 100}%"></i></div></td>
       <td><b>${isV() ? compact(r.v) : full(r.q)}</b></td><td>${isV() ? full(r.q) : compact(r.v)}</td><td>${r.q ? compact(r.v / r.q) : '–'}</td>
       ${ordered(r).map(b => { const bv = isV() ? b.v : b.q; return `<td class="${b.key === want ? 'on-base' : ''}"><div class="bc"><small>${esc(b.code)} · ${esc(b.range)}</small><span class="row2">${bv ? fmtM(bv) : '–'} ${chip(mv(r), bv)}</span></div></td>`; }).join('')}</tr>`).join('') || `<tr><td colspan="${4 + keys.length}">No sales in this period.</td></tr>`}</tbody>
     ${rows.length > LIMIT && !open ? `<tfoot><tr><td colspan="${4 + keys.length}"><button type="button" class="more" data-more="${key}">Show More (${rows.length - LIMIT})</button></td></tr></tfoot>` : ''}`;
@@ -7134,14 +7582,24 @@ main .card:not(.table-card):not(.list):not(.tiers){padding:14px 16px}
 .x-holder .cmp td:first-child{max-width:none!important}
 .x-holder .sec-head:first-child{margin-top:0}
 /* an image shows everything in full: no "…", no sideways-scrolling rows, no sticky columns */
-.x-holder td,.x-holder th,.x-holder .tb-name,.x-holder .rk-name,.x-holder .name,.x-holder .meta,.x-holder .mcard li span,.x-holder .kpi small,.x-holder .kpi b{max-width:none!important;overflow:visible!important;text-overflow:clip!important;line-height:1.5!important}
-.x-holder .sec-head{margin:32px 4px 14px!important}
-.x-holder .sec-head h2{line-height:1.35!important;font-size:20px!important}
-.x-holder .sec-head > .sub-note{margin-top:6px!important;line-height:1.4!important}
-.x-holder th,.x-holder td{padding:12px 16px!important;line-height:1.45!important}
+.x-holder td,.x-holder th,.x-holder .tb-name,.x-holder .rk-name,.x-holder .name,.x-holder .meta,.x-holder .mcard li span,.x-holder .kpi small,.x-holder .kpi b{max-width:none!important;overflow:visible!important;text-overflow:clip!important}
 .x-holder .chips{flex-wrap:wrap!important;overflow:visible!important;mask-image:none!important;-webkit-mask-image:none!important}
 .x-holder .grp-lab{position:static!important}
 .x-holder .popover,.x-holder .pop,.x-holder .ctx,.x-holder [role=menu]{display:none!important}   /* menus never go into a picture */
+/* text that used to overlap or get cut in pictures */
+.x-holder svg{overflow:visible!important}                                  /* chart axis labels sit outside the plot box */
+.x-holder .ch-box{padding:2px 12px 2px 30px!important;box-sizing:border-box}
+.x-holder .ch-box .hit,.x-holder svg .hit{display:none!important}           /* hover areas turned into solid black blocks */
+.x-holder .x-head{flex-wrap:wrap;align-items:flex-end;row-gap:6px}
+.x-holder .x-head > div:first-child{flex:1 1 320px;min-width:0}
+.x-holder .x-title{overflow-wrap:anywhere;line-height:1.18}
+.x-holder .x-sub,.x-holder .x-ctx{line-height:1.4;overflow-wrap:anywhere}
+.x-holder .x-stamp{flex:none;margin-left:auto}
+.x-holder td,.x-holder th{line-height:1.35;vertical-align:middle}
+.x-holder .pill,.x-holder .chip,.x-holder .badge,.x-holder .tag,.x-holder [class*="-pill"],.x-holder [class*="pill-"]{flex:none;white-space:nowrap;line-height:1.3}
+.x-holder .kpi,.x-holder .tile,.x-holder .mcard,.x-holder .card{min-width:0;line-height:1.3}
+.x-holder .kpi b,.x-holder .kpi small,.x-holder .tile b,.x-holder .tile small{display:block;line-height:1.3;white-space:normal;overflow-wrap:anywhere}
+.x-holder .lg,.x-holder .legend{flex-wrap:wrap!important;row-gap:6px;column-gap:14px}
 .x-holder [style*="position: sticky"],.x-holder .sticky{position:static!important}
 """
 
@@ -7154,13 +7612,6 @@ const css = `
 html,body{overflow-x:clip}
 .shell{display:flex;align-items:center;gap:8px}
 .bar-right{display:flex;align-items:center;gap:8px;justify-self:end;min-width:0}
-header.nav .nav-right{position:relative;display:flex;align-items:center;gap:8px;margin-left:auto}
-header.nav .bar-right{position:relative;isolation:isolate;display:flex;align-items:center;gap:4px;padding:3px}
-header.nav .pop-wrap{position:relative;display:inline-flex;align-items:center}
-header.nav .pop{right:0;left:auto;top:calc(100% + 10px);transform-origin:top right}
-header.nav .gp-seg button,header.nav .pop-back,header.nav .gp-btn,header.nav .hp-clear,header.nav .hp-done{border:0;background:none;padding:0;font:inherit;color:inherit;cursor:pointer}
-header.nav .gp-seg.ic button{height:60px;padding:6px;border-radius:11px}
-header.nav .gp-seg.ic button[aria-pressed=true]{background:var(--card,var(--surface-solid,#fff));color:var(--blue,#0a84ff);box-shadow:0 2px 6px rgba(0,0,0,.14)}
 .hbtn{height:36px;min-width:36px;border:0;padding:0 12px;border-radius:18px;display:inline-flex;align-items:center;justify-content:center;gap:6px;cursor:pointer;
   background:var(--fill);color:var(--label);font:inherit;font-size:13.5px;font-weight:600;white-space:nowrap;transition:background .2s,transform .3s cubic-bezier(.3,1.4,.5,1)}
 .hbtn:hover{background:color-mix(in srgb,var(--label) 14%,transparent)}
@@ -7231,7 +7682,16 @@ header.nav .gp-seg.ic button[aria-pressed=true]{background:var(--card,var(--surf
 .sp-search input{width:100%;height:36px;padding:0 12px 0 34px;border:0;border-radius:11px;background:var(--fill);color:var(--label);font:inherit;font-size:15px;
   background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%238e8e93' stroke-width='2.4' stroke-linecap='round'%3E%3Ccircle cx='11' cy='11' r='7'/%3E%3Cpath d='M20 20l-3.5-3.5'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:11px center;background-size:16px}
 .sp-search input:focus{outline:2px solid var(--blue,#0a84ff)}
-.sp-row{display:grid;grid-template-columns:34px 1fr;align-items:center;border-radius:11px;min-height:42px}
+.sp-row{display:grid;grid-template-columns:34px 1fr 34px;align-items:center;border-radius:11px;min-height:42px}
+.sp-row.sp-all{grid-template-columns:34px 1fr}
+.sp-fav{width:34px;height:42px;border:0;background:none;color:color-mix(in srgb,var(--label) 30%,transparent);font-size:17px;cursor:pointer;padding:0}
+.sp-fav[aria-pressed=true]{color:#ff9f0a}
+.sp-row:not(:hover) .sp-fav[aria-pressed=false]{opacity:.45}
+.sp-groups{display:flex;flex-wrap:wrap;gap:6px;margin:2px 6px 6px}
+.sp-groups button{height:28px;padding:0 10px;border:0;border-radius:14px;background:var(--fill);color:var(--label);font:inherit;font-size:12.5px;font-weight:600;cursor:pointer}
+.sp-groups button.fav{color:#b25d00;background:color-mix(in srgb,#ff9f0a 14%,transparent)}
+.sp-groups button.on{background:color-mix(in srgb,var(--blue,#0a84ff) 15%,transparent);color:var(--blue,#0a84ff)}
+.sp-groups small{opacity:.65;margin-left:3px}
 .sp-row:hover{background:var(--fill)}
 .sp-row[hidden]{display:none}
 .sp-ck{width:34px;height:42px;border:0;background:none;display:grid;place-items:center;cursor:pointer;padding:0}
@@ -7255,9 +7715,6 @@ header.nav .gp-seg.ic button[aria-pressed=true]{background:var(--card,var(--surf
 .sp-foot :disabled,.sp-foot .off{opacity:.4;pointer-events:none}
 /* settings + help */
 .gear-pop{width:290px;--pw:300px}
-header.nav .pop.gear-pop{display:flex;flex-direction:column;gap:8px;padding:14px;text-align:left}
-header.nav .gear-pop .gp-seg{display:grid;grid-template-columns:1fr 1fr;gap:6px;width:100%}
-header.nav .gear-pop .gp-seg button{height:36px;display:flex;align-items:center;justify-content:center;gap:6px;border-radius:8px;background:var(--fill);font-size:13px;font-weight:600}
 .gp-seg{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;padding:3px;border-radius:10px;background:var(--fill)}
 .gp-seg button{height:30px;border:0;border-radius:8px;background:none;color:var(--label);font:inherit;font-size:13px;font-weight:600;cursor:pointer}
 .gp-seg button[aria-pressed=true]{background:var(--card,var(--surface-solid,#fff));box-shadow:0 2px 6px rgba(0,0,0,.14)}
@@ -7268,11 +7725,11 @@ header.nav .gear-pop .gp-seg button{height:36px;display:flex;align-items:center;
 .gp-row b{font-weight:600;text-align:right}
 a.gp-row span:last-child{color:var(--label2,var(--label-3));font-size:16px}
 /* display and view choices as icon tiles */
-.gp-seg.ic{grid-template-columns:1fr 1fr;gap:5px;padding:4px;border-radius:14px}
-.gp-seg.ic button{height:60px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:5px;border-radius:11px;font-size:12px;color:var(--label2,var(--label-3))}
-.gp-seg.ic svg{width:22px;height:22px;fill:none;stroke:currentColor;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round}
-.gp-seg.ic button[aria-pressed=true]{color:var(--blue,#0a84ff)}
-.gp-seg.ic button[aria-pressed=true] span{color:var(--label)}
+.gp-seg.tiles{grid-template-columns:1fr 1fr;gap:5px;padding:4px;border-radius:14px}
+.gp-seg.tiles button{height:60px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:5px;border-radius:11px;font-size:12px;color:var(--label2,var(--label-3))}
+.gp-seg.tiles svg{width:22px;height:22px;fill:none;stroke:currentColor;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round}
+.gp-seg.tiles button[aria-pressed=true]{color:var(--blue,#0a84ff)}
+.gp-seg.tiles button[aria-pressed=true] span{color:var(--label)}
 /* sales data: one range, the update time, three counts */
 /* Settings → Sales data: one grouped list, label left, value right, hairlines between rows */
 .gl-list{border-radius:12px;background:var(--fill);overflow:hidden}
@@ -7608,10 +8065,11 @@ const TOOLS = [
     { href: '/spc', key: '/spc', title: 'SPC Performance', desc: 'Each SPC: share, growth, mix, products and targets', color: '#ff9500', icon: '<circle cx="9" cy="8" r="3.2"/><path d="M3.5 19a5.5 5.5 0 0111 0"/><path d="M16 11a2.6 2.6 0 100-5M20.5 19a4.5 4.5 0 00-4-4.5"/>' },
     { href: '/compare', key: '/compare', title: 'Comparison', desc: 'Stores, or one store\'s SPCs, side by side', color: '#5e5ce6', icon: '<path d="M4 9l1.5-5h13L20 9"/><path d="M4 9h16v2a2.7 2.7 0 01-5.3 0 2.7 2.7 0 01-5.4 0A2.7 2.7 0 014 11z"/><path d="M5.5 13.5V20h13v-6.5"/>' },
     { href: '/review', key: '/review', title: 'Review Meeting', desc: 'The month\'s key insights, takeaways and links', color: '#ff2d55', icon: '<rect x="5" y="4" width="14" height="17" rx="2.5"/><path d="M9 4.5h6v2.5H9zM8.5 11h7M8.5 15h5"/>' },
-    { href: '/zero', key: '/zero', title: 'Zero Sell-Out', desc: 'Models with no sales, by store or SPC', color: '#ff6482', icon: '<circle cx="12" cy="12" r="8"/><path d="M6.5 17.5l11-11"/>' } ] },
+    { href: '/zero', key: '/zero', title: 'Sell-Out Gap Analysis', desc: 'Models not selling, by store or SPC', color: '#ff6482', icon: '<circle cx="12" cy="12" r="8"/><path d="M6.5 17.5l11-11"/>' } ] },
   { group: 'Plan', items: [
     { href: '/targets', key: '/targets', title: 'Target vs Achievement', desc: 'Set SP targets, Ach%, balance, 90% and projection', color: '#34c759', icon: '<circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="4"/><circle cx="12" cy="12" r="1" fill="#fff"/>' },
     { href: '/campaigns', key: '/campaigns', title: 'Campaign Multipliers', desc: 'Count chosen models 2x (or any) for a drive', color: '#ff9f0a', icon: '<path d="M12 3l2.2 5.2L19.5 9l-4 3.7 1.2 5.6L12 15.6 7.3 18.3l1.2-5.6-4-3.7 5.3-.8z"/>' },
+    { href: '/prices', key: '/prices', title: 'Price & Offers', desc: 'Price lists, price changes and offers vs sales', color: '#1d8a5a', icon: '<path d="M3.5 12.5l8-8h8v8l-8 8z"/><circle cx="15.5" cy="8.5" r="1.6"/>' },
     { href: '/roster', key: '/roster', title: 'Duty Roster', desc: 'Weekly shifts and week-offs for SPCs', color: '#30b0c7', icon: '<rect x="3.5" y="5" width="17" height="15" rx="3"/><path d="M8 3v4M16 3v4M3.5 10h17M8 14h2M14 14h2M8 17h2"/>' } ] },
   { group: 'Daily', items: [
     { href: '/eod', key: '/eod', title: 'EOD Report', desc: 'Fill in today and send on WhatsApp', color: '#25d366', icon: '<path d="M12 3a9 9 0 00-7.8 13.5L3 21l4.6-1.2A9 9 0 1012 3z"/>' },
@@ -7665,10 +8123,11 @@ const HELP = {
   '/activation': ['Every sale with no Activation Date, oldest first.', 'Days pending count from the sale date to today.', 'Use Stores to see one store, or search for an SPC or model.'],
   '/ask': ['Ask in plain English: "top 5 SPCs last month", "Fold 8 units vs last month in Adyar".', 'Name the period, store, SPC, model or segment and I pick it up.', 'Selected stores in <b>Stores</b> are used when the question names none.'],
   '/review': ['Pick the store(s) and the month; the <b>Agenda</b> lists the most urgent point of each topic first.', 'Each topic has its numbers, takeaways and <b>Open data</b> links to the table behind it.'],
-  '/zero': ['Pick the period and, optionally, an <b>SPC name</b> to see the models they have not sold.', 'SPC coverage ranks the team by missed models.'],
+  '/zero': ['Pick the period and, optionally, an <b>SPC name</b> to see the models they have not sold.', 'SPC Range Coverage ranks the team by missed models.'],
   '/stock': ['Upload a stock statement (Excel or PDF) for the store; it is matched to sales by SKU or model name.', 'Change days of cover and lead time to see the suggested order.'],
   '/roster': ['Pick the store and week; <b>Generate</b> suggests shifts and week-offs on quiet days.', 'Tap a cell to change it, then <b>Save</b>.'],
   '/campaigns': ['Add a campaign: models, dates, stores and the units / value multipliers.', 'Every page counts those sales that many times while the campaign is on.'],
+  '/prices': ['Upload each new price list (Excel, CSV or PDF); it is kept by its date.', 'Price changes are set against units a day and ASP before and after.', 'Add offers model-wise or segment-wise in one place and see their effect.'],
 };
 const GENERAL_TIPS = ['<b>Explore</b> opens every page.', '<b>Stores</b> lets you search, pick one store or tick several to add them up or compare them.', 'The light in the top bar shows the connection: green online, yellow server offline, red no internet.', 'Quick settings (the sliders) turns <b>SP combined</b>, <b>Foldables grouped</b> (FF7…) and <b>S series grouped</b> (S26F…) on or off for every page.', 'Settings (gear) has the theme, layout and the dates your sales sheet covers.', 'The <b>light bulb</b> in the top bar opens this help on any page: ask it to explain the page or a section, how to do anything, or about your sales.', 'Every section heading has a <b>share</b> button: save it as an image, download Excel / CSV, or send it on WhatsApp.'];
 const HELP_STARTERS = {
@@ -7680,10 +8139,11 @@ const HELP_STARTERS = {
   '/eod': ['How do I fill in the EOD report?', 'How do I send the EOD report on WhatsApp?', 'What are MX, Store MTD and Care+ attach%?'],
   '/activation': ['What is Activations & Claims?', 'Which sales rows are counted?'],
   '/review': ['What is the Review Meeting page?'],
-  '/zero': ['How do I find models with zero sales?'],
+  '/zero': ['How do I find models that are not selling?'],
   '/stock': ['How do I upload stock and see what to re-order?'],
   '/roster': ['How do I make the weekly duty roster?'],
   '/campaigns': ['How do I apply a campaign multiplier?'],
+  '/prices': ['How do I see the effect of a price change or an offer?'],
 };
 
 /* ---------- build the top bar ---------- */
@@ -8014,7 +8474,7 @@ const GI = {
   desktop: '<svg viewBox="0 0 24 24"><rect x="2.5" y="4" width="19" height="12.5" rx="2"/><path d="M8.5 20.5h7M12 16.5v4"/></svg>',
   upload: '<svg viewBox="0 0 24 24"><path d="M12 15V4.5M7.5 9L12 4.5 16.5 9"/><path d="M4.5 15v3.5A1.5 1.5 0 006 20h12a1.5 1.5 0 001.5-1.5V15"/></svg>',
 };
-const seg = (id, attr, opts) => `<div class="gp-seg ic" id="${id}">${opts.map(([v, label, ic]) => `<button type="button" ${attr}="${v}">${ic}<span>${label}</span></button>`).join('')}</div>`;
+const seg = (id, attr, opts) => `<div class="gp-seg tiles" id="${id}">${opts.map(([v, label, ic]) => `<button type="button" ${attr}="${v}">${ic}<span>${label}</span></button>`).join('')}</div>`;
 gearPop.innerHTML = `<div class="pop-title">Settings</div>
   <div class="pop-cap">Display</div>${seg('themeChoice', 'data-theme-set', [['light', 'Light', GI.light], ['dark', 'Dark', GI.dark]])}
   <div class="pop-cap">View</div>${seg('viewChoice', 'data-view-set', [['phone', 'Phone', GI.phone], ['desktop', 'Desktop', GI.desktop]])}
@@ -8022,7 +8482,7 @@ gearPop.innerHTML = `<div class="pop-title">Settings</div>
   <a class="gp-up" href="/upload"><span class="gd-ic up">${GI.upload}</span><span class="gp-up-t">Data &amp; upload<small id="upState">Admin passcode needed</small></span><i>›</i></a>`;
 fetch('/api/upload/status', { cache: 'no-store' }).then(r => r.json()).then(d => {
   const el = document.getElementById('upState'); if (!el) return;
-  el.textContent = !d.protected ? 'Set an admin passcode first' : d.unlocked ? `Unlocked · ${Math.max(1, d.minutes)} min left` : 'Locked · admin passcode needed';
+  el.textContent = !d.protected ? 'Set an admin passcode first' : d.unlocked ? (d.remembered ? 'Unlocked on this device' : `Unlocked · ${Math.max(1, d.minutes)} min left`) : 'Locked · admin passcode needed';
   el.classList.toggle('open', !!d.unlocked);
 }).catch(() => {});
 /* '01 Jan 2025' + '26 Oct 2026' -> '1 Jan 2025 – 26 Oct 2026' (the year once when both are in the same year) */
@@ -8088,8 +8548,11 @@ const QUICK = [
   { k: 'sp', id: 'optSP', def: false, name: 'SP combined', desc: 'Flagship and Innovative shown together as SP' },
   { k: 'ff', id: 'optFF', def: true, name: 'Foldables grouped', desc: 'Fold and Flip of one number as one: FF8, FF7, FF6, FF5…' },
   { k: 'ss', id: null, def: true, name: 'S series grouped', desc: 'S26, S26+, S26 Ultra and S26 FE as S26F; the same for S25F, S24F, S23F…' },
+  { k: 'tab', id: null, def: true, name: 'Tab families', desc: 'Wi-Fi, 5G and LTE versions of a Tab as one: Tab S12, Tab S10 Lite (S12+ and Ultra stay separate)' },
+  { k: 'watch', id: null, def: true, name: 'Watch families', desc: 'Sizes and LTE / Bluetooth of a Watch as one: Watch9 (40mm, 44mm), Watch8 Classic' },
 ];
 const QUICK_KEYS = ['ov-state', 'ch-state', 'spc-state'];   // each page's saved state carries its own sp / ff
+const PAGE_Q = ['sp', 'ff'];   // the others (S series, Tab, Watch families) are read by the server from the cookie
 const cookieGet = k => { const m = document.cookie.match(new RegExp('(?:^|; )ap-' + k + '=([01])')); return m ? m[1] === '1' : null; };
 const cookieSet = (k, on) => { document.cookie = `ap-${k}=${on ? 1 : 0}; path=/; max-age=31536000; samesite=lax`; };
 const quickOn = q => { const c = cookieGet(q.k); return c == null ? q.def : c; };
@@ -8134,7 +8597,7 @@ QUICK.forEach(q => {
     c = typeof o[q.k] === 'boolean' ? o[q.k] : q.def;
     cookieSet(q.k, c);
   }
-  if (q.k !== 'ss') QUICK_KEYS.forEach(key => {
+  if (PAGE_Q.includes(q.k)) QUICK_KEYS.forEach(key => {
     let o = {}; try { o = JSON.parse(store.get(key) || '{}') || {}; } catch (e) {}
     if (o[q.k] !== c) { o[q.k] = c; store.set(key, JSON.stringify(o)); }
   });
@@ -8183,7 +8646,7 @@ if (hasQuick) {
       const on = e.target.checked;
       QUICK.forEach(q => {
         cookieSet(q.k, on);
-        if (q.k !== 'ss') QUICK_KEYS.forEach(key => { let o = {}; try { o = JSON.parse(store.get(key) || '{}') || {}; } catch (err) {} o[q.k] = on; store.set(key, JSON.stringify(o)); });
+        if (PAGE_Q.includes(q.k)) QUICK_KEYS.forEach(key => { let o = {}; try { o = JSON.parse(store.get(key) || '{}') || {}; } catch (err) {} o[q.k] = on; store.set(key, JSON.stringify(o)); });
       });
       paintQuick();
       const boxes = QUICK.map(q => q.id && document.getElementById(q.id)).filter(Boolean);
@@ -8194,7 +8657,7 @@ if (hasQuick) {
     const q = QUICK.find(x => x.k === k); if (!q) return;
     const on = e.target.checked;
     cookieSet(q.k, on);
-    if (q.k !== 'ss') QUICK_KEYS.forEach(key => {
+    if (PAGE_Q.includes(q.k)) QUICK_KEYS.forEach(key => {
       let o = {}; try { o = JSON.parse(store.get(key) || '{}') || {}; } catch (err) {}
       o[q.k] = on; store.set(key, JSON.stringify(o));
     });
@@ -8212,17 +8675,31 @@ if (hasQuick) {
 /* ---------- store picker: search, pick one, or tick several to add up / compare ---------- */
 const KEY = 'ap-stores';
 const readSel = () => { try { const v = JSON.parse(store.get(KEY) || 'null'); if (Array.isArray(v)) return v; } catch (e) {}
+  try { const f = JSON.parse(store.get('ap-fav') || '[]'); if (Array.isArray(f) && f.length) return f.slice(); } catch (e) {}
   try { const o = JSON.parse(store.get('ov-state') || '{}'); return o.store ? [o.store] : []; } catch (e) { return []; } };
 const SP = { stores: [], sel: readSel(), pending: null, multi: true, onChange: null, allLabel: 'All Stores' };
 function spLabel(sel){ return !sel.length ? SP.allLabel : sel.length === 1 ? sel[0] : sel.length + ' stores'; }
+/* favourite stores (starred, shown first) and store families (every store of one company, e.g. 'Ziptech Enterprises') */
+const FAV = 'ap-fav';
+const favs = () => { try { const v = JSON.parse(store.get(FAV) || '[]'); return Array.isArray(v) ? v : []; } catch (e) { return []; } };
+const familyOf = s => String(s).replace(/\s*[-–]?\s*\([^)]*\)\s*$/, '').replace(/\s+(?:pvt\.?|private)?\s*(?:ltd\.?|limited)\.?$/i, '').trim();
 function spRender(){
   if (!storeMenu) return;
   const pend = SP.pending || SP.sel, q = (storeMenu.querySelector('.sp-search input') || {}).value || '';
-  const row = s => `<div class="sp-row" data-store="${esc(s)}" style="display:flex;align-items:center;width:100%;padding:6px 10px;border-bottom:0.5px solid var(--sep)"><button type="button" class="sp-ck" aria-pressed="${pend.includes(s)}" aria-label="Tick ${esc(s)}" data-tick="${esc(s)}" style="margin-right:8px"><i></i></button><button type="button" class="sp-name" data-only="${esc(s)}" style="flex:1;text-align:left;background:none;border:0;font:inherit;cursor:pointer">${esc(s)}</button></div>`;
+  const fv = favs().filter(s => SP.stores.includes(s));
+  const row = s => `<div class="sp-row" data-store="${esc(s)}"><button type="button" class="sp-ck" aria-pressed="${pend.includes(s)}" aria-label="Tick ${esc(s)}" data-tick="${esc(s)}"><i></i></button><button type="button" class="sp-name" data-only="${esc(s)}">${esc(s)}</button>
+    <button type="button" class="sp-fav" data-fav="${esc(s)}" aria-pressed="${fv.includes(s)}" aria-label="${fv.includes(s) ? 'Remove from' : 'Add to'} favourites" title="${fv.includes(s) ? 'Favourite' : 'Mark as favourite'}">${fv.includes(s) ? '★' : '☆'}</button></div>`;
+  const fams = {}; SP.stores.forEach(s => { const f = familyOf(s); if (f && f !== s) (fams[f] = fams[f] || []).push(s); });
+  const famList = Object.entries(fams).filter(([, l]) => l.length > 1);
+  const same = l => l.length === pend.length && l.every(x => pend.includes(x));
+  const groups = SP.multi && (fv.length || famList.length > 0) ? `<div class="sp-groups" role="group" aria-label="Favourites and store families">
+      ${fv.length ? `<button type="button" class="fav${same(fv) ? ' on' : ''}" data-group="${esc(JSON.stringify(fv))}">★ Favourites<small>${fv.length}</small></button>` : ''}
+      ${famList.map(([f, l]) => `<button type="button" class="${same(l) ? 'on' : ''}" data-group="${esc(JSON.stringify(l))}" title="${esc(l.join(', '))}">${esc(f)}<small>${l.length}</small></button>`).join('')}</div>` : '';
+  const ordered = fv.concat(SP.stores.filter(s => !fv.includes(s)));
   storeMenu.classList.toggle('sp-single', !SP.multi);
-  storeMenu.innerHTML = `<div class="sp-search"><input type="search" placeholder="Search ${SP.stores.length} store${SP.stores.length === 1 ? '' : 's'}…" aria-label="Search stores" value="${esc(q)}"></div>`
-    + (SP.noAll ? `<div class="sp-cap">${esc(SP.note || 'Pick a store')}</div>` : `<div class="sp-row sp-all"><button type="button" class="sp-ck" aria-pressed="${!pend.length}" data-only="" aria-label="All stores"><i></i></button><button type="button" class="sp-name" data-only="">${esc(SP.allLabel)}</button></div><div class="sp-hr"></div>`)
-    + SP.stores.map(row).join('') + '<div class="sp-empty" id="spEmpty" hidden>No store matches.</div>'
+  storeMenu.innerHTML = (SP.stores.length > 3 ? `<div class="sp-search"><input type="search" placeholder="Search ${SP.stores.length} stores" aria-label="Search stores" value="${esc(q)}"></div>` : '')
+    + (SP.noAll ? `<div class="sp-cap">${esc(SP.note || 'Pick a store')}</div>` : `<div class="sp-row sp-all"><button type="button" class="sp-ck" aria-pressed="${!pend.length}" data-only="" aria-label="All stores"><i></i></button><button type="button" class="sp-name" data-only="">${esc(SP.allLabel)}</button></div>${groups}<div class="sp-hr"></div>`)
+    + ordered.map(row).join('') + '<div class="sp-empty" id="spEmpty" hidden>No store matches.</div>'
     + (SP.multi ? `<div class="sp-foot">${pend.length || q ? `<button type="button" class="sp-clear" title="Untick every store">Clear</button>` : ''}<span>${pend.length > 1 ? pend.length + ' ticked' : pend.length ? '1 ticked' : 'Tick stores to add them up'}</span>
         <a class="sp-cmp${pend.length < 2 ? ' off' : ''}" href="/compare?${pend.map(s => 'store=' + encodeURIComponent(s)).join('&')}">Compare</a>
         <button type="button" class="sp-apply" ${SP.pending && JSON.stringify(SP.pending) !== JSON.stringify(SP.sel) ? '' : 'disabled'}>Show</button></div>` : '');
@@ -8249,6 +8726,10 @@ if (storeMenu) {
   storeMenu.addEventListener('keydown', e => { if (e.key === 'Enter' && e.target.type === 'search') { const r = storeMenu.querySelector('.sp-row[data-store]:not([hidden])'); if (r) spApply([r.dataset.store]); } });
   storeMenu.addEventListener('click', e => {
     e.stopPropagation();
+    const fav = e.target.closest('[data-fav]');
+    if (fav) { const s = fav.dataset.fav, l = favs(), i = l.indexOf(s); if (i >= 0) l.splice(i, 1); else l.push(s); store.set(FAV, JSON.stringify(l)); spRender(); return; }
+    const grp = e.target.closest('[data-group]');
+    if (grp && SP.multi) { try { SP.pending = JSON.parse(grp.dataset.group).filter(x => SP.stores.includes(x)); } catch (err) {} spRender(); return; }
     const only = e.target.closest('[data-only]'), tick = e.target.closest('[data-tick]');
     if (tick && SP.multi) {
       const s = tick.dataset.tick, p = (SP.pending || SP.sel).slice(), i = p.indexOf(s);
@@ -8308,7 +8789,7 @@ async function checkNet(){
   } catch (e) { paintNet('bad'); }
 }
 /* ---------- changing targets needs the admin passcode: ask in a small sheet, then send the save again ---------- */
-const ADMIN_POST = /^\/api\/(?:targets?|campaigns|roster|stock(?:\/clear)?|master\/refresh)$/;
+const ADMIN_POST = /^\/api\/(?:targets?|campaigns|roster|holidays|stock(?:\/clear|\/norms)?|prices(?:\/delete|\/offers)?|master\/refresh)$/;
 let adminToken = null;
 async function adminTokenGet(){
   if (adminToken) return adminToken;
@@ -8322,7 +8803,7 @@ function adminAsk(){
     shade.innerHTML = `<form class="adm-sheet" role="dialog" aria-modal="true" aria-labelledby="admT" autocomplete="off">
       <span class="adm-ic"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="10.5" width="14" height="10" rx="2.5"/><path d="M8.5 10.5V8a3.5 3.5 0 017 0v2.5"/></svg></span>
       <h3 id="admT">Admin passcode</h3>
-      <p>Press <b>Spacebar</b> once (default passcode) to unlock for 15 minutes and save your change.</p>
+      <p>Saving this change needs the admin passcode. It unlocks this browser for 15 minutes; what you entered is kept.</p>
       <input type="password" autocomplete="current-password" aria-label="Admin passcode" required>
       <p class="adm-err" role="alert" hidden></p>
       <div class="adm-btns"><button type="button" class="adm-no">Cancel</button><button type="submit" class="adm-ok">Unlock and save</button></div></form>`;
@@ -8513,7 +8994,7 @@ function meta(head){
   const picked = [];
   group(head).forEach(n => n.querySelectorAll('.chips button.on,.seg button[aria-selected="true"]').forEach(b => { const t = clean(b.textContent); if (t && !picked.includes(t)) picked.push(t); }));
   return { title: headTitle(head), who: clean((document.getElementById('title') || {}).textContent), when: clean((document.getElementById('navLabel') || {}).textContent),
-    note: clean([...head.querySelectorAll('.sub-note')].map(x => x.textContent).join(' ')), picked };
+    note: clean([...head.querySelectorAll('.sub-note')].map(x => x.textContent).join(' ')).replace(/\s*·?\s*tap (?:a|any) (?:column|heading|model|name|cell)[^·]*/gi, '').trim(), picked };
 }
 async function openMore(head){   /* a list cut short with "Show More" is opened first, so every row is exported */
   for (let n = head.nextElementSibling; n && !n.classList.contains('sec-head'); n = n.nextElementSibling) {
@@ -8588,6 +9069,13 @@ function headerLines(d){
 async function toExcel(head){
   await openMore(head);
   const d = sectionData(head);
+  // a neat workbook from the server: title, bold header row, number formats, frozen header, filters, totals in bold
+  try {
+    const spec = { title: d.title, file: fileBase(d), sub: [[d.who, d.when].filter(Boolean).join(' · '), d.picked.join(' · '), d.note].filter(Boolean),
+      sheets: d.sheets.map(sh => ({ name: sh.name, rows: sh.rows })) };
+    const r = await fetch('/api/export/xlsx', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(spec) });
+    if (r.ok) { download(await r.blob(), fileBase(d) + '.xlsx'); return; }
+  } catch (e) { /* offline: build it here */ }
   try {
     const XLSX = await loadScript(XLSX_LIB, 'XLSX');
     const wb = XLSX.utils.book_new(), used = new Set();
@@ -8637,6 +9125,26 @@ function toWhatsApp(head){
   const w = window.open(url, '_blank', 'noopener');
   if (!w) location.href = url;
 }
+/* WhatsApp with the picture: on a phone the share sheet sends it straight to WhatsApp; on a computer the picture is
+   copied (and saved), and WhatsApp opens with the text so the picture can be pasted under it */
+async function toWhatsAppImage(head, btn){
+  const toast = window.APX_toast || (() => {});
+  try {
+    const r = await sectionImage(head, btn);
+    const file = new File([r.blob], r.name, { type: 'image/png' });
+    const text = waText(sectionData(head));
+    if (navigator.canShare && navigator.canShare({ files: [file] }) && matchMedia('(pointer:coarse)').matches) {
+      await navigator.share({ files: [file], text: text.split('\n').slice(0, 3).join('\n') });
+      return;
+    }
+    let copied = false;
+    try { if (window.ClipboardItem && navigator.clipboard && navigator.clipboard.write) { await navigator.clipboard.write([new ClipboardItem({ 'image/png': r.blob })]); copied = true; } } catch (e) {}
+    if (!copied) download(r.blob, r.name);
+    const url = 'https://wa.me/?text=' + encodeURIComponent(text.split('\n').slice(0, 3).join('\n'));
+    const w = window.open(url, '_blank', 'noopener'); if (!w) location.href = url;
+    toast(copied ? 'Picture copied: paste it into the WhatsApp chat (Ctrl / ⌘ + V).' : 'Picture saved: attach it in the WhatsApp chat.');
+  } catch (e) { if (e && e.name !== 'AbortError') alert('Could not make the picture: ' + (e.message || e)); }
+}
 async function sectionImage(head, btn){
   btn.classList.add('busy');
   // a table or list cut short with "Show More" is opened first, so the image has every row
@@ -8663,6 +9171,9 @@ async function sectionImage(head, btn){
     holder.style.minWidth = Math.max(560, Math.ceil(width)) + 'px';   // room for the title and the time stamp
     holder.innerHTML = `<div class="x-head"><div><h1 class="x-title">${safe(title)}</h1><p class="x-sub"><b>${safe(who)}</b>${when ? ' · ' + safe(when) : ''}</p></div><div class="x-stamp">Exported ${safe(stamp)}</div></div>`;
     nodes.forEach(n => { const c = n.cloneNode(true); copyFormState(n, c); holder.appendChild(c); });
+    // the page's own "Updated …" line is repeated in the picture's footer, so the copy inside the card goes
+    holder.querySelectorAll('.foot.updated,#updated,.foot').forEach(x => x.remove());
+    holder.querySelectorAll('svg .hit').forEach(x => x.remove());   // invisible hover areas: they came out as black blocks
     // buttons don't belong in a picture: the choices they show are written out under the title instead
     const picked = [];
     holder.querySelectorAll('.chips,.seg').forEach(g => {
@@ -8714,7 +9225,8 @@ function openPop(btn){
     <button type="button" role="menuitem" data-x="png"><span class="sx-ic" style="--c:#0a84ff">${IC.image}</span>Save image<small>PNG</small></button>
     <button type="button" role="menuitem" data-x="xlsx"><span class="sx-ic" style="--c:#1d6f42">${IC.xls}</span>Excel<small>.xlsx · data</small></button>
     <button type="button" role="menuitem" data-x="csv"><span class="sx-ic" style="--c:#8e8e93">${IC.csv}</span>CSV<small>data</small></button>
-    <button type="button" role="menuitem" data-x="wa"><span class="sx-ic" style="--c:#25d366">${IC.wa}</span>WhatsApp<small>as text</small></button>
+    <button type="button" role="menuitem" data-x="wa"><span class="sx-ic" style="--c:#25d366">${IC.wa}</span>WhatsApp<small>text</small></button>
+    <button type="button" role="menuitem" data-x="waimg"><span class="sx-ic" style="--c:#128c7e">${IC.wa}</span>WhatsApp<small>picture</small></button>
     ${canShare ? `<button type="button" role="menuitem" data-x="more"><span class="sx-ic" style="--c:#5e5ce6">${IC.more}</span>More…<small>image</small></button>` : ''}`;
   cur = { btn, head, y: window.scrollY };
   btn.setAttribute('aria-expanded', 'true');
@@ -8740,6 +9252,7 @@ pop.addEventListener('click', e => {
   else if (x === 'xlsx') toExcel(head);
   else if (x === 'csv') openMore(head).then(() => toCSV(head));
   else if (x === 'wa') openMore(head).then(() => toWhatsApp(head));
+  else if (x === 'waimg') toWhatsAppImage(head, btn);
 });
 document.addEventListener('click', e => {
   const b = e.target.closest('.xbtn');
@@ -8751,6 +9264,8 @@ window.addEventListener('scroll', () => { if (!cur) return; if (Math.abs(window.
 window.addEventListener('resize', closePop);
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', addButtons); else addButtons();
 window.addExportButtons = addButtons;
+window.APX_toast = msg => { let t = document.querySelector('.sx-toast'); if (!t) { t = document.createElement('div'); t.className = 'sx-toast'; t.setAttribute('role', 'status'); document.body.appendChild(t); }
+  t.textContent = msg; t.classList.add('show'); clearTimeout(t._t); t._t = setTimeout(() => t.classList.remove('show'), 4200); };
 window.APX_open = (head, kind) => (kind === 'xlsx' ? toExcel(head) : kind === 'csv' ? toCSV(head) : kind === 'wa' ? toWhatsApp(head) : toImage(head, head.querySelector('.xbtn') || head, false));
 })();
 
@@ -8802,9 +9317,9 @@ function mount(host, o){
       const tot = isV() ? d.total.v : d.total.q, oth = isV() ? d.total.q : d.total.v;
       body = `<section class="card table-card"><div class="tscroll"><table class="cmp dw">
         <thead><tr><th>Day</th><th>${isV() ? 'Value' : 'Units'}</th><th>${isV() ? 'Units' : 'Value'}</th><th>ASP</th><th>vs same day LM</th><th>vs same day LY</th><th>Running total</th>${d.cols.map(c => `<th>${esc(c)}</th>`).join('')}</tr></thead>
-        <tbody>${shown.map(r => { const m = mv(r), z = !r.v && !r.q, we = r.wd === 'Sat' || r.wd === 'Sun';
+        <tbody>${shown.map(r => { const m = mv(r), z = !r.v && !r.q, D = window.APDAY;
           const tag = r.day === d.best ? '<i class="dw-tag up" title="Best day">Best</i>' : r.day === d.worst ? '<i class="dw-tag down" title="Weakest day">Low</i>' : '';
-          return `<tr class="${z ? 'dw-zero' : ''}${we ? ' dw-we' : ''}"><td><b>${esc(r.label)}</b><small>${esc(r.wd)}</small>${tag}</td>
+          return `<tr class="${z ? 'dw-zero' : ''} ${D ? D.cls(r.tag) : ''}" title="${D ? esc(D.text(r.tag)) : ''}"><td><b>${esc(r.label)}</b><small>${esc(r.wd)}</small>${tag}${D ? D.chips(r.tag, { noWd: true }) : ''}</td>
             <td><div class="dw-v"><span>${z ? '–' : fm(m)}</span><i style="width:${Math.round(m / max * 100)}%"></i></div></td>
             <td>${z ? '–' : (isV() ? full(r.q) : compact(r.v))}</td><td>${r.q ? compact(r.v / r.q) : '–'}</td>
             <td>${r.lm ? `<span class="dw-b" title="Same date last month: ${fm(r.lm[idx])}">${chip(m, r.lm[idx])}</span>` : '–'}</td>
@@ -8817,7 +9332,8 @@ function mount(host, o){
       </table></div></section>`;
     }
     host.innerHTML = `<div class="sec-head"><h2>Day-wise Sales</h2><span class="sub-note">${d && !d.error ? `${esc(d.range)} · ${isV() ? 'value' : 'units'}${d.cols.length ? ' by ' + esc((bys.find(b => b[0] === d.by) || ['', ''])[1].toLowerCase()) : ''}` : ''}</span></div>
-      <div class="chips dw-by" role="group" aria-label="Split day-wise sales by">${bys.map(([k, t]) => `<button type="button" data-dwby="${k}" class="${S.by === k ? 'on' : ''}">${t}</button>`).join('')}</div>${body}`;
+      <div class="chips dw-by" role="group" aria-label="Split day-wise sales by">${bys.map(([k, t]) => `<button type="button" data-dwby="${k}" class="${S.by === k ? 'on' : ''}">${t}</button>`).join('')}</div>
+      <div class="dt-legend"><span><i class="dt wk">Fri · Weekend</i></span><span><i class="dt hol">Holiday</i></span><span><i class="dt fest">Festival</i></span><span><i class="dt eve">Eve / day after</i></span></div>${body}`;
     if (window.addExportButtons) window.addExportButtons();
   };
   host.addEventListener('click', e => {
@@ -8829,9 +9345,10 @@ function mount(host, o){
   window.APX = window.APX || {};
   window.APX['Day-wise Sales'] = () => {
     const d = S.data; if (!d || d.error) return null;
-    const head = ['Date', 'Weekday', 'Value', 'Units', 'ASP', 'Same day LM value', 'Same day LM units', 'Same day LY value', 'Same day LY units', 'Running value', 'Running units', ...d.cols.flatMap(c => [c + ' value', c + ' units'])];
-    return { sheets: [{ name: 'Day-wise', rows: [head, ...d.rows.map(r => [r.day, r.wd, r.v, r.q, r.q ? Math.round(r.v / r.q) : 0, r.lm ? r.lm[0] : '', r.lm ? r.lm[1] : '', r.ly ? r.ly[0] : '', r.ly ? r.ly[1] : '', r.cv, r.cq,
-      ...d.cols.flatMap(c => (r.cols[c] || [0, 0]))])] }] };
+    const head = ['Date', 'Weekday', 'Holiday / festival', 'Value', 'Units', 'ASP', 'Same day LM value', 'Same day LM units', 'Same day LY value', 'Same day LY units', 'Running value', 'Running units', ...d.cols.flatMap(c => [c + ' value', c + ' units'])];
+    return { sheets: [{ name: 'Day-wise', rows: [head, ...d.rows.map(r => [r.day, r.wd, window.APDAY ? window.APDAY.text(r.tag) : '', r.v, r.q, r.q ? Math.round(r.v / r.q) : 0, r.lm ? r.lm[0] : '', r.lm ? r.lm[1] : '', r.ly ? r.ly[0] : '', r.ly ? r.ly[1] : '', r.cv, r.cq,
+      ...d.cols.flatMap(c => (r.cols[c] || [0, 0]))]), ['Total', '', '', d.total.v, d.total.q, d.total.q ? Math.round(d.total.v / d.total.q) : 0, '', '', '', '', d.total.v, d.total.q,
+      ...d.cols.flatMap(c => [d.rows.reduce((a, r) => a + ((r.cols[c] || [0, 0])[0]), 0), d.rows.reduce((a, r) => a + ((r.cols[c] || [0, 0])[1]), 0)])]] }] };
   };
   W.render();
   return W;
@@ -9518,6 +10035,10 @@ EOD_HTML = """<!doctype html>
           </div>
         </div>
       </div>
+      <section class="card eod-opts" aria-label="What goes in the report">
+        <div class="eo-head"><b>In the report</b><span class="eo-presets"><button type="button" data-eop="full">Full</button><button type="button" data-eop="short">Short</button><button type="button" data-eop="sales">Sales only</button></span></div>
+        <div class="eo-chips" id="eoChips" role="group"></div>
+      </section>
       <section class="card wa-card">
         <div class="wa-chat"><pre class="wa-bubble" id="preview"></pre></div>
       </section>
@@ -9568,6 +10089,14 @@ EOD_CSS = r"""
 .cmp.eod-t tbody tr.care td{background:color-mix(in srgb,#34c759 8%,transparent)}
 .eod-attach{margin:0;padding:0 16px 6px}
 .wa-card{padding:0;overflow:hidden}
+.eod-opts{margin:0 0 10px;padding:12px 14px}
+.eo-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px;font-size:13.5px}
+.eo-presets{display:flex;gap:6px}
+.eo-presets button{height:26px;padding:0 10px;border:0;border-radius:13px;background:var(--fill);color:var(--blue);font:inherit;font-size:12px;font-weight:700;cursor:pointer}
+.eo-chips{display:flex;flex-wrap:wrap;gap:6px}
+.eo-chips label{display:inline-flex;align-items:center;gap:6px;height:30px;padding:0 11px;border-radius:15px;background:var(--fill);font-size:12.5px;font-weight:600;cursor:pointer;user-select:none}
+.eo-chips input{margin:0;accent-color:var(--blue)}
+.eo-chips label:has(input:checked){background:color-mix(in srgb,var(--blue) 14%,transparent);color:var(--blue)}
 .wa-chat{padding:16px;background:color-mix(in srgb,#25d366 8%,var(--bg));background-image:radial-gradient(color-mix(in srgb,var(--label) 6%,transparent) 1px,transparent 1px);background-size:14px 14px;max-height:70vh;overflow:auto}
 .wa-bubble{margin:0 0 0 auto;max-width:92%;width:fit-content;padding:10px 12px;border-radius:12px 4px 12px 12px;background:#d9fdd3;color:#111b21;font:13.5px/1.42 -apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,sans-serif;white-space:pre-wrap;word-break:break-word;box-shadow:0 1px 1px rgba(0,0,0,.12)}
 :root[data-theme=dark] .wa-bubble{background:#005c4b;color:#e9edef}
@@ -9732,60 +10261,33 @@ function compute(){
     gone: (boot.today_day || 1) / (boot.days_total || 30) * 100 };
 }
 
+/* the report's parts: tick what goes into the WhatsApp message (kept on this device) */
+const EO = [['day', 'Day summary'], ['mtd', 'MTD & SP target'], ['models', "Today's models"], ['ff8', 'FF8'], ['s26', 'S26F'], ['mx', 'MX'], ['sp', 'SP'],
+  ['tab', 'Tab'], ['wear', 'Wearables'], ['pc', 'NPC'], ['acc', 'Accessories'], ['care', 'Care+'], ['walk', 'Walk-in & conversion']];
+const EO_PRESET = { full: EO.map(x => x[0]), short: ['day', 'mtd', 'models', 'sp', 'walk'], sales: ['day', 'mtd', 'mx', 'sp', 'tab', 'wear', 'pc', 'acc'] };
+let eoOn = EO_PRESET.full.slice();
+try { const v = JSON.parse(store.get('eod-parts') || 'null'); if (Array.isArray(v)) eoOn = v.filter(k => EO.some(x => x[0] === k)); } catch (e) {}
+function paintEO(){
+  const el = $('#eoChips'); if (!el) return;
+  el.innerHTML = EO.map(([k, t]) => `<label><input type="checkbox" data-eo="${k}" ${eoOn.includes(k) ? 'checked' : ''}>${t}</label>`).join('');
+}
 function message(r){
   const { c, f } = r;
   const block = (t, x) => `*${t}*\nFTD Qty -${pad2(x.fq)}\nFTD Value -${inr(x.fv)}\nMTD Qty -${pad2(x.mq)}\nMTD Value -${inr(x.mv)}`;
   const ffLines = key => FF.map(k => `- ${FF_NAMES[k]} -${pad2(f[k][key])}`).join('\n');
   const models = r.models.length ? r.models.map(m => `- ${m.name} -${pad2(m.qty)}`).join('\n') : '- Nil';
-  return `*${cur === '__all__' ? 'All Stores' : cur}*
-
-*${boot.date_label || ''}*
-
-Day -${boot.day || ''}
-Total Day Sales -${inr(num('totalSales'))}/-
-Bills -${pad2(r.bills)}
-Units -${pad2(r.units)}
-
-Store MTD Sales -${inr(r.storeMtd)}/-
-SP MTD Sales -${inr(r.spMtd)}/-
-SP MTD Units -${pad2(r.spMtdQ)}
-SP Value Target -${r.target ? inr(r.target) + '/-' : '–'}
-SP Value Ach% -${r.target ? pct(r.ach) : '–'}
-SP Units Target -${r.targetQ ? inr(r.targetQ) : '–'}
-SP Units Ach% -${r.targetQ ? pct(r.achQ) : '–'}
-
-*Today's Models Sold*
-${models}
-
-*FF8 FTD: ${pad2(f.ff8.fq)}*
-${ffLines('fq')}
-
-*FF8 MTD: ${pad2(f.ff8.mq)}*
-${ffLines('mq')}
-
-*S26F*
-- FTD -${pad2(f.s26.fq)}
-- MTD -${pad2(f.s26.mq)}
-
-${block('MX Sales', c.mx)}
-
-${block('SP', c.sp)}
-
-${block('Tab', c.tab)}
-
-${block('Wearables', c.wear)}
-
-${block('NPC', c.pc)}
-
-*Accessories*
-FTD Value -${inr(c.acc.fv)}
-MTD Value -${inr(c.acc.mv)}
-
-${block('CARE+', c.care)}
-MTD attach% -${isFinite(r.attach) ? r.attach.toFixed(2) + '%' : '–'}
-
-Walk-in: ${pad2(r.walkin)}
-Conversion: ${r.conv.toFixed(2)}%`;
+  const parts = {
+    day: `Day -${boot.day || ''}\nTotal Day Sales -${inr(num('totalSales'))}/-\nBills -${pad2(r.bills)}\nUnits -${pad2(r.units)}`,
+    mtd: `Store MTD Sales -${inr(r.storeMtd)}/-\nSP MTD Sales -${inr(r.spMtd)}/-\nSP MTD Units -${pad2(r.spMtdQ)}\nSP Value Target -${r.target ? inr(r.target) + '/-' : '–'}\nSP Value Ach% -${r.target ? pct(r.ach) : '–'}\nSP Units Target -${r.targetQ ? inr(r.targetQ) : '–'}\nSP Units Ach% -${r.targetQ ? pct(r.achQ) : '–'}`,
+    models: `*Today's Models Sold*\n${models}`,
+    ff8: `*FF8 FTD: ${pad2(f.ff8.fq)}*\n${ffLines('fq')}\n\n*FF8 MTD: ${pad2(f.ff8.mq)}*\n${ffLines('mq')}`,
+    s26: `*S26F*\n- FTD -${pad2(f.s26.fq)}\n- MTD -${pad2(f.s26.mq)}`,
+    mx: block('MX Sales', c.mx), sp: block('SP', c.sp), tab: block('Tab', c.tab), wear: block('Wearables', c.wear), pc: block('NPC', c.pc),
+    acc: `*Accessories*\nFTD Value -${inr(c.acc.fv)}\nMTD Value -${inr(c.acc.mv)}`,
+    care: `${block('CARE+', c.care)}\nMTD attach% -${isFinite(r.attach) ? r.attach.toFixed(2) + '%' : '–'}`,
+    walk: `Walk-in: ${pad2(r.walkin)}\nConversion: ${r.conv.toFixed(2)}%`,
+  };
+  return [`*${cur === '__all__' ? 'All Stores' : cur}*`, `*${boot.date_label || ''}*`].concat(EO.map(x => x[0]).filter(k => eoOn.includes(k)).map(k => parts[k])).join('\n\n');
 }
 
 function update(){
@@ -9950,6 +10452,9 @@ $('#copyBtn').addEventListener('click', () => {
     .catch(() => { const ta = document.createElement('textarea'); ta.value = txt; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove(); toast('EOD report copied'); });
 });
 $('#waBtn').addEventListener('click', () => { update(); window.open('https://wa.me/?text=' + encodeURIComponent($('#preview').textContent), '_blank', 'noopener'); });
+paintEO();
+$('#eoChips').addEventListener('change', e => { const k = e.target.dataset.eo; if (!k) return; eoOn = EO.map(x => x[0]).filter(x => x === k ? e.target.checked : eoOn.includes(x)); store.set('eod-parts', JSON.stringify(eoOn)); update(); });
+document.querySelector('.eo-presets').addEventListener('click', e => { const b = e.target.closest('[data-eop]'); if (!b) return; eoOn = EO_PRESET[b.dataset.eop].slice(); store.set('eod-parts', JSON.stringify(eoOn)); paintEO(); update(); });
 const top = $('#top');
 window.addEventListener('scroll', () => top.classList.toggle('scrolled', window.scrollY > 4), { passive: true });
 loadStore();
@@ -10004,9 +10509,20 @@ SPC_HTML = """<!doctype html>
         </div>
       </div>
     </div>
+    <div class="ch-group" style="--g:#5e5ce6">
+      <span class="gi"><svg viewBox="0 0 24 24"><path d="M4 5h16l-6 7.5V19l-4 1.5v-8z"/></svg></span>
+      <div class="gb"><div class="gl">Filter <button type="button" class="link spc-clear" id="fltClear" hidden>Clear filters</button></div>
+        <div class="ctl-rows spc-flt">
+          <div class="ctl-row"><span class="ctl-lab">Segment</span><div class="chips" id="fSeg"></div></div>
+          <div class="ctl-row"><span class="ctl-lab">Category</span><div class="chips" id="fCat"></div></div>
+          <div class="ctl-row"><span class="ctl-lab">Price</span><div class="chips" id="fPb"></div></div>
+        </div>
+      </div>
+    </div>
   </section>
 
   <p class="err" id="err" hidden></p>
+  <p class="flt-note" id="fltNote" hidden></p>
 
   <div class="sec-head"><h2>Store Snapshot</h2><span class="sub-note" id="snapNote"></span></div>
   <section class="kpis" id="kpis"></section>
@@ -10024,6 +10540,12 @@ SPC_HTML = """<!doctype html>
   </div>
   <section class="card table-card"><div class="tscroll"><table class="cmp heat" id="heatTable"></table></div></section>
 
+  <div class="sec-head"><h2>Who Sells Each Price Bracket</h2><span class="sub-note" id="pbNote"></span></div>
+  <section class="card table-card"><div class="tscroll"><table class="cmp heat" id="pbTable"></table></div></section>
+
+  <div class="sec-head"><h2>Categories by SPC</h2><span class="sub-note" id="catNote"></span></div>
+  <section class="card table-card"><div class="tscroll"><table class="cmp heat" id="catTable"></table></div></section>
+
   <div class="sec-head"><h2>Products × SPC</h2><span class="sub-note" id="prodSpcNote"></span></div>
   <div class="chips secseg" id="prodSegPick" role="group" aria-label="Segment for Products × SPC" hidden></div>
   <section class="card table-card"><div class="tscroll"><table class="cmp" id="prodSpcTable"></table></div></section>
@@ -10035,6 +10557,9 @@ SPC_HTML = """<!doctype html>
     </div>
     <section class="card"><div class="trend" id="trend"></div><div class="ch-legend" id="trendLegend"></div></section>
   </div>
+  <div class="sec-head"><h2>SPC History · Store-wise</h2><span class="sub-note" id="histNote"></span></div>
+  <div class="chips" id="histMonths"><button type="button" data-hm="3">3 months</button><button type="button" data-hm="6">6 months</button><button type="button" data-hm="12">12 months</button></div>
+  <section class="card table-card"><div class="tscroll"><table class="cmp hist" id="histTable"></table></div></section>
   <div id="daywise" class="dw-host"></div>
   <p class="foot" id="updated"></p>
 </main>
@@ -10094,6 +10619,15 @@ SPC_CSS = r"""
 .trend .hit{fill:transparent;cursor:crosshair}
 .trend.dim .ln:not(.hl),.trend.dim .ar:not(.hl){opacity:.18}
 .ch-legend span[data-s]{cursor:pointer}
+.spc-flt .ctl-row{grid-template-columns:76px minmax(0,1fr)}
+.spc-flt .chips{margin:0;flex-wrap:nowrap;overflow-x:auto}
+.spc-clear{margin-left:8px;font-size:12px;text-transform:none;letter-spacing:0}
+.flt-note{margin:10px 4px 0;padding:9px 12px;border-radius:12px;background:color-mix(in srgb,#5e5ce6 10%,transparent);font-size:13px;color:var(--label)}
+.flt-note b{font-weight:700}
+.trend .band{pointer-events:none}
+.cmp.hist tr.sub td{font-weight:700;background:color-mix(in srgb,var(--blue) 6%,var(--card))!important}
+.cmp.hist td.cur{background:color-mix(in srgb,var(--blue) 5%,var(--card))}
+.cmp.hist th small.part{color:#c76a00}
 @media (max-width:560px){.spc-ctl{grid-template-columns:1fr}}
 """
 
@@ -10127,7 +10661,7 @@ const PRESETS = [['mtd', 'MTD'], ['lm', 'Last month'], ['l7', 'Last 7 days'], ['
 let saved = {}, ov = {};
 try { saved = JSON.parse(store.get('spc-state') || '{}'); } catch (e) {}
 try { ov = JSON.parse(store.get('ov-state') || '{}'); } catch (e) {}
-const st = Object.assign({ preset: 'mtd', start: '', end: '', metric: 'v', compare: 'prev', sp: !!ov.sp, ff: ov.ff !== false, sort: 'v', heat: 'seg' }, saved);
+const st = Object.assign({ preset: 'mtd', start: '', end: '', metric: 'v', compare: 'prev', sp: !!ov.sp, ff: ov.ff !== false, sort: 'v', heat: 'seg', fseg: '', fcat: '', fpb: '', months: 6 }, saved);
 st.sel = StorePicker.saved(); delete st.store;
 let data = null, ctrl = null;
 const save = () => { const { sel, ...rest } = st; store.set('spc-state', JSON.stringify(rest)); };
@@ -10174,6 +10708,10 @@ function render(){
   const flag = d.segments.find(s => /^(flagship|sp)$/i.test(s.name));
   const flagMix = r => { const s = flag && r.segs[flag.name]; return r.v ? (s ? s[0] : 0) / r.v * 100 : 0; };
 
+  /* filters in force */
+  const F = d.filters || {}, fl = [F.seg && 'segment ' + F.seg, F.cat && 'category ' + F.cat, F.pb && 'price ' + F.pb].filter(Boolean);
+  $('#fltNote').hidden = !fl.length;
+  $('#fltNote').innerHTML = fl.length ? `Showing <b>${esc(fl.join(' · '))}</b> only. Every table below (and its Excel) uses this filter.` : '';
   /* snapshot */
   $('#snapNote').textContent = `${d.range} · vs ${d.base_code} ${d.base_range}`;
   const top1 = sorted[0], top2 = sorted.slice(0, 2).reduce((a, r) => a + m(r), 0);
@@ -10247,7 +10785,26 @@ function render(){
       const p = den ? v / den * 100 : 0;
       const col = SEG_COLORS[s.name.toLowerCase()] || '#8e8e93';
       return `<td class="hc" style="background:color-mix(in srgb,${col} ${Math.round(Math.min(100, p) * 0.55)}%,transparent)"><div><span>${v ? pct(p) : '–'}</span><small>${v ? fmtM(v) : ''}</small></div></td>`;
-    }).join('')}</tr>`).join('')}</tbody>`;
+    }).join('')}</tr>`).join('')}</tbody>
+    <tfoot><tr><td>Store total</td>${segs.map(s => { const v = isV() ? s.v : s.q; return `<td><div><span>${mode === 'seg' ? '100%' : pct(tm ? v / tm * 100 : 0)}</span><small>${fmtM(v)}</small></div></td>`; }).join('')}</tr></tfoot>`;
+  /* price brackets and categories: the same view (who sells each one, or each SPC's own mix) */
+  const heatOf = (el, note, blk, label, colorOf) => {
+    const keys = blk.keys || [], tot = blk.tot || {};
+    $(note).textContent = keys.length ? (mode === 'seg' ? `who sells each ${label} · ${isV() ? 'value' : 'units'}` : `how each SPC's ${isV() ? 'value' : 'units'} splits by ${label}`) : '';
+    if (!keys.length) { $(el).innerHTML = `<tbody><tr><td>No sales in this period.</td></tr></tbody>`; return; }
+    const tsum = keys.reduce((a, k) => a + (tot[k] || [0, 0])[isV() ? 0 : 1], 0);
+    $(el).innerHTML = `<thead><tr><th>SPC</th>${keys.map(k => `<th>${esc(k)}</th>`).join('')}<th>Total</th></tr></thead>
+      <tbody>${sorted.map(r => { const own = keys.reduce((a, k) => a + (((blk.by[r.name] || {})[k] || [0, 0])[isV() ? 0 : 1]), 0);
+        return `<tr><td><span class="dot" style="background:${r.color}"></span>${esc(r.name)}</td>${keys.map((k, i) => {
+          const v = ((blk.by[r.name] || {})[k] || [0, 0])[isV() ? 0 : 1], den = mode === 'seg' ? (tot[k] || [0, 0])[isV() ? 0 : 1] : own, p = den ? v / den * 100 : 0;
+          return `<td class="hc" style="background:color-mix(in srgb,${colorOf(k, i)} ${Math.round(Math.min(100, p) * 0.55)}%,transparent)"><div><span>${v ? pct(p) : '–'}</span><small>${v ? fmtM(v) : ''}</small></div></td>`; }).join('')}
+          <td><div><span>${fmtM(own)}</span><small>${pct(tsum ? own / tsum * 100 : 0)}</small></div></td></tr>`; }).join('')}</tbody>
+      <tfoot><tr><td>Store total</td>${keys.map(k => { const v = (tot[k] || [0, 0])[isV() ? 0 : 1]; return `<td><div><span>${fmtM(v)}</span><small>${pct(tsum ? v / tsum * 100 : 0)}</small></div></td>`; }).join('')}<td><div><span>${fmtM(tsum)}</span><small>100%</small></div></td></tr></tfoot>`;
+  };
+  const PB_C = ['#30b0c7', '#34c759', '#0a84ff', '#5e5ce6', '#af52de', '#ff2d55'];
+  heatOf('#pbTable', '#pbNote', d.brackets || {}, 'price bracket', (k, i) => PB_C[i % PB_C.length]);
+  heatOf('#catTable', '#catNote', d.categories || {}, 'category', k => ({ Smartphones: '#0a84ff', Tabs: '#ff9500', Wearables: '#ff2d55', NPC: '#af52de', Accessories: '#34c759', 'Care+': '#30b0c7' }[k] || '#8e8e93'));
+  renderHistory(d);
 
   /* products by SPC: each product's total, who sold it, and the growth vs the base window */
   const allProds = (d.products || []).slice().sort((x, y) => m(y) - m(x));
@@ -10287,6 +10844,29 @@ function render(){
   if (window.addExportButtons) window.addExportButtons();
 }
 
+function renderHistory(d){
+  const h = d.history; const el = $('#histTable');
+  $$('#histMonths [data-hm]').forEach(b => b.classList.toggle('on', +b.dataset.hm === +st.months));
+  if (!h || !h.stores.length) { el.innerHTML = '<tbody><tr><td>No SPC sales in these months.</td></tr></tbody>'; $('#histNote').textContent = ''; return; }
+  const ms = h.months, k = isV() ? 0 : 1, val = (r, m) => ((r.m[m.key] || [0, 0])[k]);
+  const many = h.stores.length > 1, ncol = ms.length + 4;
+  $('#histNote').textContent = `${isV() ? 'value' : 'units'} by month · ${h.stores.length} store${many ? 's' : ''}${ms.some(m => m.partial) ? ' · the latest month is to date' : ''}`;
+  const cells = (vals) => { const tot = vals.reduce((a, x) => a + x, 0), done = vals.filter((x, i) => !ms[i].partial), avg = done.length ? done.reduce((a, x) => a + x, 0) / done.length : 0;
+    const full_i = ms.map((m, i) => i).filter(i => !ms[i].partial), li = full_i[full_i.length - 1], pi = full_i[full_i.length - 2];
+    const last = li != null ? vals[li] : 0, prv = pi != null ? vals[pi] : 0;   // full months only: a month to date is never set against a whole month
+    return vals.map((x, i) => `<td class="${ms[i].partial ? 'cur' : ''}">${x ? fmtM(x) : '–'}</td>`).join('') + `<td><b>${fmtM(tot)}</b></td><td>${avg ? fmtM(avg) : '–'}</td><td>${gchip(last, prv)}</td>`; };
+  const all = ms.map(() => 0);
+  el.innerHTML = `<thead><tr><th>SPC</th>${ms.map(m => `<th>${esc(m.label)}${m.partial ? '<small class="part">to date</small>' : ''}</th>`).join('')}<th>Total</th><th>Avg / month<small>full months</small></th><th>Last full month<small>vs the one before</small></th></tr></thead>
+    <tbody>${h.stores.map(g => { const sub = ms.map(m => g.rows.reduce((a, r) => a + val(r, m), 0)); sub.forEach((x, i) => { all[i] += x; });
+      return (many ? `<tr class="grp"><td colspan="${ncol}"><span class="grp-lab">${esc(g.store)}<small>${g.rows.length} SPCs</small></span></td></tr>` : '')
+        + g.rows.map(r => `<tr><td title="${esc(r.spc)}">${esc(r.spc)}</td>${cells(ms.map(m => val(r, m)))}</tr>`).join('')
+        + (many ? `<tr class="sub"><td>${esc(g.store.replace(/^.*\(([^)]+)\)\s*$/, '$1'))} total</td>${cells(sub)}</tr>` : ''); }).join('')}</tbody>
+    <tfoot><tr><td>${many ? 'All stores' : 'Store'} total</td>${cells(all)}</tr></tfoot>`;
+}
+function fltChips(el, list, cur, attr, all){
+  $(el).innerHTML = [['', all]].concat(list.map(x => [x, x])).map(([k, t]) => `<button type="button" ${attr}="${esc(k)}" class="${(cur || '') === k ? 'on' : ''}">${esc(t)}</button>`).join('');
+}
+
 /* Share → Excel / CSV for the three big SPC tables: full rows with raw numbers, both measures */
 const DW = window.DayWise ? DayWise.mount($('#daywise'), { by: 'spc', bys: ['spc', 'seg', 'fam', 'none'] }) : null;
 window.APX = window.APX || {};
@@ -10313,14 +10893,29 @@ window.APX['Products × SPC'] = () => {
   const spcs = d.spcs.filter(r => r.v || r.q).sort((a, b) => m(b) - m(a)).map(r => r.name);
   const prods = (d.products || []).filter(p => !st.prodSeg || (p.seg || 'Other') === st.prodSeg).sort((a, b) => (b.v - a.v));
   const sheet = (k, label) => ({ name: 'Products x SPC ' + label, rows: [['Segment', 'Product', 'Store ' + label.toLowerCase(), `${d.base_code} ${label.toLowerCase()}`, 'Growth %', ...spcs],
-    ...prods.map(p => { const c = k ? p.q : p.v, b = k ? p.bq : p.bv; return [p.seg || 'Other', p.name, Math.round(c), Math.round(b || 0), b ? r0((c - b) / b * 100) : '', ...spcs.map(n => Math.round(((p.by[n] || [0, 0])[k]) || 0))]; })] });
+    ...prods.map(p => { const c = k ? p.q : p.v, b = k ? p.bq : p.bv; return [p.seg || 'Other', p.name, Math.round(c), Math.round(b || 0), b ? r0((c - b) / b * 100) : '', ...spcs.map(n => Math.round(((p.by[n] || [0, 0])[k]) || 0))]; }),
+    (() => { const c = prods.reduce((a, p) => a + (k ? p.q : p.v), 0), b = prods.reduce((a, p) => a + ((k ? p.bq : p.bv) || 0), 0);
+      return ['Store total', '', Math.round(c), Math.round(b), b ? r0((c - b) / b * 100) : '', ...spcs.map(n => prods.reduce((a, p) => a + Math.round(((p.by[n] || [0, 0])[k]) || 0), 0))]; })()] });
   return { sheets: [sheet(0, 'Value'), sheet(1, 'Units')] };
+};
+window.APX['SPC History · Store-wise'] = () => {
+  const h = data && data.history; if (!h || !h.stores.length) return null;
+  const ms = h.months, rows = [['Store', 'SPC', ...ms.flatMap(m => [m.label + ' value', m.label + ' units']), 'Total value', 'Total units']];
+  const all = ms.map(() => [0, 0]);
+  h.stores.forEach(g => { const sub = ms.map(() => [0, 0]);
+    g.rows.forEach(r => { const v = ms.map(m => r.m[m.key] || [0, 0]); v.forEach((x, i) => { sub[i][0] += x[0]; sub[i][1] += x[1]; all[i][0] += x[0]; all[i][1] += x[1]; });
+      rows.push([g.store, r.spc, ...v.flat(), v.reduce((a, x) => a + x[0], 0), v.reduce((a, x) => a + x[1], 0)]); });
+    rows.push(['Store total · ' + g.store, '', ...sub.flat(), sub.reduce((a, x) => a + x[0], 0), sub.reduce((a, x) => a + x[1], 0)]); });
+  if (h.stores.length > 1) rows.push(['Total · all stores', '', ...all.flat(), all.reduce((a, x) => a + x[0], 0), all.reduce((a, x) => a + x[1], 0)]);
+  return { sheets: [{ name: 'SPC history', rows }] };
 };
 window.APX['Daily Contribution'] = () => {
   const d = data, tr = d && d.trend; if (!tr) return null;
   const spcs = d.spcs.filter(r => r.v || r.q).sort((a, b) => m(b) - m(a)).map(r => r.name);
-  const sheet = (src, label) => ({ name: 'Daily ' + label, rows: [['Date', 'Total', ...spcs], ...tr.days.map((day, i) => {
-    const vals = spcs.map(n => Math.round(((src[n] || [])[i]) || 0)); return [day, vals.reduce((a, x) => a + x, 0), ...vals]; })] });
+  const tg = d.tags || {};
+  const sheet = (src, label) => { const body = tr.days.map((day, i) => {
+    const vals = spcs.map(n => Math.round(((src[n] || [])[i]) || 0)); return [day, window.APDAY ? APDAY.text(tg[day]) : '', vals.reduce((a, x) => a + x, 0), ...vals]; });
+    return { name: 'Daily ' + label, rows: [['Date', 'Day mark', 'Total', ...spcs], ...body, ['Total', '', body.reduce((a, r) => a + r[2], 0), ...spcs.map((n, j) => body.reduce((a, r) => a + r[3 + j], 0))]] }; };
   return { sheets: [sheet(tr.v, 'value'), sheet(tr.q, 'units')] };
 };
 
@@ -10356,6 +10951,10 @@ function drawTrend(tr, sorted){
   let g = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="Daily contribution by SPC"><defs>`;
   series.forEach((s, k) => { g += `<linearGradient id="tg${k}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${s.r.color}" stop-opacity="${mode === 'share' ? 0.9 : 0.22}"/><stop offset="1" stop-color="${s.r.color}" stop-opacity="${mode === 'share' ? 0.75 : 0}"/></linearGradient>`; });
   g += '</defs>';
+  const tg = (data && data.tags) || {}, bw = n > 1 ? pw / (n - 1) : pw;
+  tr.days.forEach((dd, i) => { const t = tg[dd]; if (!t) return;
+    const c = t.hol ? (t.kind === 'fest' ? '#ff9f0a' : '#af52de') : t.eve || t.after ? '#ffcc00' : '#0a84ff';
+    g += `<rect class="band" x="${X(i) - bw / 2}" y="${m.t}" width="${bw}" height="${ph}" fill="${c}" opacity="${t.hol ? 0.16 : t.eve || t.after ? 0.12 : 0.06}"><title>${esc(window.APDAY ? APDAY.text(t) : '')}</title></rect>`; });
   [0, .25, .5, .75, 1].forEach(f => { const v = top * f; g += `<line class="gl" x1="${m.l}" x2="${W - m.r}" y1="${Y(v)}" y2="${Y(v)}"/><text x="${m.l - 7}" y="${Y(v) + 3.5}" text-anchor="end">${fmtY(v)}</text>`; });
   const every = Math.max(1, Math.ceil(n / Math.floor(pw / 52)));
   tr.labels.forEach((l, i) => { if (i % every === 0 || i === n - 1) g += `<text x="${X(i)}" y="${H - 8}" text-anchor="middle">${esc(l)}</text>`; });
@@ -10396,7 +10995,8 @@ function showTip(i, x, y){
     let acc = 0;
     $('#tDots').innerHTML = series.map(s => { const v = mode === 'share' ? (acc += s.vals[i]) : s.vals[i]; return `<circle cx="${X(i)}" cy="${Y(v)}" r="4" fill="${s.r.color}" stroke="var(--card)" stroke-width="2"/>`; }).join('');
   }
-  const head = mode === 'cum' ? `Running total to ${tr.labels[i]}` : tr.labels[i];
+  const tt = ((data && data.tags) || {})[tr.days[i]], tl = tt && window.APDAY ? ' · ' + APDAY.text(tt) : '';
+  const head = (mode === 'cum' ? `Running total to ${tr.labels[i]}` : tr.labels[i]) + tl;
   const rows = series.map((s, k) => ({ s, k, v: s.vals[i], day: raw[k].vals[i] })).filter(o => o.v || o.day).sort((a, b) => b.v - a.v);
   const total = mode === 'cum' ? series.reduce((a, s) => a + s.vals[i], 0) : tot[i];
   tip.innerHTML = `<h4>${esc(head)}</h4><div class="tv">${mode === 'share' ? fmtM(tot[i]) : fmtM(total)}</div>` + rows.map(o => `<div class="tl"><span><i style="background:${o.s.r.color}"></i>${esc(o.s.r.name)}</span><span>${mode === 'share' ? o.v.toFixed(2) + '% · ' + fmtM(o.day) : fmtM(o.v) + (total ? ' · ' + (o.v / total * 100).toFixed(2) + '%' : '')}</span></div>`).join('');
@@ -10430,6 +11030,11 @@ function controls(){
   $$('#cmpSeg button').forEach(b => b.setAttribute('aria-selected', String(b.dataset.cmp === st.compare)));
   $('#cmpSeg [data-cmp=prev]').textContent = 'vs ' + (st.compare === 'prev' ? d.base_code : 'Previous');
   $('#optSP').checked = st.sp; $('#optFF').checked = st.ff;
+  const F = d.filters || { segs: [], cats: [], pbs: [] };
+  fltChips('#fSeg', F.segs, st.fseg, 'data-fseg', 'All segments');
+  fltChips('#fCat', F.cats, st.fcat, 'data-fcat', 'All categories');
+  fltChips('#fPb', F.pbs, st.fpb, 'data-fpb', 'All prices');
+  $('#fltClear').hidden = !(st.fseg || st.fcat || st.fpb);
 }
 
 async function load(){
@@ -10437,7 +11042,8 @@ async function load(){
   if (ctrl) ctrl.abort();
   const mine = ctrl = new AbortController();
   $('#wrap').classList.add('loading');
-  const q = new URLSearchParams({ compare: st.compare, sp: st.sp ? '1' : '0', ff: st.ff ? '1' : '0' });
+  const q = new URLSearchParams({ compare: st.compare, sp: st.sp ? '1' : '0', ff: st.ff ? '1' : '0', months: st.months || 6 });
+  if (st.fseg) q.set('seg', st.fseg); if (st.fcat) q.set('cat', st.fcat); if (st.fpb) q.set('pb', st.fpb);
   st.sel.forEach(s => q.append('store', s));
   if (data && !data.error) { const [a, b] = presetRange(st.preset, data.dmin, data.dmax); q.set('start', iso(a)); q.set('end', iso(b)); }
   try {
@@ -10448,7 +11054,7 @@ async function load(){
     if (!d.error) st.sel = d.scope || [];
     if (first && !d.error && st.preset !== 'mtd') return load();
     render();
-    if (DW && !d.error) DW.load({ start: d.start, end: d.end, stores: st.sel, sp: st.sp, ff: st.ff, metric: st.metric });
+    if (DW && !d.error) DW.load({ start: d.start, end: d.end, stores: st.sel, sp: st.sp, ff: st.ff, metric: st.metric, seg: st.fseg });
   } catch (e) {
     if (e.name !== 'AbortError') { data = { error: 'Could not reach the server. Please try again.' }; render(); }
   } finally { if (mine === ctrl) $('#wrap').classList.remove('loading'); }
@@ -10462,6 +11068,11 @@ document.addEventListener('click', e => {
   const s = e.target.closest('th[data-sort]'); if (s) { st.sort = s.dataset.sort; save(); render(); return; }
   const h = e.target.closest('[data-heat]'); if (h) { st.heat = h.dataset.heat; save(); render(); return; }
   const ps = e.target.closest('[data-prodseg]'); if (ps) { st.prodSeg = ps.dataset.prodseg; save(); render(); return; }
+  const fs = e.target.closest('[data-fseg]'); if (fs) { st.fseg = fs.dataset.fseg; load(); return; }
+  const fc = e.target.closest('[data-fcat]'); if (fc) { st.fcat = fc.dataset.fcat; load(); return; }
+  const fp = e.target.closest('[data-fpb]'); if (fp) { st.fpb = fp.dataset.fpb; load(); return; }
+  const hm = e.target.closest('[data-hm]'); if (hm) { st.months = +hm.dataset.hm; load(); return; }
+  if (e.target.closest('#fltClear')) { st.fseg = st.fcat = st.fpb = ''; load(); return; }
 });
 ['fromDate', 'toDate'].forEach(id => $('#' + id).addEventListener('change', () => { st.preset = 'custom'; st.start = $('#fromDate').value; st.end = $('#toDate').value; load(); }));
 [['optSP', 'sp'], ['optFF', 'ff']].forEach(([id, k]) => $('#' + id).addEventListener('change', e => { st[k] = e.target.checked; load(); }));
@@ -11619,6 +12230,7 @@ def daywise_data(st, args):
             cols.append("Others")
     rows = []
     cv = cq = 0.0
+    tags = day_tags(pd.date_range(a, b, freq="D"))
     for day in pd.date_range(a, b, freq="D"):
         v, q = (float(tot.at[day, "v"]), float(tot.at[day, "q"])) if day in tot.index else (0.0, 0.0)
         lm = (day - pd.DateOffset(months=1)).normalize()
@@ -11631,7 +12243,8 @@ def daywise_data(st, args):
                      "v": round(v), "q": round(q), "cv": round(cv), "cq": round(cq),
                      "lm": [round(float(lmv["v"])), round(float(lmv["q"]))] if lmv is not None else None,
                      "ly": [round(float(lyv["v"])), round(float(lyv["q"]))] if lyv is not None else None,
-                     "cols": {k: [round(x[0]), round(x[1])] for k, x in split.get(day, {}).items()}})
+                     "cols": {k: [round(x[0]), round(x[1])] for k, x in split.get(day, {}).items()},
+                     "tag": tags.get(day.strftime("%Y-%m-%d"))})
     sold = [r for r in rows if r["v"] or r["q"]]
     return {"scope": sel, "store_label": scope_label(sel), "start": a.strftime("%Y-%m-%d"), "end": b.strftime("%Y-%m-%d"),
             "range": fmt_range(a, b), "by": by if col else "none", "cols": cols, "rows": rows,
@@ -11772,6 +12385,11 @@ def zero_data(st, args):
             "dmax": dmax.strftime("%Y-%m-%d"), "spcs": spc_list, "spc": spc, "seg": seg, "segs": segs,
             "models": len(models), "sold_now": len(sold_now), "store_zero": store_zero, "matrix": matrix, "spc_rows": spc_rows,
             "has_stock": bool(in_stock), "updated": updated_note()}
+
+
+@app.get("/sellout-gaps")
+def sellout_gaps_page():
+    return redirect("/zero" + (("?" + request.query_string.decode()) if request.query_string else ""))
 
 
 @app.get("/zero")
@@ -11980,10 +12598,12 @@ def stock_model(name, fam_norms):
             best = fam
     if best:
         return best, True
-    # not sold yet: the name up to the memory size / colour ('Galaxy Tab S10 Lite Wifi 6/128GB Gray' -> 'Tab S10 Lite Wifi')
+    # not sold yet: the name up to the memory / size, without the colour ('Galaxy Tab S10 Lite Wifi 6/128GB Gray' -> 'Tab S10 Lite Wifi',
+    # 'Watch Ultra2 Titanium Black 47MM' -> 'Watch Ultra2')
     t = _NAME_DROP.sub(" ", str(name))
-    t = re.split(r"\(|\b\d+\s*/\s*\d+\s*(?:GB|TB)?\b|\b\d+\s*(?:GB|TB)\b", t, maxsplit=1, flags=re.I)[0]
-    return re.sub(r"\s+", " ", t).strip(" -") or str(name), False
+    t = re.split(r"\(|\b\d+\s*/\s*\d+\s*(?:GB|TB)?\b|\b\d+\s*(?:GB|TB)\b|\b\d{2}\s*mm\b", t, maxsplit=1, flags=re.I)[0]
+    t = strip_colors(re.sub(r"\s+", " ", t).strip(" -"))
+    return t or str(name), False
 
 
 def match_stock_store(head, stores, wanted=""):
@@ -12029,12 +12649,19 @@ def map_stock_item(it, sku_fam, fam_norms):
     return stock_model(it["name"], fam_norms)
 
 
-def stock_analysis(st, store, cover=15, lead=3):
+FEST_PRE, FEST_POST = 10, 2   # a festival's selling window: 10 days before it to 2 days after
+STOCK_BASIS = {"blend": "Recent pace (60% last 7 days + 40% last 30)", "mtd": "MTD pace", "lmtd": "LMTD pace (same days last month)",
+               "lm": "Last month (full)", "l30": "Last 30 days", "l90": "Last 90 days", "fest": "Festival: last year's sell-out"}
+
+
+def stock_analysis(st, store, cover=15, lead=3, basis="blend", fest="", norms=None):
     daily = daily_frame(st)
     stores = sorted(s for s in daily["store"].unique() if s) if daily is not None else []
     stk = load_stock()
     rec = stk.get(store)
-    out = {"stores": stores, "store": store, "loaded": sorted(stk.keys()), "cover": cover, "lead": lead}
+    basis = basis if basis in STOCK_BASIS else "blend"
+    out = {"stores": stores, "store": store, "loaded": sorted(k for k in stk if not k.startswith("_")), "cover": cover, "lead": lead,
+           "basis": basis, "bases": [{"key": k, "label": v} for k, v in STOCK_BASIS.items()]}
     if not rec:
         return {**out, "empty": True}
     fams = json.loads(st["ctx"]["boot_json"]).get("family_names", [])
@@ -12047,9 +12674,34 @@ def stock_analysis(st, store, cover=15, lead=3):
     segmap = fam_segments(d) if d is not None else {}
     by = lambda a, b: ov_slice(d, a, b).groupby("fam")[["q", "v"]].sum() if d is not None else pd.DataFrame(columns=["q", "v"])
     s7, s30, smtd, slm = by(a7, dmax), by(a30, dmax), by(mtd_a, dmax), by(lm_a, lm_b)
+    s90 = by(dmax - pd.Timedelta(days=89), dmax)
+    lmf_b = mtd_a - DAY
+    lmf_a = lmf_b.replace(day=1)
+    slmf = by(lmf_a, lmf_b)
+    mtd_days, lm_days, lmf_days = (dmax - mtd_a).days + 1, (lm_b - lm_a).days + 1, (lmf_b - lmf_a).days + 1
     last_sale = d.groupby("fam")["day"].max() if d is not None else {}
     sku_fam, sku30 = stock_mapper(st, store, a30)
     asof = parse_date(rec.get("as_of")) or dmax
+    norms = {k: int(v) for k, v in (norms if norms is not None else (rec.get("norms") or {})).items() if str(v).isdigit() and 1 <= int(v) <= 120}
+    # festival plan: last year's sales around the same festival (whatever its date was), grown by the store's trend
+    fest_opts = festival_options(max(asof, dmax))
+    fest_info, sfest, growth, win_days = None, None, 1.0, FEST_PRE + FEST_POST + 1
+    if basis == "fest":
+        fsel = next((x for x in fest_opts if x["key"] == fest), fest_opts[0] if fest_opts else None)
+        if fsel and d is not None:
+            ly = pd.Timestamp(fsel["ly"])
+            fa, fb = ly - pd.Timedelta(days=FEST_PRE), ly + pd.Timedelta(days=FEST_POST)
+            sfest = by(fa, fb)
+            cur30 = float(ov_slice(d, a30, dmax)["q"].sum())
+            ly30 = float(ov_slice(d, a30 - pd.DateOffset(years=1), dmax - pd.DateOffset(years=1))["q"].sum())
+            growth = min(2.0, max(0.5, cur30 / ly30)) if ly30 else 1.0
+            fest_info = {**fsel, "window": fmt_range(fa, fb), "ly_units": round(float(sfest["q"].sum())) if len(sfest) else 0,
+                         "growth": round(growth, 2), "has_ly": bool(len(sfest)), "days": win_days}
+        if not fest_info or not fest_info["has_ly"]:
+            out["fest_note"] = ("No festival in the calendar for the next 150 days." if not fest_opts else
+                                f"The sheet has no sales around {fest_opts[0]['name']} last year ({fest_opts[0]['ly']}), so the recent pace is used.")
+            basis, sfest = "blend", None
+    out.update(basis=basis, fest=fest_info, fests=fest_opts, norms=norms)
     models = {}
     for it in rec.get("items", []):
         k = sku_key(it.get("sku"))
@@ -12057,7 +12709,9 @@ def stock_analysis(st, store, cover=15, lead=3):
         m = models.setdefault(fam, {"name": fam, "known": known, "stock": 0, "value": 0.0, "skus": []})
         m["stock"] += int(it.get("qty") or 0)
         m["value"] += float(it.get("value") or 0)
-        m["skus"].append({"name": it["name"], "short": stock_short(it["name"], fam), "sku": it.get("sku", ""), "qty": int(it.get("qty") or 0), "rate": it.get("rate", 0),
+        var, col = stock_variant(it["name"], fam)
+        m["skus"].append({"name": it["name"], "short": stock_short(it["name"], fam), "variant": var, "color": col, "sku": it.get("sku", ""),
+                          "qty": int(it.get("qty") or 0), "rate": it.get("rate", 0),
                           "value": it.get("value", 0), "s30": round(float(sku30.get(k, 0))) if sku30 else None})
     # models selling in the last 30 days with no stock at all
     for fam in s30.index:
@@ -12068,27 +12722,47 @@ def stock_analysis(st, store, cover=15, lead=3):
         q7 = float(s7.at[fam, "q"]) if fam in s7.index else 0.0
         q30 = float(s30.at[fam, "q"]) if fam in s30.index else 0.0
         v30 = float(s30.at[fam, "v"]) if fam in s30.index else 0.0
-        rate = 0.6 * q7 / 7 + 0.4 * q30 / 30   # recent days count more, so a model picking up is caught early
-        if q7 == 0 and q30 > 0:
-            rate = q30 / 30 * 0.5
+        qv = lambda fr: float(fr.at[fam, "q"]) if fam in fr.index else 0.0
+        if basis == "mtd":
+            rate = qv(smtd) / mtd_days
+        elif basis == "lmtd":
+            rate = qv(slm) / lm_days
+        elif basis == "lm":
+            rate = qv(slmf) / lmf_days
+        elif basis == "l30":
+            rate = q30 / 30
+        elif basis == "l90":
+            rate = qv(s90) / 90
+        elif basis == "fest":
+            rate = qv(sfest) * growth / win_days
+        else:
+            rate = 0.6 * q7 / 7 + 0.4 * q30 / 30   # recent days count more, so a model picking up is caught early
+            if q7 == 0 and q30 > 0:
+                rate = q30 / 30 * 0.5
+        seg_m = segmap.get(fam) or guess_seg(fam, segmap)
+        nd = win_days if basis == "fest" else norms.get(seg_m, cover)   # stock norm: days of cover to hold
         price = v30 / q30 if q30 else (m["value"] / m["stock"] if m["stock"] else 0)
         cov = m["stock"] / rate if rate > 0 else None
-        need = max(0, int(-(-(rate * (cover + lead) - m["stock"]) // 1))) if rate > 0 else 0
+        need = max(0, int(-(-(rate * (nd + lead) - m["stock"]) // 1))) if rate > 0 else 0
+        norm_qty = int(-(-(rate * nd) // 1)) if rate > 0 else 0
+        sold_any = q30 > 0 or rate > 0
         if m["stock"] <= 0:
             status = "out"
-        elif q30 == 0:
+        elif not sold_any:
             status = "dead"
         elif cov is not None and cov <= lead + 2:
             status = "critical"
-        elif cov is not None and cov < cover:
+        elif cov is not None and cov < nd:
             status = "low"
-        elif cov is not None and cov > max(60, cover * 4):
+        elif cov is not None and cov > max(60, nd * 4):
             status = "excess"
         else:
             status = "ok"
         trend = "up" if q30 and q7 / 7 > q30 / 30 * 1.25 else "down" if q30 and q7 / 7 < q30 / 30 * 0.75 else "flat"
         lr = last_sale.get(fam) if hasattr(last_sale, "get") else None
-        rows.append({"name": fam, "seg": segmap.get(fam) or guess_seg(fam, segmap), "known": m["known"], "stock": m["stock"], "value": round(m["value"]),
+        rows.append({"name": fam, "seg": seg_m, "known": m["known"], "stock": m["stock"], "value": round(m["value"]),
+                     "norm": nd, "norm_qty": norm_qty, "gap": norm_qty - m["stock"], "s90": round(qv(s90)), "lm": round(qv(slmf)),
+                     "fest_q": round(qv(sfest) * growth) if sfest is not None else None,
                      "s7": round(q7), "s30": round(q30), "mtd": round(float(smtd.at[fam, "q"])) if fam in smtd.index else 0,
                      "lmtd": round(float(slm.at[fam, "q"])) if fam in slm.index else 0, "v30": round(v30),
                      "rate": round(rate, 2), "cover": round(cov, 1) if cov is not None else None,
@@ -12119,6 +12793,18 @@ def stock_analysis(st, store, cover=15, lead=3):
         g["cover"] = round(g["stock"] / g["rate"], 1) if g["rate"] else None
         g["rate"] = round(g["rate"], 2)
         segs.append(g)
+    colors = {}
+    for r in rows:
+        for x in r["skus"]:
+            c = colors.setdefault(x["color"], {"color": x["color"], "stock": 0, "value": 0.0, "s30": 0, "known": False, "models": set()})
+            c["stock"] += x["qty"]
+            c["value"] += float(x["value"] or 0)
+            if x["s30"] is not None:
+                c["s30"] += x["s30"]
+                c["known"] = True
+            c["models"].add(r["name"])
+    color_rows = sorted(({**c, "value": round(c["value"]), "models": len(c["models"]), "share": round(c["stock"] / (tot_q or 1) * 100, 1)}
+                         for c in colors.values()), key=lambda c: -c["stock"])
     need_rows = [r for r in rows if r["need"] > 0]
     dead_v = sum(r["value"] for r in rows if r["status"] == "dead")
     excess_v = sum(r["value"] for r in rows if r["status"] == "excess")
@@ -12157,7 +12843,8 @@ def stock_analysis(st, store, cover=15, lead=3):
         g = mism[0]
         actions.append({"tone": "warn", "text": f"{esc_html(g['name'])} holds {g['stock_share']:g}% of the stock but brings {g['sales_share']:g}% of 30-day unit sales: rebalance the next order."})
     grand = (rec.get("head_info") or {}).get("grand")
-    return {**out, "empty": False, "file": rec.get("file"), "uploaded": rec.get("uploaded"), "as_of": rec.get("as_of"),
+    return {**out, "empty": False, "file": rec.get("file"), "uploaded": rec.get("uploaded"), "as_of": rec.get("as_of"), "colors": color_rows,
+            "seg_list": sorted({r["seg"] for r in rows if r["seg"]}), "basis_label": STOCK_BASIS[basis],
             "sales_to": dmax.strftime("%Y-%m-%d"), "check": rec.get("check", ""),
             "kpis": {"stock": tot_q, "value": round(tot_v), "models": sum(1 for r in rows if r["stock"] > 0),
                      "cover": round(tot_q / tot_rate, 1) if tot_rate else None, "rate": round(tot_rate, 2),
@@ -12216,7 +12903,10 @@ def api_stock():
             lead = max(0, min(30, int(request.args.get("lead", 3))))
         except ValueError:
             cover, lead = 15, 3
-        return stock_analysis(st, store, cover, lead)
+        try:
+            return stock_analysis(st, store, cover, lead, request.args.get("basis", "blend"), request.args.get("fest", ""))
+        except Exception as exc:  # noqa: BLE001 - one bad stock line never takes the page down
+            return {"stores": stores, "store": store, "error": f"Could not analyse this store's stock: {exc}. Upload the file again."}
     return api(run)
 
 
@@ -12242,9 +12932,21 @@ def api_stock_post():
         return jsonify({"error": "No stock lines were found in that file (each line needs a model name and a quantity, e.g. '7 Nos')."}), 400
     daily = daily_frame(st)
     stores = sorted(s for s in daily["store"].unique() if s) if daily is not None else []
-    store = match_stock_store(head.get("head", ""), stores, request.form.get("store", ""))
+    page_store = request.form.get("store", "") if request.form.get("store", "") in stores else ""
+    file_store = match_stock_store(head.get("head", ""), stores)
+    choice = request.form.get("use", "")
+    if choice == "file" and file_store:
+        store = file_store
+    elif choice == "page" and page_store:
+        store = page_store
+    elif file_store and page_store and file_store != page_store:
+        # never switch stores silently: the page asks which store this file is for
+        return jsonify({"mismatch": True, "file_store": file_store, "page_store": page_store,
+                        "error": f"This file is for {file_store}, but {page_store} is picked."}), 409
+    else:
+        store = page_store or file_store
     if not store:
-        return jsonify({"error": "Pick the store this stock belongs to.", "need_store": True}), 400
+        return jsonify({"error": "Pick the store this stock belongs to at the top, then upload again.", "need_store": True}), 400
     tq, tv = sum(it["qty"] for it in items), round(sum(it["value"] for it in items), 2)
     g = head.get("grand")
     check = ""
@@ -12257,7 +12959,8 @@ def api_stock_post():
     for it in items:
         it["model"] = map_stock_item(it, sku_fam, fam_norms)[0]
     stk = load_stock()
-    stk[store] = {"items": items, "file": name, "uploaded": datetime.now().strftime("%d %b %Y, %I:%M %p"),
+    old_norms = (stk.get(store) or {}).get("norms") or {}
+    stk[store] = {"norms": old_norms, "items": items, "file": name, "uploaded": datetime.now().strftime("%d %b %Y, %I:%M %p"),
                   "as_of": head.get("as_of") or eod_today().strftime("%Y-%m-%d"), "check": check,
                   "head_info": {"grand": g} if g else {}}
     save_stock(stk)
@@ -12265,6 +12968,28 @@ def api_stock_post():
     res = stock_analysis(st, store)
     res["saved"] = f"{len(items)} lines, {tq} units read for {store}."
     return jsonify(res)
+
+
+@app.post("/api/stock/norms")
+@admin_api
+def api_stock_norms():
+    body = request.get_json(silent=True) or {}
+    stk = load_stock()
+    store = str(body.get("store", ""))
+    if store not in stk:
+        return jsonify({"error": "Upload this store's stock first."}), 400
+    norms = {}
+    for k, v in (body.get("norms") or {}).items():
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= n <= 120:
+            norms[str(k)[:30]] = n
+    stk[store]["norms"] = norms
+    save_stock(stk)
+    audit("stock norms saved", f"{store} · {norms}")
+    return jsonify({"ok": True, "norms": norms})
 
 
 @app.post("/api/stock/clear")
@@ -12388,7 +13113,7 @@ def roster_data(st, args):
     shifts = R["shifts"].get(store) or DEFAULT_SHIFTS
     return {"stores": stores, "store": store, "scope": [store], "week": wk.strftime("%Y-%m-%d"),
             "week_label": f"{wk.day} {wk:%b} – {days[-1].day} {days[-1]:%b %Y}", "week_no": week_no,
-            "days": [{"date": x.strftime("%Y-%m-%d"), "label": f"{x:%a}", "num": x.day, "mon": f"{x:%b}",
+            "days": [{"date": x.strftime("%Y-%m-%d"), "label": f"{x:%a}", "num": x.day, "mon": f"{x:%b}", "tag": day_tags([x]).get(x.strftime("%Y-%m-%d")),
                       "exp_v": round(load[x.weekday()]), "exp_q": round(loadq[x.weekday()], 1),
                       "busy": x.weekday() in set(sorted(range(7), key=lambda i: -load[i])[:2])} for x in days],
             "spcs": [{"name": s, "v": round(float(act.at[s, "v"])) if s in act.index else 0,
@@ -12645,7 +13370,8 @@ def review_data(st, args):
             names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
             tk.append(f"Over 12 weeks, <b>{names[int(wdm.idxmax())]}</b> is the busiest weekday and <b>{names[int(wdm.idxmin())]}</b> the quietest: put week-offs on quiet days.")
     topics.append({"id": "days", "title": "Day-wise pattern", "tone": "warn" if len(dd) and (dd < dd.mean() * 0.7).sum() > 3 else "good",
-                   "spark": [round(float(dd.get(x, 0))) for x in pd.date_range(s, eff)], "takeaways": tk or ["No sales yet."],
+                   "spark": [round(float(dd.get(x, 0))) for x in pd.date_range(s, eff)],
+                   "spark_tags": [day_tags([x]).get(x.strftime("%Y-%m-%d")) for x in pd.date_range(s, eff)], "takeaways": tk or ["No sales yet."],
                    "links": [{"label": "Day-wise sales", "href": qlink("/", "mode=month") + "#daywise"}, {"label": "Duty roster", "href": qlink("/roster")}]})
 
     # 7. zero sell-out
@@ -12667,9 +13393,9 @@ def review_data(st, args):
     if gaps and gaps[0][1]:
         n, miss = gaps[0]
         tk.append(f"{esc_html(n)} has not sold {len(miss)} of the store's top {len(topm)} models ({', '.join(esc_html(f) for f in miss[:4])}).")
-    topics.append({"id": "zero", "title": "Zero sell-out", "tone": "bad" if len(zero_models) > 3 else "warn" if zero_models or (gaps and len(gaps[0][1]) >= 3) else "good",
+    topics.append({"id": "zero", "title": "Sell-out gaps", "tone": "bad" if len(zero_models) > 3 else "warn" if zero_models or (gaps and len(gaps[0][1]) >= 3) else "good",
                    "takeaways": tk or ["Every model that sold before has sold this month."],
-                   "links": [{"label": "Zero Sell-Out report", "href": qlink("/zero", "preset=mtd")}] +
+                   "links": [{"label": "Sell-Out Gap Analysis", "href": qlink("/zero", "preset=mtd")}] +
                             ([{"label": f"{gaps[0][0]}'s zero models", "href": qlink("/zero", "preset=mtd&spc=" + urllib.parse.quote(gaps[0][0]))}] if gaps and gaps[0][1] else [])})
 
     # 8. activations
@@ -12748,9 +13474,10 @@ PAGE_GUIDE = {
     "/eod": "EOD Report builds today's end-of-day message: you type today's figures, month-to-date comes from the sheet, and it is shared on WhatsApp.",
     "/activation": "Activations & Claims lists sales still waiting for activation (oldest first) and how many uploaded records were accepted or rejected.",
     "/review": "Review Meeting gathers the month's most important findings for a management review: each topic has its status, numbers, takeaways and links to the data behind it.",
-    "/zero": "Zero Sell-Out lists models that sold before (or are in stock) but sold nothing in the chosen period, for the store or for one SPC.",
+    "/zero": "Sell-Out Gap Analysis lists models that sold before (or are in stock) but sold nothing in the chosen period, for the store or for one SPC.",
     "/stock": "Stock & Sell-Out reads a stock statement (Excel or PDF) and sets it against live sales: days of cover, run-out dates, what to re-order and what is not moving.",
     "/roster": "Duty Roster plans each store's week: shifts and week-offs for every SPC, with week-offs suggested on the store's quietest days.",
+    "/prices": "Price & Offers keeps every price list you upload by its date, sets price changes against units a day and ASP before and after, and records offers model-wise or segment-wise with their effect.",
     "/campaigns": "Campaign Multipliers count chosen models' units and value N times over a date range (for example an A17 drive at 2x), in every total on every page.",
 }
 SECTION_HELP = [
@@ -12790,11 +13517,19 @@ SECTION_HELP = [
     (r"re-?order", "the suggested order for each model to hold the chosen days of cover plus the lead time."),
     (r"segment mix", "each segment's share of the stock against its share of the last 30 days' sales; a big gap means the stock is out of balance."),
     (r"run-?out", "when each model will run out at its current pace."),
-    (r"zero sell-?out|models with no sales", "models that sold in the reference window (or are in stock) but sold nothing in the period."),
-    (r"spc coverage", "for each SPC, how many of the models the store sold in the period they sold too; zeros are their gaps."),
+    (r"zero sell-?out|models with no sales|models not selling|sell-?out gap", "models that sold in the reference window (or are in stock) but sold nothing in the period."),
+    (r"spc (?:range )?coverage", "for each SPC, how many of the models the store sold in the period they sold too; zeros are their gaps."),
     (r"weekly roster|roster", "each SPC's shift for each day of the week; tap a cell to change it."),
     (r"coverage", "how many SPCs work each shift each day, against the store's usual sales for that weekday."),
     (r"shift timings", "the store's shift names and hours."),
+    (r"price bracket", "each SPC's sales split by price bracket (price of one unit: under 15K up to 1L+), as a share of each bracket or of the SPC's own sales."),
+    (r"categories by spc", "each SPC's sales split by product category (smartphones, tabs, wearables, NPC, accessories, Care+)."),
+    (r"spc history", "each SPC month by month, store by store, with a total, the average of full months and the latest month against the one before."),
+    (r"colou?r", "stock by colour and memory / size for every model, with 30-day sales by SKU where the sheet has SKU codes."),
+    (r"price changes", "each model's price in the latest list against the list before, and units a day for 14 days before and after the new prices."),
+    (r"offers", "each offer (model-wise or segment-wise) with units a day during it against the same number of days just before, units, value and estimated cost."),
+    (r"price (?:&|and) asp", "the price-list price against the ASP actually sold, week by week."),
+    (r"holidays", "the holiday and festival calendar used to mark days everywhere and to plan festival stock."),
     (r"campaigns?", "the campaigns with their models, dates, multipliers and how much they add to the totals."),
 ]
 EXPLAIN_PAGE = re.compile(r"\b(?:explain|describe|summari[sz]e|overview of|walk me through|guide me|tour)\b.*\b(?:page|screen|this|here|dashboard|view)\b"
@@ -12886,12 +13621,12 @@ APP_HELP.extend([
                "Each topic card shows its status colour, key numbers, takeaways and <b>Open data</b> links straight to the table behind it.",
                "Use the share icon to send a topic on WhatsApp, or save it as an image or Excel; <b>Print</b> gives a clean handout."],
      "link": "/review", "rel": ["zero_page", "stock_page"]},
-    {"id": "zero_page", "q": "How do I find models with zero sales?", "page": "/zero",
+    {"id": "zero_page", "q": "How do I find models that are not selling?", "page": "/zero",
      "strong": [r"\bzero (?:sell|sale|sales)\b", r"\bno sales?\b.*\bmodels?\b", r"\bnil sales?\b", r"\bnot sold\b"],
      "text": PAGE_GUIDE["/zero"],
      "steps": ["Pick the store and the period (MTD, Last 7 / 15 / 30 days, Last month or Custom).",
                "Type or pick an <b>SPC name</b> to see the models the store sold that this SPC did not.",
-               "<b>SPC coverage</b> ranks every SPC by how many of the store's selling models they missed.",
+               "<b>SPC Range Coverage</b> ranks every SPC by how many of the store's selling models they missed.",
                "With a stock file loaded, in-stock models with no sale are listed first."],
      "link": "/zero", "rel": ["review_page", "stock_page"]},
     {"id": "stock_page", "q": "How do I upload stock and see what to re-order?", "page": "/stock",
@@ -12918,10 +13653,18 @@ APP_HELP.extend([
                "<b>Save</b> (admin passcode needed). Every page then counts those sales that many times; switch a campaign off to stop it.",
                "Each campaign shows how many units and how much value it adds."],
      "link": "/campaigns", "rel": ["review_page"]},
+    {"id": "price_page", "q": "How do I see the effect of a price change or an offer?", "page": "/prices",
+     "strong": [r"\bprice (?:list|change|drop|cut|increase|hike)s?\b", r"\boffers?\b", r"\bcashback\b", r"\bbank offer\b", r"\bprice impact\b"],
+     "text": PAGE_GUIDE["/prices"],
+     "steps": ["Open <b>Price &amp; Offers</b>, set <b>Prices from</b> (the list's date) and tap <b>Upload price list</b> (Excel, CSV or PDF; admin passcode needed).",
+               "Each upload is kept by its date. <b>Price Changes &amp; Impact</b> compares the latest list with the one before: change in ₹ and %, units a day 14 days before and after, and ASP.",
+               "Tap <b>Add offer</b>, choose <b>Model-wise</b> or <b>Segment-wise</b>, pick the models or segments, type, amount, dates and stores.",
+               "<b>Offers &amp; Impact</b> shows units a day during each offer against the same days just before, with value and estimated cost."],
+     "link": "/prices", "rel": ["stock_page", "campaign_page"]},
     {"id": "share_sheet", "q": "How do I save or share a section?", "strong": [r"\bshare\b.*\bsection\b", r"\bexport\b", r"\bdownload\b", r"\bexcel\b", r"\bcsv\b", r"\bpng\b", r"\bimage\b"],
      "text": "Every section heading has a share icon (a box with an arrow):",
-     "steps": ["<b>Save image</b> saves the section as a PNG.", "<b>Excel</b> downloads its tables as a spreadsheet with real numbers (SPC Scorecard, Products × SPC and Daily Contribution come as full data).",
-               "<b>CSV</b> gives the same as a plain file.", "<b>WhatsApp</b> sends the section's headline and rows as text; on a phone, <b>More…</b> opens the phone's share sheet."],
+     "steps": ["<b>Save image</b> saves the section as a PNG.", "<b>Excel</b> downloads a neat workbook: title, bold header, number formats, frozen header row, filters and totals in bold (big tables come as full data with both value and units).",
+               "<b>CSV</b> gives the same as a plain file.", "<b>WhatsApp · text</b> sends the headline and rows as text; <b>WhatsApp · picture</b> sends the section as an image (on a computer the picture is copied, so paste it into the chat)."],
      "rel": ["review_page"]},
     {"id": "drive_history", "q": "Where does the older sales history come from?", "strong": [r"\bgoogle drive\b", r"\bmaster (?:file|data|sheet)\b", r"\bhistory\b.*\b(?:file|data)\b", r"\bmtd file\b", r"\bmerg\w*\b"],
      "text": "When the server has MASTER_DATA_URL set, the full history is read from that Google Drive file and joined in memory with the uploaded file:",
@@ -12931,6 +13674,658 @@ APP_HELP.extend([
      "rel": ["upload"]},
 ])
 APP_HELP_BY_ID.update({h["id"]: h for h in APP_HELP})
+
+
+# ════════════════════════════════════════════════════════════════════
+#  HOLIDAYS & FESTIVALS (Tamil Nadu government list; editable on the Duty Roster page)
+#  kind 'fest' = a festival (its eve and the day after are marked too); 'gov' = a government holiday
+# ════════════════════════════════════════════════════════════════════
+HOLIDAYS_BUILTIN = {
+    # 2024
+    "2024-01-01": ("New Year's Day", "gov"), "2024-01-15": ("Pongal", "fest"), "2024-01-16": ("Thiruvalluvar Day", "gov"),
+    "2024-01-17": ("Uzhavar Thirunal", "gov"), "2024-01-25": ("Thai Poosam", "fest"), "2024-01-26": ("Republic Day", "gov"),
+    "2024-03-29": ("Good Friday", "gov"), "2024-04-09": ("Telugu New Year", "gov"), "2024-04-11": ("Ramzan", "fest"),
+    "2024-04-14": ("Tamil New Year", "fest"), "2024-04-21": ("Mahavir Jayanti", "gov"), "2024-05-01": ("May Day", "gov"),
+    "2024-06-17": ("Bakrid", "fest"), "2024-07-17": ("Muharram", "gov"), "2024-08-15": ("Independence Day", "gov"),
+    "2024-08-26": ("Krishna Jayanthi", "fest"), "2024-09-07": ("Vinayakar Chathurthi", "fest"), "2024-09-16": ("Milad-un-Nabi", "gov"),
+    "2024-10-02": ("Gandhi Jayanti", "gov"), "2024-10-11": ("Ayutha Pooja", "fest"), "2024-10-12": ("Vijaya Dasami", "fest"),
+    "2024-10-31": ("Deepavali", "fest"), "2024-12-25": ("Christmas", "fest"),
+    # 2025
+    "2025-01-01": ("New Year's Day", "gov"), "2025-01-14": ("Pongal", "fest"), "2025-01-15": ("Thiruvalluvar Day", "gov"),
+    "2025-01-16": ("Uzhavar Thirunal", "gov"), "2025-01-26": ("Republic Day", "gov"), "2025-02-11": ("Thai Poosam", "fest"),
+    "2025-03-30": ("Telugu New Year", "gov"), "2025-03-31": ("Ramzan", "fest"), "2025-04-10": ("Mahavir Jayanti", "gov"),
+    "2025-04-14": ("Tamil New Year", "fest"), "2025-04-18": ("Good Friday", "gov"), "2025-05-01": ("May Day", "gov"),
+    "2025-06-07": ("Bakrid", "fest"), "2025-07-06": ("Muharram", "gov"), "2025-08-15": ("Independence Day", "gov"),
+    "2025-08-16": ("Krishna Jayanthi", "fest"), "2025-08-27": ("Vinayakar Chathurthi", "fest"), "2025-09-05": ("Milad-un-Nabi", "gov"),
+    "2025-10-01": ("Ayutha Pooja", "fest"), "2025-10-02": ("Vijaya Dasami", "fest"), "2025-10-20": ("Deepavali", "fest"),
+    "2025-12-25": ("Christmas", "fest"),
+    # 2026
+    "2026-01-01": ("New Year's Day", "gov"), "2026-01-15": ("Pongal", "fest"), "2026-01-16": ("Thiruvalluvar Day", "gov"),
+    "2026-01-17": ("Uzhavar Thirunal", "gov"), "2026-01-26": ("Republic Day", "gov"), "2026-02-01": ("Thai Poosam", "fest"),
+    "2026-03-19": ("Telugu New Year", "gov"), "2026-03-21": ("Ramzan", "fest"), "2026-03-31": ("Mahavir Jayanti", "gov"),
+    "2026-04-03": ("Good Friday", "gov"), "2026-04-14": ("Tamil New Year", "fest"), "2026-05-01": ("May Day", "gov"),
+    "2026-05-28": ("Bakrid", "fest"), "2026-06-26": ("Muharram", "gov"), "2026-08-15": ("Independence Day", "gov"),
+    "2026-08-26": ("Milad-un-Nabi", "gov"), "2026-09-04": ("Krishna Jayanthi", "fest"), "2026-09-14": ("Vinayakar Chathurthi", "fest"),
+    "2026-10-02": ("Gandhi Jayanti", "gov"), "2026-10-19": ("Ayutha Pooja", "fest"), "2026-10-20": ("Vijaya Dasami", "fest"),
+    "2026-11-08": ("Deepavali", "fest"), "2026-12-25": ("Christmas", "fest"),
+    # 2027 (moon-sighting dates may move by a day; correct them on the Duty Roster page)
+    "2027-01-01": ("New Year's Day", "gov"), "2027-01-15": ("Pongal", "fest"), "2027-01-16": ("Thiruvalluvar Day", "gov"),
+    "2027-01-17": ("Uzhavar Thirunal", "gov"), "2027-01-22": ("Thai Poosam", "fest"), "2027-01-26": ("Republic Day", "gov"),
+    "2027-03-10": ("Ramzan", "fest"), "2027-03-26": ("Good Friday", "gov"), "2027-04-07": ("Telugu New Year", "gov"),
+    "2027-04-14": ("Tamil New Year", "fest"), "2027-04-18": ("Mahavir Jayanti", "gov"), "2027-05-01": ("May Day", "gov"),
+    "2027-05-17": ("Bakrid", "fest"), "2027-06-16": ("Muharram", "gov"), "2027-08-15": ("Independence Day", "gov"),
+    "2027-08-25": ("Krishna Jayanthi", "fest"), "2027-09-04": ("Vinayakar Chathurthi", "fest"), "2027-10-02": ("Gandhi Jayanti", "gov"),
+    "2027-10-08": ("Ayutha Pooja", "fest"), "2027-10-09": ("Vijaya Dasami", "fest"), "2027-10-28": ("Deepavali", "fest"),
+    "2027-12-25": ("Christmas", "fest"),
+}
+HOLIDAYS_PATH = os.path.join(UPLOAD_DIR, "holidays.json")
+_FEST_ALIAS = {"diwali": "deepavali", "deepawali": "deepavali", "idulfitr": "ramzan", "eidulfitr": "ramzan", "ramadan": "ramzan",
+               "eidaladha": "bakrid", "idulzuha": "bakrid", "ganeshchaturthi": "vinayakarchathurthi", "vinayagarchathurthi": "vinayakarchathurthi",
+               "ayudhapooja": "ayuthapooja", "ayudhapuja": "ayuthapooja", "dussehra": "vijayadasami", "vijayadashami": "vijayadasami",
+               "janmashtami": "krishnajayanthi", "sankranti": "pongal", "xmas": "christmas"}
+
+
+def fest_key(name):
+    k = re.sub(r"[^a-z]", "", str(name).lower())
+    return _FEST_ALIAS.get(k, k)
+
+
+def holiday_user():
+    try:
+        with open(HOLIDAYS_PATH, encoding="utf-8") as fh:
+            d = json.load(fh)
+        return {"add": d.get("add") or {}, "removed": d.get("removed") or []}
+    except (OSError, ValueError):
+        return {"add": {}, "removed": []}
+
+
+def holiday_map():
+    """date (YYYY-MM-DD) -> (name, kind): the built-in list with the user's additions and removals."""
+    u = holiday_user()
+    out = {k: v for k, v in HOLIDAYS_BUILTIN.items() if k not in set(u["removed"])}
+    for k, v in u["add"].items():
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", k) and isinstance(v, (list, tuple)) and len(v) == 2:
+            out[k] = (str(v[0])[:40], "fest" if v[1] == "fest" else "gov")
+    return out
+
+
+def day_tags(days):
+    """For each day that needs a mark: weekday (Fri / Sat / Sun), the holiday or festival, or the eve / day after a festival."""
+    hm = holiday_map()
+    out = {}
+    for d in days:
+        d = pd.Timestamp(d)
+        k = d.strftime("%Y-%m-%d")
+        t = {}
+        if d.weekday() >= 4:
+            t["wd"] = f"{d:%a}"
+        if k in hm:
+            t["hol"], t["kind"] = hm[k]
+        nxt, prv = (d + DAY).strftime("%Y-%m-%d"), (d - DAY).strftime("%Y-%m-%d")
+        if nxt in hm and hm[nxt][1] == "fest" and "hol" not in t:
+            t["eve"] = hm[nxt][0]
+        if prv in hm and hm[prv][1] == "fest" and "hol" not in t:
+            t["after"] = hm[prv][0]
+        if t:
+            out[k] = t
+    return out
+
+
+def festival_dates():
+    out = {}
+    for k, (name, kind) in holiday_map().items():
+        if kind == "fest":
+            out.setdefault(fest_key(name), {"name": name, "dates": []})["dates"].append(pd.Timestamp(k))
+    for v in out.values():
+        v["dates"].sort()
+    return out
+
+
+def festival_options(ref, ahead=150):
+    """Festivals coming up (from `ref`) with last year's date of the same festival, for stock planning."""
+    res = []
+    for key, v in festival_dates().items():
+        nxt = next((d for d in v["dates"] if ref - pd.Timedelta(days=3) <= d <= ref + pd.Timedelta(days=ahead)), None)
+        if nxt is None:
+            continue
+        ly = next((d for d in reversed(v["dates"]) if pd.Timedelta(days=300) <= nxt - d <= pd.Timedelta(days=420)), None)
+        if ly is not None:
+            res.append({"key": key, "name": v["name"], "date": nxt.strftime("%Y-%m-%d"), "ly": ly.strftime("%Y-%m-%d"),
+                        "in": int((nxt - ref).days)})
+    return sorted(res, key=lambda x: x["date"])
+
+
+@app.get("/api/holidays")
+def api_holidays():
+    year = request.args.get("year", "")
+    hm = holiday_map()
+    u = holiday_user()
+    items = [{"date": k, "name": v[0], "kind": v[1], "builtin": k in HOLIDAYS_BUILTIN and k not in u["add"]}
+             for k, v in sorted(hm.items()) if not year or k.startswith(year)]
+    return jsonify({"items": items, "years": sorted({k[:4] for k in hm})})
+
+
+@app.post("/api/holidays")
+@admin_api
+def api_holidays_post():
+    body = request.get_json(silent=True) or {}
+    u = holiday_user()
+    for it in body.get("add") or []:
+        dd = parse_date(it.get("date"))
+        name = re.sub(r"\s+", " ", str(it.get("name") or "")).strip()[:40]
+        if dd is None or not name:
+            return jsonify({"error": "Not saved: each holiday needs a date and a name."}), 400
+        k = dd.strftime("%Y-%m-%d")
+        u["add"][k] = [name, "fest" if it.get("kind") == "fest" else "gov"]
+        if k in u["removed"]:
+            u["removed"].remove(k)
+    for k in body.get("remove") or []:
+        k = str(k)[:10]
+        u["add"].pop(k, None)
+        if k in HOLIDAYS_BUILTIN and k not in u["removed"]:
+            u["removed"].append(k)
+    tmp = HOLIDAYS_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(u, fh)
+    os.replace(tmp, HOLIDAYS_PATH)
+    audit("holidays saved", f"{len(body.get('add') or [])} added, {len(body.get('remove') or [])} removed")
+    return api_holidays()
+
+
+# ════════════════════════════════════════════════════════════════════
+#  NEAT EXCEL EXPORTS: every section's data as a styled workbook (title, bold header, number formats,
+#  frozen header row, filters, totals in bold)
+# ════════════════════════════════════════════════════════════════════
+_XNUM = re.compile(r"^\s*([↑↓+\-−]?)\s*₹?\s*(-?[\d,]*\.?\d+)\s*(Cr|L|K|%|pp)?\s*$", re.I)
+
+
+def xl_num(v):
+    if isinstance(v, (int, float)) or v is None:
+        return v
+    t = str(v).strip()
+    m = _XNUM.match(t)
+    if not m or not re.search(r"\d", m.group(2)):
+        return t
+    try:
+        n = float(m.group(2).replace(",", ""))
+    except ValueError:
+        return t
+    u = (m.group(3) or "").lower()
+    n *= {"cr": 1e7, "l": 1e5, "k": 1e3}.get(u, 1)
+    if m.group(1) in ("↓", "-", "−"):
+        n = -abs(n)
+    return round(n, 2)
+
+
+def build_xlsx(spec):
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+    wb = Workbook()
+    wb.remove(wb.active)
+    title = str(spec.get("title") or "Export")[:120]
+    sub = [str(x)[:300] for x in (spec.get("sub") or []) if str(x).strip()][:4]
+    head_fill = PatternFill("solid", fgColor="DCEBFF")
+    foot_fill = PatternFill("solid", fgColor="EEF4FF")
+    thin = Side(style="thin", color="B8C7DC")
+    hair = Side(style="hair", color="D8DEE8")
+    indian = '[>=10000000]##\\,##\\,##\\,##0;[>=100000]##\\,##\\,##0;##,##0'
+    used = set()
+    for k, sh in enumerate((spec.get("sheets") or [])[:12]):
+        rows = [list(r)[:80] for r in (sh.get("rows") or [])[:20000] if isinstance(r, (list, tuple))]
+        name = re.sub(r"[\[\]:*?/\\]", " ", str(sh.get("name") or title))[:28].strip() or f"Sheet {k + 1}"
+        while name in used:
+            name = name[:24] + f" {k + 1}"
+        used.add(name)
+        ws = wb.create_sheet(name)
+        ws.sheet_view.showGridLines = False
+        r0 = 1
+        ws.cell(r0, 1, title).font = Font(bold=True, size=14, color="1D1D1F")
+        for i, line in enumerate(sub):
+            c = ws.cell(r0 + 1 + i, 1, line)
+            c.font = Font(size=10, color="6E6E73")
+        hr = r0 + len(sub) + 2   # header row
+        if not rows:
+            continue
+        head = [str(x) if x is not None else "" for x in rows[0]]
+        ncol = max(len(r) for r in rows)
+        head += [""] * (ncol - len(head))
+        pct_cols = {j for j, h in enumerate(head) if re.search(r"%|share|ach|growth|mix|coverage|pp\b", h, re.I)}
+        money_cols = {j for j, h in enumerate(head) if re.search(r"value|asp|price|amount|₹|order v|dp\b|mop|mrp|rate|offer", h, re.I) and j not in pct_cols}
+        for j, h in enumerate(head):
+            c = ws.cell(hr, j + 1, h)
+            c.font = Font(bold=True, size=10, color="1D1D1F")
+            c.fill = head_fill
+            c.alignment = Alignment(horizontal="left" if j == 0 else "center", vertical="center", wrap_text=True)
+            c.border = Border(bottom=thin, top=thin)
+        widths = [max(8, min(44, len(h) * 0.9 + 3)) for h in head]
+        for i, r in enumerate(rows[1:], start=1):
+            is_total = bool(r) and re.match(r"(?i)^\s*(store\s+)?total|^\s*all\s|grand total|^\s*sum\b", str(r[0] or ""))
+            for j in range(ncol):
+                v = xl_num(r[j]) if j < len(r) else None
+                c = ws.cell(hr + i, j + 1, v)
+                if isinstance(v, (int, float)):
+                    if j in pct_cols:
+                        c.number_format = '0.00'
+                    elif j in money_cols or abs(v) >= 1000:
+                        c.number_format = indian if float(v).is_integer() or abs(v) >= 1000 else '#,##0.00'
+                    else:
+                        c.number_format = '0' if float(v).is_integer() else '0.00'
+                    c.alignment = Alignment(horizontal="right", vertical="center")
+                else:
+                    c.alignment = Alignment(horizontal="left" if j == 0 else "center", vertical="center")
+                c.border = Border(bottom=hair)
+                if is_total:
+                    c.font = Font(bold=True)
+                    c.fill = foot_fill
+                    c.border = Border(top=thin, bottom=thin)
+                if v is not None:
+                    widths[j] = max(widths[j], min(44, len(f"{v:,.0f}" if isinstance(v, (int, float)) and abs(v) >= 1000 else str(v)) + 3))
+        for j, w in enumerate(widths):
+            ws.column_dimensions[get_column_letter(j + 1)].width = w
+        ws.row_dimensions[hr].height = 30
+        ws.freeze_panes = ws.cell(hr + 1, 2)
+        if len(rows) > 2:
+            ws.auto_filter.ref = f"A{hr}:{get_column_letter(ncol)}{hr + len(rows) - 1}"
+        ws.print_title_rows = f"{hr}:{hr}"
+        ws.page_setup.orientation = "landscape"
+        ws.page_setup.fitToWidth = 1
+    if not wb.worksheets:
+        wb.create_sheet("Sheet 1")
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+@app.post("/api/export/xlsx")
+def api_export_xlsx():
+    spec = request.get_json(silent=True) or {}
+    try:
+        raw = build_xlsx(spec)
+    except Exception as exc:  # noqa: BLE001 - the page falls back to CSV
+        return jsonify({"error": f"Could not build the workbook: {exc}"}), 500
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(spec.get("file") or "export"))[:90].strip("_") or "export"
+    return Response(raw, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": f'attachment; filename="{name}.xlsx"', "Cache-Control": "no-store"})
+
+
+# ════════════════════════════════════════════════════════════════════
+#  STOCK: colour and variant of each line
+# ════════════════════════════════════════════════════════════════════
+COLOR_WORDS = {"black", "white", "silver", "gray", "grey", "blue", "green", "violet", "lavender", "pink", "titanium", "graphite", "gold", "navy",
+               "mint", "cream", "yellow", "red", "coral", "peach", "icy", "ice", "iceblue", "light", "dark", "jet", "jetblack", "shadow", "onyx", "cobalt",
+               "purple", "orange", "bronze", "beige", "olive", "awesome", "phantom", "midnight", "sky", "lime", "rose", "copper", "charcoal", "starlight"}
+
+
+def strip_colors(t):
+    w = t.split()
+    while len(w) > 1 and w[-1].lower().strip("()-_,") in COLOR_WORDS:
+        w.pop()
+    return " ".join(w)
+
+
+_STORAGE = re.compile(r"\(?\s*\d{1,2}\s*/\s*\d{2,4}\s*(?:GB|TB)?\s*\)?|\b\d{2,4}\s*(?:GB|TB)\b", re.I)
+_SIZE = re.compile(r"\b\d{2}\s*mm\b", re.I)
+_CONN = re.compile(r"\b(?:5g|4g|lte|wi-?fi|wifi|bt|bluetooth)\b", re.I)
+
+
+def stock_variant(name, model):
+    """'6/128GB Gray' -> ('6/128GB', 'Gray'); 'Graphite 44MM' -> ('44mm', 'Graphite'); 'LTE 44mm Silver' -> ('LTE 44mm', 'Silver')."""
+    t = stock_short(name, model)
+    parts = []
+    m = _STORAGE.search(t)
+    if m:
+        parts.append(re.sub(r"[()\s]", "", m.group(0)).upper().replace("GB", "GB"))
+        t = t[:m.start()] + " " + t[m.end():]
+    c = _CONN.findall(t)
+    if c:
+        parts = [x.upper() if x.lower() in ("5g", "4g", "lte", "bt") else "Wi-Fi" for x in c] + parts
+        t = _CONN.sub(" ", t)
+    m = _SIZE.search(t)
+    if m:
+        parts.append(m.group(0).replace(" ", "").lower())
+        t = t[:m.start()] + " " + t[m.end():]
+    rest = re.sub(r"\s+", " ", re.sub(r"[()_\-]+", " ", t)).strip()
+    words = rest.split()
+    tail = []   # the colour is the run of colour words at the end ('Z Fold8 Ultra Violet' -> 'Violet', 'Titanium Black' -> 'Titanium Black')
+    while words and words[-1].lower() in COLOR_WORDS:
+        tail.insert(0, words.pop())
+    color = " ".join(tail) if tail else re.sub(r"(?i)^(plus|ultra|fe|lite|classic|pro)\s+", "", rest)
+    return " ".join(parts), (color.title() if color else "–")
+
+
+# ════════════════════════════════════════════════════════════════════
+#  PRICE & OFFERS: each price list uploaded is kept by its date; price changes are set against sales
+#  (units per day and ASP before and after), and offers (model-wise or segment-wise, in one place) against
+#  the same number of days before them
+# ════════════════════════════════════════════════════════════════════
+PRICES_PATH = os.path.join(UPLOAD_DIR, "prices.json")
+OFFER_KINDS = ["Cashback", "Bank offer", "Exchange bonus", "Discount", "EMI / finance", "Gift", "Other"]
+
+
+def load_prices():
+    try:
+        with open(PRICES_PATH, encoding="utf-8") as fh:
+            d = json.load(fh)
+        if isinstance(d, dict):
+            d.setdefault("lists", [])
+            d.setdefault("offers", [])
+            return d
+    except (OSError, ValueError):
+        pass
+    return {"lists": [], "offers": []}
+
+
+def save_prices(d):
+    tmp = PRICES_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(d, fh)
+    os.replace(tmp, PRICES_PATH)
+
+
+_PCOL = {"dp": r"\bdp\b|dealer|nlc|net landing|landing|billing|cost|nett?\s*price|purchase",
+         "mop": r"\bmop\b|selling|market operating|best buy|offer price|effective|sale price|nop",
+         "mrp": r"\bmrp\b|retail|list price|\bmsp\b",
+         "offer": r"offer|cashback|cash back|scheme|discount|bank|support|upgrade|exchange|bonus|instant"}
+
+
+def read_price_file(raw, name):
+    """A price list (Excel, CSV or PDF) -> [{name, sku, dp, mop, mrp, offer}] with whatever price columns it has."""
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    if ext == "pdf" or raw[:5] == b"%PDF-":
+        text = ""
+        try:
+            import pdfplumber
+            with pdfplumber.open(io.BytesIO(raw)) as pdf:
+                text = "\n".join((p.extract_text() or "") for p in pdf.pages)
+        except ImportError:
+            import pypdf
+            text = "\n".join((p.extract_text() or "") for p in pypdf.PdfReader(io.BytesIO(raw)).pages)
+        items = []
+        for ln in text.splitlines():
+            nums = [_num(x) for x in re.findall(r"(?<![\w/])\d{1,3}(?:,\d{2,3})+(?:\.\d+)?(?![\w/])|(?<![\w/])\d{4,7}(?:\.\d+)?(?![\w/])", ln)]
+            nums = [x for x in nums if x and 500 <= x <= 1e7]
+            name_part = re.split(r"\s(?:₹|Rs\.?)?\s*\d{1,3}(?:,\d{2,3})+|\s\d{4,7}(?:\.\d+)?\b", ln)[0].strip(" -:")
+            if not nums or len(name_part) < 3 or not re.search(r"[A-Za-z]", name_part):
+                continue
+            sku = ""
+            m = _SKU.search(name_part) or re.search(r"\b([A-Z]{2}-[A-Z0-9]{5,})\b", ln)
+            if m:
+                sku = m.group(1)
+                name_part = name_part.replace(m.group(0), " ").strip(" -")
+            nums_sorted = sorted(nums)
+            items.append({"name": re.sub(r"\s+", " ", name_part), "sku": sku, "dp": nums_sorted[0],
+                          "mop": nums_sorted[1] if len(nums_sorted) > 2 else None, "mrp": nums_sorted[-1] if len(nums_sorted) > 1 else None, "offer": None})
+        return items
+    if ext not in ("xlsx", "xls", "csv"):
+        raise ValueError("only .xlsx, .xls, .csv or .pdf price lists are accepted")
+    buf = io.BytesIO(raw)
+    try:
+        sheet = pd.read_csv(buf, header=None, dtype=str) if ext == "csv" else pd.read_excel(buf, header=None, dtype=str)
+    except ImportError:
+        raise ValueError("reading old .xls files needs the xlrd package on the server; save it as .xlsx instead")
+    sheet = sheet.fillna("")
+    hdr, cols = None, {}
+    for i, r in enumerate(sheet.head(40).values):
+        low = [str(x).strip().lower() for x in r]
+        n = next((j for j, x in enumerate(low) if re.search(r"model|item|product|description|particular|name|variant", x)), None)
+        price = {k: [j for j, x in enumerate(low) if x and re.search(p, x)] for k, p in _PCOL.items()}
+        if n is not None and any(price[k] for k in ("dp", "mop", "mrp")):
+            hdr = i
+            cols = {"name": n, "sku": next((j for j, x in enumerate(low) if re.search(r"\bsku\b|item code|product code|model code|material|part no|code", x) and j != n), None),
+                    **{k: [j for j in v if j != n] for k, v in price.items()}}
+            break
+    if hdr is None:
+        raise ValueError("no header row with a model / product name and a price column (DP, MOP or MRP) was found")
+    items = []
+    for r in sheet.values[hdr + 1:]:
+        name = re.sub(r"\s+", " ", str(r[cols["name"]])).strip()
+        if not name or re.fullmatch(r"(?i)(grand )?total|sub ?total", name):
+            continue
+        val = lambda js: next((x for x in (_num(re.sub(r"[^\d.,-]", "", str(r[j])) or "x") for j in js) if x), None)
+        dp, mop, mrp = val(cols["dp"][:1]), val(cols["mop"][:1]), val(cols["mrp"][:1])
+        offer = sum(x for x in (_num(re.sub(r"[^\d.,-]", "", str(r[j])) or "x") for j in cols["offer"] if j not in (cols["dp"][:1] + cols["mop"][:1] + cols["mrp"][:1])) if x) or None
+        if not (dp or mop or mrp):
+            continue
+        sku = str(r[cols["sku"]]).strip() if cols["sku"] is not None else ""
+        if not sku:
+            m = _SKU.search(name)
+            if m:
+                sku, name = m.group(1), name[:m.start()].strip(" -")
+        items.append({"name": name, "sku": sku.strip("_ "), "dp": dp, "mop": mop, "mrp": mrp, "offer": offer})
+    return items
+
+
+def price_date_from(name, form_date):
+    d = parse_date(form_date)
+    if d is not None:
+        return d.normalize()
+    m = re.search(r"(\d{1,2})[._-](\d{1,2})(?:[._-](\d{2,4}))?", name)
+    if m:
+        day, mon, yr = int(m.group(1)), int(m.group(2)), m.group(3)
+        y = eod_today().year if not yr else (int(yr) + 2000 if len(yr) == 2 else int(yr))
+        try:
+            return pd.Timestamp(y, mon, day)
+        except ValueError:
+            pass
+    return eod_today().normalize()
+
+
+def offer_models(o, fams, segmap):
+    if o.get("scope") == "segment":
+        segs = set(o.get("targets") or [])
+        return [f for f in fams if segmap.get(f) in segs]
+    want = {str(x).lower() for x in (o.get("targets") or [])}
+    return [f for f in fams if f.lower() in want]
+
+
+def prices_data(st, args):
+    daily = daily_frame(st)
+    if daily is None or daily.empty:
+        return {"error": "This sheet has no usable date column."}
+    stores = sorted(s for s in daily["store"].unique() if s)
+    sel = pick_scope(args, stores)
+    d = scope_rows(daily, sel)
+    dmax = daily["day"].max()
+    segmap = fam_segments(daily)
+    fams = sorted({f for f in daily["fam"].unique() if f and f != "Unknown"}, key=str.lower)
+    fam_norms = [(f, _norm_model(f)) for f in fams]
+    P = load_prices()
+    lists = sorted(P["lists"], key=lambda x: (x.get("date", ""), x.get("uploaded_ts", 0)))
+    # each list's price per model (lowest DP of its variants = the entry price; also the highest)
+    per_list = []
+    for L in lists:
+        mm = {}
+        for it in L.get("items", []):
+            fam = it.get("model") or stock_model(it["name"], fam_norms)[0]
+            x = mm.setdefault(fam, {"dp": [], "mop": [], "mrp": [], "offer": [], "variants": 0})
+            x["variants"] += 1
+            for k in ("dp", "mop", "mrp", "offer"):
+                if it.get(k):
+                    x[k].append(float(it[k]))
+        per_list.append({"id": L["id"], "date": L["date"], "file": L.get("file", ""), "models": {
+            f: {"dp": min(v["dp"]) if v["dp"] else None, "dp_hi": max(v["dp"]) if v["dp"] else None, "mop": min(v["mop"]) if v["mop"] else None,
+                "mrp": min(v["mrp"]) if v["mrp"] else None, "offer": max(v["offer"]) if v["offer"] else None, "variants": v["variants"]}
+            for f, v in mm.items()}})
+    sales = d.groupby(["fam", "day"])[["q", "v"]].sum()
+
+    def window(f, a, b):
+        a, b = max(a, daily["day"].min()), min(b, dmax)
+        if a > b or f not in sales.index.get_level_values(0):
+            return 0.0, 0.0, 0
+        part = sales.loc[f]
+        part = part[(part.index >= a) & (part.index <= b)]
+        return float(part["q"].sum()), float(part["v"].sum()), int((b - a).days) + 1
+    latest = per_list[-1] if per_list else None
+    prev = per_list[-2] if len(per_list) > 1 else None
+    rows = []
+    if latest:
+        for f, x in sorted(latest["models"].items(), key=lambda kv: str(kv[0]).lower()):
+            p0 = (prev["models"].get(f) if prev else None) or {}
+            base_p = x["dp"] or x["mop"] or x["mrp"]
+            old_p = p0.get("dp") or p0.get("mop") or p0.get("mrp")
+            chg = (base_p - old_p) if base_p and old_p else None
+            ch_date = pd.Timestamp(latest["date"])
+            hist = [{"date": pl["date"], "dp": pl["models"].get(f, {}).get("dp"), "mop": pl["models"].get(f, {}).get("mop"),
+                     "mrp": pl["models"].get(f, {}).get("mrp"), "offer": pl["models"].get(f, {}).get("offer")} for pl in per_list if f in pl["models"]]
+            qb, vb, nb = window(f, ch_date - pd.Timedelta(days=14), ch_date - DAY)
+            qa, va, na = window(f, ch_date, ch_date + pd.Timedelta(days=13))
+            ub, ua = (qb / nb if nb else None), (qa / na if na else None)
+            uplift = ((ua - ub) / ub * 100) if ub and ua is not None else None
+            pct = (chg / old_p * 100) if chg is not None and old_p else None
+            rows.append({"name": f, "seg": segmap.get(f) or guess_seg(f, segmap), "dp": x["dp"], "dp_hi": x["dp_hi"], "mop": x["mop"], "mrp": x["mrp"],
+                         "offer": x["offer"], "variants": x["variants"], "prev": old_p, "chg": chg, "chg_pct": pct, "hist": hist,
+                         "before": {"upd": round(ub, 2) if ub is not None else None, "asp": round(vb / qb) if qb else None, "days": nb},
+                         "after": {"upd": round(ua, 2) if ua is not None else None, "asp": round(va / qa) if qa else None, "days": na},
+                         "uplift": round(uplift, 1) if uplift is not None else None,
+                         "elastic": round(uplift / pct, 2) if uplift is not None and pct else None,
+                         "sold30": round(window(f, dmax - pd.Timedelta(days=29), dmax)[0])})
+    # weekly ASP and units from sales (last 12 weeks), for the trend lines
+    wk0 = week_start_sun(dmax) - pd.Timedelta(days=7 * 11)
+    weeks = [wk0 + pd.Timedelta(days=7 * i) for i in range(12)]
+    dd = d[d["day"] >= wk0]
+    wk = dd.assign(w=dd["day"].map(week_start_sun)).groupby(["fam", "w"])[["q", "v"]].sum()
+    trend = {}
+    for f in {r["name"] for r in rows} | set(dd.groupby("fam")["v"].sum().sort_values(ascending=False).index[:25]):
+        pts = []
+        for w in weeks:
+            if (f, w) in wk.index:
+                r = wk.loc[(f, w)]
+                pts.append([round(float(r["q"])), round(float(r["v"]) / float(r["q"])) if float(r["q"]) else None])
+            else:
+                pts.append([0, None])
+        trend[f] = pts
+    # offers: during vs the same number of days just before
+    today = eod_today().normalize()
+    offers = []
+    for o in P["offers"]:
+        a, b = parse_date(o.get("start")), parse_date(o.get("end"))
+        if a is None or b is None:
+            continue
+        ms = offer_models(o, fams, segmap)
+        od = d if not o.get("stores") else daily[daily["store"].isin(o["stores"])]
+        part = od[od["fam"].isin(ms)]
+        run_b = min(b, dmax)
+        n = int((run_b - a).days) + 1 if run_b >= a else 0
+        dur = part[(part["day"] >= a) & (part["day"] <= run_b)] if n else part.iloc[0:0]
+        pre = part[(part["day"] >= a - pd.Timedelta(days=max(n, 7))) & (part["day"] < a)]
+        npre = max(n, 7)
+        udur, upre = (float(dur["q"].sum()) / n if n else None), float(pre["q"].sum()) / npre
+        offers.append({**o, "models": ms, "state": "upcoming" if a > today else "ended" if b < today else "live", "range": fmt_range(a, b),
+                       "days": int((b - a).days) + 1, "ran": n, "units": round(float(dur["q"].sum())), "value": round(float(dur["v"].sum())),
+                       "upd": round(udur, 2) if udur is not None else None, "pre_upd": round(upre, 2),
+                       "uplift": round((udur - upre) / upre * 100, 1) if udur is not None and upre else None,
+                       "cost": round(float(dur["q"].sum()) * float(o.get("amount") or 0)) if o.get("unit") != "pct" else
+                               round(float(dur["v"].sum()) * float(o.get("amount") or 0) / 100)})
+    offers.sort(key=lambda o: ({"live": 0, "upcoming": 1, "ended": 2}[o["state"]], o.get("start", "")), reverse=False)
+    ins = []
+    cuts = sorted([r for r in rows if r["chg"] and r["chg"] < 0], key=lambda r: r["chg_pct"] or 0)
+    rises = sorted([r for r in rows if r["chg"] and r["chg"] > 0], key=lambda r: -(r["chg_pct"] or 0))
+    for r in cuts[:3]:
+        ins.append({"tone": "good" if (r["uplift"] or 0) > 0 else "warn", "text": f"<b>{esc_html(r['name'])}</b> price cut {abs(r['chg_pct']):.1f}% (to {inr_full(r['dp'] or r['mop'] or 0)})"
+                    + (f": units a day {r['before']['upd']:g} → {r['after']['upd']:g} ({'+' if r['uplift'] >= 0 else ''}{r['uplift']:.0f}%)." if r["uplift"] is not None else ": too early to see the effect on sales.")})
+    for r in rises[:3]:
+        ins.append({"tone": "bad" if (r["uplift"] or 0) < -10 else "info", "text": f"<b>{esc_html(r['name'])}</b> price up {r['chg_pct']:.1f}%"
+                    + (f": units a day {r['before']['upd']:g} → {r['after']['upd']:g} ({'+' if r['uplift'] >= 0 else ''}{r['uplift']:.0f}%)." if r["uplift"] is not None else ".")})
+    for o in offers:
+        if o["state"] != "upcoming" and o["uplift"] is not None:
+            ins.append({"tone": "good" if o["uplift"] > 10 else "warn" if o["uplift"] < 0 else "info",
+                        "text": f"Offer <b>{esc_html(o.get('name') or o.get('kind', 'Offer'))}</b> on {esc_html(', '.join(o.get('targets') or [])[:80])}: "
+                                f"{o['upd']:g} units a day during it vs {o['pre_upd']:g} before ({'+' if o['uplift'] >= 0 else ''}{o['uplift']:.0f}%), {inr_short(o['value'])} sold."})
+    return {"stores": stores, "scope": sel, "store_label": scope_label(sel), "dmax": dmax.strftime("%Y-%m-%d"), "today": today.strftime("%Y-%m-%d"),
+            "lists": [{"id": L["id"], "date": L["date"], "file": L.get("file", ""), "uploaded": L.get("uploaded", ""), "n": len(L.get("items", []))} for L in reversed(lists)],
+            "latest": latest and {"date": latest["date"], "file": latest["file"]}, "prev": prev and {"date": prev["date"], "file": prev["file"]},
+            "rows": rows, "weeks": [w.strftime("%Y-%m-%d") for w in weeks], "trend": trend, "offers": offers, "insights": ins,
+            "models": fams, "segments": sorted({v for v in segmap.values() if v}), "kinds": OFFER_KINDS, "updated": updated_note()}
+
+
+@app.get("/prices")
+def prices_page():
+    return page(PRICES_HTML)
+
+
+@app.get("/api/prices")
+def api_prices():
+    return api(lambda st: prices_data(st, request.args))
+
+
+@app.post("/api/prices")
+@admin_api
+def api_prices_post():
+    st = get_state()
+    if st is None:
+        return jsonify({"error": "Upload the sales sheet first."}), 400
+    f = request.files.get("file")
+    if not f or not f.filename:
+        return jsonify({"error": "Choose a price list first."}), 400
+    name = os.path.basename(f.filename)[:120]
+    raw = f.read()
+    if len(raw) > 20 * 1024 * 1024:
+        return jsonify({"error": "That price list is over 20 MB."}), 400
+    try:
+        items = read_price_file(raw, name)
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"Couldn't read that price list: {exc}"}), 400
+    if not items:
+        return jsonify({"error": "No prices were found in that file (it needs a model name and a DP, MOP or MRP)."}), 400
+    fams = json.loads(st["ctx"]["boot_json"]).get("family_names", [])
+    fam_norms = [(x, _norm_model(x)) for x in fams]
+    for it in items[:5000]:
+        it["model"] = stock_model(it["name"], fam_norms)[0]
+    date = price_date_from(name, request.form.get("date"))
+    P = load_prices()
+    P["lists"] = [L for L in P["lists"] if L.get("date") != date.strftime("%Y-%m-%d")] + [{
+        "id": secrets.token_urlsafe(8), "date": date.strftime("%Y-%m-%d"), "file": name, "uploaded": datetime.now().strftime("%d %b %Y, %I:%M %p"),
+        "uploaded_ts": time.time(), "items": items[:5000]}]
+    P["lists"] = sorted(P["lists"], key=lambda x: x["date"])[-40:]
+    save_prices(P)
+    audit("price list uploaded", f"{name} · {date:%d %b %Y} · {len(items)} lines")
+    res = prices_data(st, request.form)
+    res["saved"] = f"{len(items)} prices read, dated {date.day} {date:%b %Y}."
+    return jsonify(res)
+
+
+@app.post("/api/prices/delete")
+@admin_api
+def api_prices_delete():
+    body = request.get_json(silent=True) or {}
+    P = load_prices()
+    P["lists"] = [L for L in P["lists"] if L.get("id") != body.get("id")]
+    save_prices(P)
+    return jsonify({"ok": True})
+
+
+@app.post("/api/prices/offers")
+@admin_api
+def api_prices_offers():
+    body = request.get_json(silent=True) or {}
+    st = get_state()
+    if st is None:
+        return jsonify({"error": "No data available."}), 400
+    daily = daily_frame(st)
+    stores = sorted(s for s in daily["store"].unique() if s)
+    clean = []
+    for o in (body.get("offers") or [])[:100]:
+        a, b = parse_date(o.get("start")), parse_date(o.get("end"))
+        targets = [re.sub(r"\s+", " ", str(x)).strip()[:40] for x in (o.get("targets") or []) if str(x).strip()][:40]
+        if a is None or b is None or b < a or not targets:
+            return jsonify({"error": "Not saved: every offer needs models (or segments) and a start and end date."}), 400
+        try:
+            amount = float(o.get("amount") or 0)
+        except (TypeError, ValueError):
+            amount = 0.0
+        oid = str(o.get("id") or "")
+        clean.append({"id": oid if re.fullmatch(r"[A-Za-z0-9_-]{6,40}", oid) else secrets.token_urlsafe(9),
+                      "name": re.sub(r"\s+", " ", str(o.get("name") or "")).strip()[:60],
+                      "scope": "segment" if o.get("scope") == "segment" else "model", "targets": targets,
+                      "kind": o.get("kind") if o.get("kind") in OFFER_KINDS else "Other", "amount": round(max(0.0, amount), 2),
+                      "unit": "pct" if o.get("unit") == "pct" else "inr", "start": a.strftime("%Y-%m-%d"), "end": b.strftime("%Y-%m-%d"),
+                      "stores": [x for x in (o.get("stores") or []) if x in stores], "note": str(o.get("note") or "")[:140]})
+    P = load_prices()
+    P["offers"] = clean
+    save_prices(P)
+    audit("offers saved", f"{len(clean)} offer(s)")
+    return api(lambda st: prices_data(st, request.args))
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -12962,7 +14357,7 @@ REVIEW_HTML = """<!doctype html>
 </body></html>"""
 
 ZERO_HTML = """<!doctype html>
-<html lang="en"><head><title>Zero Sell-Out</title>""" + PAGE_HEAD + """
+<html lang="en"><head><title>Sell-Out Gap Analysis</title>""" + PAGE_HEAD + """
 <script src="/assets/zr.js?v={{ asset_v }}" defer></script>
 </head><body>""" + STORE_TOP + """
 <main class="wrap zr" id="wrap">
@@ -12994,13 +14389,13 @@ ZERO_HTML = """<!doctype html>
   <div class="sec-head"><h2>Summary</h2><span class="sub-note" id="sumNote"></span></div>
   <section class="nx-kpis" id="kpis"></section>
   <div id="spcBlock" hidden>
-    <div class="sec-head"><h2 id="spcHead">SPC Zero Sell-Out</h2><span class="sub-note" id="spcNote"></span></div>
+    <div class="sec-head"><h2 id="spcHead">SPC Sell-Out Gaps</h2><span class="sub-note" id="spcNote"></span></div>
     <section class="card table-card"><div class="tscroll"><table class="cmp" id="spcTable"></table></div></section>
   </div>
-  <div class="sec-head"><h2>Store Zero Sell-Out</h2><span class="sub-note" id="zeroNote"></span></div>
+  <div class="sec-head"><h2>Models Not Selling</h2><span class="sub-note" id="zeroNote"></span></div>
   <div class="chips" id="segChips"></div>
   <section class="card table-card"><div class="tscroll"><table class="cmp" id="zeroTable"></table></div></section>
-  <div class="sec-head"><h2>SPC Coverage</h2><span class="sub-note" id="covNote"></span></div>
+  <div class="sec-head"><h2>SPC Range Coverage</h2><span class="sub-note" id="covNote"></span></div>
   <section class="card table-card"><div class="tscroll"><table class="cmp" id="covTable"></table></div></section>
   <p class="foot" id="updated"></p>
 </main>
@@ -13029,7 +14424,14 @@ STOCK_HTML = """<!doctype html>
         <div class="ctl-rows">
           <div class="ctl-row"><span class="ctl-lab">Cover for</span><div class="chips" id="coverChips" style="margin:0"></div></div>
           <div class="ctl-row"><span class="ctl-lab">Lead time</span><div class="chips" id="leadChips" style="margin:0"></div></div>
+          <div class="ctl-row"><span class="ctl-lab">Based on</span><div class="chips" id="basisChips" style="margin:0"></div></div>
+          <div class="ctl-row" id="festRow" hidden><span class="ctl-lab">Festival</span><div class="chips" id="festChips" style="margin:0"></div></div>
         </div>
+        <p class="stk-basis" id="basisNote" hidden></p>
+        <details class="stk-norms" id="normBox"><summary>Stock norms by segment <small>days of cover to hold</small></summary>
+          <div class="norm-rows" id="normRows"></div>
+          <div class="norm-acts"><span id="normMsg" role="status"></span><button type="button" class="rs-btn primary" id="normSave">Save norms</button></div>
+        </details>
       </div>
     </div>
   </section>
@@ -13045,6 +14447,10 @@ STOCK_HTML = """<!doctype html>
     <section class="card table-card"><div class="tscroll"><table class="cmp stk-t" id="mTable"></table></div></section>
     <div class="sec-head"><h2>Re-order List</h2><span class="sub-note" id="rNote"></span></div>
     <section class="card table-card"><div class="tscroll"><table class="cmp" id="rTable"></table></div></section>
+    <div class="sec-head"><h2>Colour &amp; Variant</h2><span class="sub-note" id="cvNote"></span></div>
+    <section class="card table-card"><div class="tscroll"><table class="cmp" id="cvTable"></table></div></section>
+    <div class="sec-head"><h2>Colour Summary</h2><span class="sub-note">every model together</span></div>
+    <section class="card table-card"><div class="tscroll"><table class="cmp" id="colTable"></table></div></section>
     <div class="sec-head"><h2>Run-out Timeline</h2><span class="sub-note" id="tlNote"></span></div>
     <section class="card"><div class="stk-tl" id="timeline"></div></section>
     <div class="sec-head"><h2>Segment Mix</h2><span class="sub-note">share of stock vs share of 30-day unit sales</span></div>
@@ -13086,6 +14492,13 @@ ROSTER_HTML = """<!doctype html>
   <form class="rs-add" id="addForm" autocomplete="off"><input type="text" id="addIn" placeholder="Add an SPC (name as in the sheet)" aria-label="Add an SPC" maxlength="60"><button type="submit">Add</button></form>
   <div class="sec-head"><h2>Coverage</h2><span class="sub-note" id="cNote">SPCs on duty against the usual sales of each weekday</span></div>
   <section class="card table-card"><div class="tscroll"><table class="cmp" id="cTable"></table></div></section>
+  <div class="sec-head"><h2>Holidays &amp; Festivals</h2><span class="sub-note">Tamil Nadu list · used to mark days on every page and for festival stock plans</span></div>
+  <div class="chips" id="hYears"></div>
+  <section class="card table-card"><div class="tscroll"><table class="cmp" id="hTable" data-nosort></table></div></section>
+  <form class="rs-add hol-add" id="hForm" autocomplete="off">
+    <input type="date" id="hDate" aria-label="Date" required><input type="text" id="hName" placeholder="Name, e.g. Deepavali" maxlength="40" aria-label="Name" required>
+    <select id="hKind" aria-label="Kind"><option value="fest">Festival</option><option value="gov">Holiday</option></select><button type="submit">Add</button></form>
+  <p class="rs-state" id="hState" role="status"></p>
   <p class="foot" id="updated"></p>
 </main>
 </body></html>"""
@@ -13109,6 +14522,53 @@ CAMPAIGN_HTML = """<!doctype html>
 </body></html>"""
 
 NEXT_CSS = r"""
+/* ---------- tables: header stays in view while scrolling inside the box; even columns; sortable headings ---------- */
+.tscroll{max-height:min(72vh,640px);overflow:auto;overscroll-behavior-x:contain}
+.rv-tab.tscroll,.hp-t{max-height:none}
+.cmp thead th{position:sticky;top:0;z-index:3}
+.cmp thead th:first-child{z-index:5}
+.tscroll .cmp tfoot td{position:sticky;bottom:0;z-index:2}
+.tscroll .cmp tfoot td:first-child{z-index:4}
+.tscroll .cmp tfoot tr:nth-last-child(2) td{bottom:48px}
+.tscroll .cmp tfoot tr:nth-last-child(3) td{bottom:96px}
+.cmp.heat thead th:not(:first-child){text-align:center}
+.cmp th:first-child,.cmp td:first-child{z-index:2}
+.cmp.eqw thead th:not(:first-child){width:calc(80% / var(--nc,6))}
+.cmp thead th{white-space:normal;line-height:1.25;min-width:84px}
+.cmp thead th:first-child{min-width:150px}
+.rs-t thead th,.heat thead th{min-width:62px}
+.cmp thead th.srt{cursor:pointer;user-select:none;-webkit-user-select:none}
+.cmp thead th.srt:hover{color:var(--blue)}
+.cmp thead th.srt-asc::after,.cmp thead th.srt-desc::after{display:inline-block;margin-left:4px;font-size:10px;color:var(--blue)}
+.cmp thead th.srt-asc::after{content:"▲"}
+.cmp thead th.srt-desc::after{content:"▼"}
+.x-holder .tscroll{max-height:none!important;overflow:visible!important}
+.x-holder .cmp tfoot td{position:static!important}
+.x-holder .cmp thead th.srt-asc::after,.x-holder .cmp thead th.srt-desc::after{content:none}
+@media print{.tscroll{max-height:none!important;overflow:visible!important}}
+/* section headings: title and share button on one line, centred */
+.sec-head h2{display:inline-flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}
+.sec-head h2 .xbtn{margin:0;position:relative;top:0}
+/* day marks */
+.dt{display:inline-block;margin-left:6px;padding:0 6px;border-radius:7px;font-style:normal;font-size:10px;font-weight:800;line-height:16px;vertical-align:1px;white-space:nowrap}
+.dt.hol{background:color-mix(in srgb,#af52de 16%,transparent);color:#8944ab}
+.dt.fest{background:color-mix(in srgb,#ff9f0a 20%,transparent);color:#b25d00}
+.dt.eve{background:color-mix(in srgb,#ffcc00 22%,transparent);color:#8a6d00}
+.dt.wk{background:color-mix(in srgb,var(--blue) 12%,transparent);color:var(--blue)}
+:root[data-theme=dark] .dt.hol{color:#da8fff}:root[data-theme=dark] .dt.fest{color:#ffb340}:root[data-theme=dark] .dt.eve{color:#ffd60a}
+.cmp tr.dt-we td:first-child,.cmp tr.dt-hol td:first-child,.cmp tr.dt-fest td:first-child{box-shadow:inset 3px 0 0 var(--dtc,transparent),inset -.5px 0 0 var(--sep)}
+.cmp tr.dt-wk{--dtc:color-mix(in srgb,var(--blue) 45%,transparent)}
+.cmp tr.dt-eve{--dtc:#ffcc00}
+.cmp tr.dt-hol{--dtc:#af52de}
+.cmp tr.dt-fest{--dtc:#ff9f0a}
+.cmp tr.dt-wk td:first-child,.cmp tr.dt-eve td:first-child{box-shadow:inset 3px 0 0 var(--dtc),inset -.5px 0 0 var(--sep)}
+.cmp tr.dt-fest td,.cmp tr.dt-hol td{background:color-mix(in srgb,var(--dtc) 7%,var(--card))!important}
+.dt-legend{display:flex;flex-wrap:wrap;gap:6px 4px;margin:-2px 2px 10px;font-size:11.5px;color:var(--label2)}
+.dt-legend .dt{margin-left:0}
+.sx-toast{position:fixed;left:50%;bottom:calc(24px + env(safe-area-inset-bottom));z-index:99;max-width:calc(100% - 32px);padding:10px 16px;border-radius:14px;background:var(--label);color:var(--bg);
+  font-size:13.5px;font-weight:600;box-shadow:0 10px 30px rgba(0,0,0,.25);transform:translate(-50%,20px);opacity:0;pointer-events:none;transition:transform .3s cubic-bezier(.3,1.4,.5,1),opacity .2s}
+.sx-toast.show{transform:translate(-50%,0);opacity:1}
+
 /* ---------- share menu (every section) ---------- */
 .sx-pop{position:fixed;z-index:95;min-width:228px;padding:6px;border-radius:16px;background:color-mix(in srgb,var(--card,#fff) 97%,transparent);
   -webkit-backdrop-filter:blur(30px) saturate(180%);backdrop-filter:blur(30px) saturate(180%);box-shadow:0 14px 44px rgba(0,0,0,.24),0 0 0 .5px var(--sep,rgba(0,0,0,.15));
@@ -13233,6 +14693,22 @@ html[data-view=phone] .rv-hero .rv-btns{justify-content:flex-start}
 .stk-msg{margin:8px 0 0;font-size:13px;font-weight:600}
 .stk-msg.bad{color:var(--down)}.stk-msg.good{color:var(--up)}
 .stk-empty{text-align:center;padding:28px 18px}
+.stk-basis{margin:8px 0 0;font-size:12.5px;color:var(--label2);line-height:1.45}
+.stk-basis b{color:var(--label)}
+.stk-norms{margin-top:10px;border-radius:12px;background:var(--fill);padding:8px 12px}
+.stk-norms summary{cursor:pointer;font-size:13px;font-weight:700}
+.stk-norms summary small{font-weight:500;color:var(--label2);margin-left:6px}
+.norm-rows{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px;margin:10px 0}
+.norm-rows label{display:grid;gap:4px;font-size:12px;font-weight:600;color:var(--label2)}
+.norm-rows input{height:34px;padding:0 10px;border:0;border-radius:9px;background:var(--card);color:var(--label);font:inherit;font-size:15px}
+.norm-acts{display:flex;align-items:center;justify-content:flex-end;gap:10px;font-size:12.5px;color:var(--label2)}
+.stk-pick{position:fixed;inset:0;z-index:120;display:grid;place-items:center;padding:16px;background:rgba(0,0,0,.32)}
+.stk-pick form{width:min(420px,100%);padding:18px;border-radius:18px;background:var(--card);box-shadow:0 20px 60px rgba(0,0,0,.3);display:grid;gap:10px}
+.stk-pick h3{margin:0;font-size:17px}
+.stk-pick p{margin:0;font-size:13.5px;color:var(--label2);line-height:1.45}
+.stk-pick button{height:42px;border:0;border-radius:12px;background:var(--fill);color:var(--label);font:inherit;font-weight:600;cursor:pointer;text-align:left;padding:0 14px}
+.stk-pick button.primary{background:var(--blue);color:#fff}
+.cv-dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:7px;vertical-align:0;box-shadow:inset 0 0 0 1px rgba(0,0,0,.15)}
 .stk-empty h3{margin:6px 0 4px;font-size:18px}
 .stk-empty p{margin:0 auto 4px;max-width:520px;font-size:13.5px;color:var(--label2);line-height:1.5}
 .stk-act{margin:0;padding:0;list-style:none;display:grid;gap:10px}
@@ -13300,6 +14776,10 @@ html[data-view=phone] .tl-row,html[data-view=phone] .tl-axis{grid-template-colum
 .rs-add input{flex:1;min-width:0;height:36px;padding:0 12px;border:0;border-radius:11px;background:var(--fill);color:var(--label);font:inherit;font-size:15px}
 .rs-add button{height:36px;padding:0 16px;border:0;border-radius:11px;background:var(--fill);color:var(--blue);font:inherit;font-weight:700;cursor:pointer}
 .cmp td.warn-cell{color:var(--down);font-weight:700}
+.hol-add{max-width:620px;flex-wrap:wrap}
+.hol-add input[type=date]{flex:0 0 160px}
+.hol-add select{height:36px;padding:0 10px;border:0;border-radius:11px;background:var(--fill);color:var(--label);font:inherit}
+.rs-t th.hday{color:#b25d00}
 /* ---------- campaigns ---------- */
 .cp-intro{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:14px;align-items:center;margin-top:6px}
 .cp-intro p{margin:4px 0 0;font-size:13.5px;line-height:1.5;color:var(--label2)}
@@ -13365,6 +14845,101 @@ async function getJSON(url, opts){
 const onScrollTop = () => { const top = document.getElementById('top'); if (top) window.addEventListener('scroll', () => top.classList.toggle('scrolled', window.scrollY > 4), { passive: true }); };
 window.APU = { esc, compact, full, ls, day, dlabel, getJSON, onScrollTop };
 })();
+
+/* day marks: Friday / Saturday / Sunday, government holidays, festivals and the days just before and after them */
+(function(){
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function chips(t, opts){
+  if (!t) return '';
+  const o = opts || {}, out = [];
+  if (t.hol) out.push(`<i class="dt ${t.kind === 'fest' ? 'fest' : 'hol'}" title="${t.kind === 'fest' ? 'Festival' : 'Government holiday'}">${esc(t.hol)}</i>`);
+  if (t.eve) out.push(`<i class="dt eve" title="The day before ${esc(t.eve)}">Eve of ${esc(t.eve)}</i>`);
+  if (t.after) out.push(`<i class="dt eve" title="The day after ${esc(t.after)}">After ${esc(t.after)}</i>`);
+  if (t.wd && !o.noWd) out.push(`<i class="dt wk">${t.wd === 'Fri' ? 'Fri' : 'Weekend'}</i>`);
+  return out.join('');
+}
+const cls = t => (!t ? '' : [t.wd ? 'dt-wk' : '', t.wd === 'Sat' || t.wd === 'Sun' ? 'dt-we' : '', t.hol ? (t.kind === 'fest' ? 'dt-fest' : 'dt-hol') : '', t.eve || t.after ? 'dt-eve' : ''].filter(Boolean).join(' '));
+const text = t => (!t ? '' : [t.hol, t.eve ? 'Eve of ' + t.eve : '', t.after ? 'After ' + t.after : '', t.wd ? (t.wd === 'Fri' ? 'Friday' : 'Weekend') : ''].filter(Boolean).join(', '));
+window.APDAY = { chips, cls, text };
+})();
+
+/* every data table: tap a heading to sort (A–Z / Z–A, or by number), header kept in view while the table scrolls
+   inside its box, and the columns after the first share the width evenly */
+(function(){
+const clean = t => String(t || '').replace(/\s+/g, ' ').trim();
+const num = txt => {
+  const t = clean(txt).replace(/−/g, '-');
+  const m = t.match(/^([↑↓+-]?)\s*₹?\s*(-?[\d,]*\.?\d+)\s*(Cr|L|K|%|pp)?/i);
+  if (!m || !/\d/.test(m[2])) return null;
+  let n = parseFloat(m[2].replace(/,/g, '')); if (!isFinite(n)) return null;
+  const u = (m[3] || '').toLowerCase();
+  if (u === 'cr') n *= 1e7; else if (u === 'l') n *= 1e5; else if (u === 'k') n *= 1e3;
+  if (m[1] === '↓' || m[1] === '-') n = -Math.abs(n);
+  return n;
+};
+const own = table => table.matches('.rs-t,[data-nosort]') || !!table.querySelector('th[data-sort]');
+const colStart = th => { let i = 0; for (let c = th.previousElementSibling; c; c = c.previousElementSibling) i += c.colSpan || 1; return i; };
+const cellAt = (tr, col) => { let i = 0; for (const c of tr.children) { const span = c.colSpan || 1; if (col >= i && col < i + span) return span > 1 ? null : c; i += span; } return null; };
+const state = new WeakMap();
+let busy = false;
+function apply(table){
+  const st = state.get(table); if (!st) return;
+  const head = table.tHead && [...table.tHead.rows].pop();
+  const th = head && [...head.children].find(c => colStart(c) === st.col);
+  if (!th || clean(th.textContent) !== st.label) { state.delete(table); return; }   // the table changed shape: drop the sort
+  const tb = table.tBodies[0]; if (!tb) return;
+  busy = true;
+  const blocks = [], all = [...tb.rows];
+  let cur = { head: null, items: [] };
+  all.forEach(r => {
+    if (r.classList.contains('grp') || r.querySelector('td[colspan]') && r.children.length === 1) { blocks.push(cur); cur = { head: r, items: [] }; return; }
+    if (r.classList.contains('sku') && cur.items.length) { cur.items[cur.items.length - 1].kids.push(r); return; }
+    cur.items.push({ r, kids: [] });
+  });
+  blocks.push(cur);
+  const key = it => { const c = cellAt(it.r, st.col); const t = c ? clean(c.innerText || c.textContent) : ''; return { t, n: num(t), empty: !t || t === '–' || t === '-' }; };
+  blocks.forEach(b => {
+    const ks = b.items.map(it => ({ it, k: key(it) }));
+    const numeric = ks.filter(x => !x.k.empty).every(x => x.k.n != null);
+    ks.sort((x, y) => (x.k.empty - y.k.empty) || (numeric ? (x.k.n - y.k.n) : x.k.t.localeCompare(y.k.t, 'en', { numeric: true, sensitivity: 'base' })) * st.dir);
+    b.items = ks.map(x => x.it);
+  });
+  const frag = document.createDocumentFragment();
+  blocks.forEach(b => { if (b.head) frag.appendChild(b.head); b.items.forEach(it => { frag.appendChild(it.r); it.kids.forEach(k => frag.appendChild(k)); }); });
+  tb.appendChild(frag);
+  [...head.children].forEach(c => { c.classList.remove('srt-asc', 'srt-desc'); c.removeAttribute('aria-sort'); });
+  th.classList.add(st.dir > 0 ? 'srt-asc' : 'srt-desc'); th.setAttribute('aria-sort', st.dir > 0 ? 'ascending' : 'descending');
+  setTimeout(() => { busy = false; }, 0);
+}
+function shape(table){
+  if (table.dataset.shaped === '1' || !table.tHead) return;
+  const head = [...table.tHead.rows].pop(); if (!head) return;
+  const n = [...head.children].reduce((a, c) => a + (c.colSpan || 1), 0);
+  const textCols = [...head.children].slice(1).some(c => c.classList.contains('lft'));   // a text column (names, notes) keeps its own width
+  if (n >= 3 && n <= 10 && !textCols && !table.matches('.rs-t,.heat,.dw')) { table.classList.add('eqw'); table.style.setProperty('--nc', n - 1); }
+  if (!own(table)) [...head.children].forEach(c => { c.classList.add('srt'); if (!c.title) c.title = 'Sort by ' + clean(c.textContent).toLowerCase(); });
+  table.dataset.shaped = '1';
+}
+function scan(root){ (root.querySelectorAll ? root : document).querySelectorAll('table.cmp').forEach(t => { shape(t); apply(t); }); }
+document.addEventListener('click', e => {
+  const th = e.target.closest && e.target.closest('table.cmp thead th');
+  if (!th || e.target.closest('button,a,input')) return;
+  const table = th.closest('table');
+  if (own(table) || th.closest('tr') !== [...table.tHead.rows].pop()) return;
+  const col = colStart(th), label = clean(th.textContent), prev = state.get(table);
+  const first = num((cellAt((table.tBodies[0] || { rows: [] }).rows[0] || document.createElement('tr'), col) || {}).textContent || '') != null;
+  const dir = prev && prev.col === col ? -prev.dir : (first ? -1 : 1);   // numbers: biggest first; names: A–Z
+  state.set(table, { col, dir, label });
+  apply(table);
+});
+let t = null;
+new MutationObserver(ms => {
+  if (busy) return;
+  if (!ms.some(m => [...m.addedNodes].some(n => n.nodeType === 1 && (n.matches('table,thead,tbody,tr') || n.querySelector && n.querySelector('table'))))) return;
+  clearTimeout(t); t = setTimeout(() => { document.querySelectorAll('table.cmp').forEach(tb => { if (!tb.dataset.shaped || !tb.querySelector('th.srt,th[data-sort]') ) { tb.dataset.shaped = ''; } shape(tb); apply(tb); }); }, 30);
+}).observe(document.documentElement, { childList: true, subtree: true });
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => scan(document)); else scan(document);
+})();
 """
 
 ZR_JS = r"""
@@ -13416,7 +14991,7 @@ function render(){
   $('#kpis').innerHTML = [
     ['', 'Models tracked', full(d.models), 'sold before or in the period'],
     ['good', 'Sold in the period', full(d.sold_now), d.models ? Math.round(d.sold_now / d.models * 100) + '% of tracked' : ''],
-    [d.store_zero.length ? 'bad' : 'good', 'Zero sell-out', full(d.store_zero.length), 'models with no sale'],
+    [d.store_zero.length ? 'bad' : 'good', 'Not selling', full(d.store_zero.length), 'models with no sale'],
     ...(d.has_stock ? [[inStock0 ? 'bad' : 'good', 'In stock, no sale', full(inStock0), 'stock sitting idle']] : []),
     [withGaps ? 'warn' : 'good', 'SPCs with gaps', `${withGaps} of ${d.matrix.length}`, 'missed a selling model'],
   ].map(([t, k, v, s]) => `<div class="kpi ${t}"><small>${k}</small><b>${v}</b><span class="pv">${esc(s)}</span></div>`).join('');
@@ -13424,7 +14999,7 @@ function render(){
   $('#spcBlock').hidden = !d.spc;
   if (d.spc) {
     const known = d.spcs.includes(d.spc);
-    $('#spcHead').textContent = `${d.spc} · Zero Sell-Out`;
+    $('#spcHead').textContent = `${d.spc} · Models Not Sold`;
     $('#spcNote').textContent = known ? `${d.spc_rows.length} models the store sells that ${d.spc} did not sell in ${d.range}` : 'no SPC with this name in the store';
     $('#spcTable').innerHTML = !known ? `<tbody><tr><td class="lft">No SPC named “${esc(d.spc)}” sold in this store in the last ${d.ref_days} days or in the period. Pick a name from the list.</td></tr></tbody>` :
       `<thead><tr><th class="lft">Model</th><th class="lft">Segment</th><th>Store units<small class="sub">in the period</small></th><th>Store share</th><th>${esc(d.spc)}<small class="sub">units, ${d.ref_days} days before</small></th><th>Last sold by ${esc(d.spc)}</th><th>Days since</th>${d.has_stock ? '<th>In stock</th>' : ''}</tr></thead>
@@ -13438,7 +15013,7 @@ function render(){
     <tbody>${d.store_zero.map(r => `<tr><td class="lft"><b>${esc(r.name)}</b></td><td class="lft">${esc(r.seg || '–')}</td><td>${full(r.ref)}</td><td>${r.ref_rate ? r.ref_rate.toFixed(1) : '–'}</td><td>${dlabel(r.last)}</td><td>${since(r.since)}</td>${d.has_stock ? `<td>${r.stock ? `<span class="nx-badge bad">${full(r.stock)}</span>` : '–'}</td>` : ''}</tr>`).join('') || `<tr><td class="lft" colspan="7">Every tracked model sold in this period.</td></tr>`}</tbody>`;
   // coverage
   $('#covNote').textContent = `each SPC against the models their store sold in ${d.range} · tap a name for their list`;
-  $('#covTable').innerHTML = `<thead><tr><th class="lft">SPC</th><th>Units</th><th>Models sold</th><th>Coverage</th><th>Zero models</th><th class="lft">Top models not sold</th></tr></thead>
+  $('#covTable').innerHTML = `<thead><tr><th class="lft">SPC</th><th>Units</th><th>Models sold</th><th>Coverage</th><th>Gaps</th><th class="lft">Top models not sold</th></tr></thead>
     <tbody>${d.matrix.map(r => `<tr><td class="lft"><button type="button" class="zr-go" data-spc="${esc(r.spc)}">${esc(r.spc)}</button>${d.scope.length !== 1 && r.store ? `<small>${esc((r.store.match(/\(([^)]+)\)\s*$/) || [0, r.store])[1])}</small>` : ''}</td><td>${full(r.units)}</td><td>${r.models_sold} / ${r.store_models}</td>
       <td><div class="zr-bar"><span>${r.cover.toFixed(1)}%</span><i><b style="width:${r.cover}%"></b></i></div></td><td>${r.zero ? `<span class="nx-badge ${r.zero > r.store_models / 2 ? 'bad' : 'warn'}">${r.zero}</span>` : '<span class="nx-badge good">0</span>'}</td>
       <td class="lft"><div class="zr-miss">${r.zero_top.map(f => `<span>${esc(f)}</span>`).join('') || '–'}</div></td></tr>`).join('') || '<tr><td class="lft" colspan="6">No SPC sales in this period.</td></tr>'}</tbody>`;
@@ -13472,16 +15047,21 @@ const $ = s => document.querySelector(s);
 const STATUS = { out: ['Out of stock', 'bad'], critical: ['Critical', 'bad'], low: ['Low', 'warn'], ok: ['Healthy', 'good'], excess: ['Excess', 'info'], dead: ['No sale 30d', 'mute'] };
 const COVERS = [7, 10, 15, 21, 30], LEADS = [0, 2, 3, 5, 7];
 let saved = {}; try { saved = JSON.parse(ls.get('stk-state') || '{}') || {}; } catch (e) {}
-const st = Object.assign({ cover: 15, lead: 3, status: '', q: '' }, saved, { open: {} });
-st.sel = StorePicker.saved();
+const st = Object.assign({ cover: 15, lead: 3, status: '', q: '', basis: 'blend', fest: '' }, saved, { open: {} });
+st.sel = StorePicker.saved().slice(0, 1);   // stock is one store at a time; the picked store stays put
 let data = null, ctrl = null;
-const save = () => ls.set('stk-state', JSON.stringify({ cover: st.cover, lead: st.lead, status: st.status }));
+const save = () => ls.set('stk-state', JSON.stringify({ cover: st.cover, lead: st.lead, status: st.status, basis: st.basis, fest: st.fest }));
+const COLORS = { black: '#1d1d1f', gray: '#8e8e93', grey: '#8e8e93', graphite: '#4a4a4f', silver: '#c7c7cc', white: '#f5f5f7', blue: '#0a84ff', navy: '#1c3d7a', green: '#34c759',
+  mint: '#98e2c6', violet: '#8e5bd9', lavender: '#b8a1e6', purple: '#8e5bd9', pink: '#ff8fb1', red: '#ff3b30', coral: '#ff7f6e', gold: '#d4af37', yellow: '#ffd60a',
+  cream: '#f3e9d2', titanium: '#a7a29a', peach: '#ffb59a', orange: '#ff9500', jet: '#111' };
+const colorOf = n => { const w = String(n).toLowerCase().split(/\s+/).reverse(); for (const x of w) if (COLORS[x]) return COLORS[x]; return '#d1d1d6'; };
 async function load(){
   save();
   if (ctrl) ctrl.abort();
   const mine = ctrl = new AbortController();
   $('#wrap').classList.add('loading');
-  const q = new URLSearchParams({ cover: st.cover, lead: st.lead });
+  const q = new URLSearchParams({ cover: st.cover, lead: st.lead, basis: st.basis || 'blend' });
+  if (st.fest) q.set('fest', st.fest);
   if (st.sel[0]) q.set('store', st.sel[0]);
   try { data = await getJSON('/api/stock?' + q, { signal: mine.signal }); render(); }
   catch (e) { if (e.name !== 'AbortError') { data = { error: 'Could not reach the server. Please try again.' }; render(); } }
@@ -13493,16 +15073,29 @@ const covCell = r => (r.stock <= 0 ? '<span class="nx-badge bad">none left</span
 const trend = t => (t === 'up' ? '<span class="gc up">↑ picking up</span>' : t === 'down' ? '<span class="gc down">↓ slowing</span>' : '<span class="gc">steady</span>');
 function render(){
   const d = data;
-  $('#err').hidden = !d.error; if (d.error) { $('#err').textContent = d.error; return; }
+  if (d.stores) StorePicker.mount({ stores: d.stores, selected: d.store ? [d.store] : [], multi: false, noAll: true, note: 'Stock is per store',
+    onChange: sel => { st.sel = sel; st.open = {}; load(); } });
+  $('#err').hidden = !d.error; if (d.error) { $('#err').textContent = d.error; $('#body').hidden = true; return; }
   $('#title').textContent = d.store || 'Stock';
   $('#navLabel').textContent = d.as_of ? 'Stock as of ' + dlabel(d.as_of) : 'Stock & Sell-Out';
-  StorePicker.mount({ stores: d.stores, selected: d.store ? [d.store] : [], multi: false, noAll: true, note: 'Stock is per store',
-    onChange: sel => { st.sel = sel; st.open = {}; load(); } });
   st.sel = d.store ? [d.store] : [];
   $('#coverChips').innerHTML = COVERS.map(c => `<button type="button" data-cover="${c}" class="${+st.cover === c ? 'on' : ''}">${c} days</button>`).join('');
   $('#leadChips').innerHTML = LEADS.map(c => `<button type="button" data-lead="${c}" class="${+st.lead === c ? 'on' : ''}">${c ? c + ' days' : 'none'}</button>`).join('');
+  const BL = { blend: 'Recent pace', mtd: 'MTD', lmtd: 'LMTD', lm: 'Last month', l30: 'Last 30 days', l90: 'Last 90 days', fest: 'Festival (LY)' };
+  $('#basisChips').innerHTML = (d.bases || []).map(b => `<button type="button" data-basis="${b.key}" class="${(d.basis || 'blend') === b.key ? 'on' : ''}" title="${esc(b.label)}">${BL[b.key] || esc(b.label)}</button>`).join('');
+  $('#festRow').hidden = st.basis !== 'fest' || !(d.fests || []).length;
+  $('#festChips').innerHTML = (d.fests || []).map(f => `<button type="button" data-fest="${f.key}" class="${d.fest && d.fest.key === f.key ? 'on' : ''}">${esc(f.name)} · ${dlabel(f.date)}</button>`).join('');
+  const bn = $('#basisNote');
+  bn.hidden = !(d.fest || d.fest_note || d.basis !== 'blend');
+  bn.innerHTML = d.fest ? `Festival plan for <b>${esc(d.fest.name)} ${dlabel(d.fest.date)}</b> (in ${d.fest.in} days): last year's <b>${esc(d.fest.window)}</b> around ${esc(d.fest.name)} sold <b>${full(d.fest.ly_units)} units</b>; × ${d.fest.growth} for this year's trend (last 30 days vs the same days last year). Each model's requirement = that projection + ${st.lead} days' lead time − stock in hand.`
+    : d.fest_note ? esc(d.fest_note) : d.basis !== 'blend' ? `Pace per day from <b>${esc(d.basis_label || '')}</b>. Requirement = pace × (stock norm + lead time) − stock in hand.` : '';
+  if (!d.empty) {
+    const segs = d.seg_list || [];
+    $('#normRows').innerHTML = segs.map(sg => `<label>${esc(sg)}<input type="number" min="1" max="120" inputmode="numeric" data-norm="${esc(sg)}" value="${d.norms && d.norms[sg] ? d.norms[sg] : ''}" placeholder="${st.cover} (cover)"></label>`).join('') || '<p class="nx-empty">No segments yet.</p>';
+    $('#normBox').hidden = false;
+  } else $('#normBox').hidden = true;
   const loaded = (d.loaded || []).length;
-  $('#fileInfo').innerHTML = d.empty ? `No stock loaded for this store yet${loaded ? ` · ${loaded} store${loaded === 1 ? '' : 's'} have stock` : ''}.<br>Excel (.xlsx, .xls, .csv) or PDF, e.g. Tally's Stock Group Summary.`
+  $('#fileInfo').innerHTML = d.empty ? `No stock loaded for this store yet${loaded ? ` · ${loaded} store${loaded === 1 ? ' has' : 's have'} stock` : ''}.<br>Excel (.xlsx, .xls, .csv) or PDF, e.g. Tally's Stock Group Summary.`
     : `<b>${esc(d.file || 'Stock file')}</b> · stock as of <b>${dlabel(d.as_of)}</b> · uploaded ${esc(d.uploaded || '')}<br>${d.check ? `<span class="${/^Matches/.test(d.check) ? 'ok' : 'warn'}">${/^Matches/.test(d.check) ? '✓ ' : '⚠︎ '}${esc(d.check)}</span> · ` : ''}sales to ${dlabel(d.sales_to)} · <button type="button" id="clearStock">Remove</button>`;
   $('#empty').hidden = !d.empty; $('#body').hidden = !!d.empty;
   if (d.empty) {
@@ -13512,7 +15105,7 @@ function render(){
     return;
   }
   const k = d.kpis;
-  $('#sumNote').textContent = `${dlabel(d.as_of)} · pace = 60% last 7 days + 40% last 30 days`;
+  $('#sumNote').textContent = `${dlabel(d.as_of)} · pace: ${d.basis_label || ''}`;
   $('#kpis').innerHTML = [
     ['', 'Stock units', full(k.stock), `${k.models} models in stock`],
     ['', 'Stock value', compact(k.value), k.grand ? 'Grand Total ' + compact(k.grand.value) : 'at the file\'s rates'],
@@ -13534,6 +15127,19 @@ function render(){
   $('#rTable').innerHTML = `<thead><tr><th class="lft">Model</th><th>Status</th><th>Stock</th><th>Pace / day</th><th>Cover</th><th>Order units</th><th>Order value</th></tr></thead>
     <tbody>${need.map(r => `<tr><td class="lft"><b>${esc(r.name)}</b><small>${esc(r.seg || '')}</small></td><td>${badge(r.status)}</td><td>${full(r.stock)}</td><td>${r.rate.toFixed(2)}</td><td>${r.cover != null ? r.cover.toFixed(1) + ' d' : '0 d'}</td><td><b>${full(r.need)}</b></td><td>${compact(r.need_v)}</td></tr>`).join('') || '<tr><td class="lft" colspan="7">Nothing to re-order for this cover.</td></tr>'}</tbody>
     ${need.length ? `<tfoot><tr><td class="lft">Total</td><td></td><td>${full(need.reduce((a, r) => a + r.stock, 0))}</td><td>${need.reduce((a, r) => a + r.rate, 0).toFixed(2)}</td><td></td><td>${full(need.reduce((a, r) => a + r.need, 0))}</td><td>${compact(need.reduce((a, r) => a + r.need_v, 0))}</td></tr></tfoot>` : ''}`;
+  // colour and variant
+  const cv = d.models.filter(r => r.skus.length).flatMap(r => r.skus.map(x => ({ m: r, x })));
+  $('#cvNote').textContent = `${cv.length} lines · ${new Set(cv.map(o => o.x.color)).size} colours${cv.some(o => o.x.s30 != null) ? ' · sold 30d by SKU' : ''}`;
+  $('#cvTable').innerHTML = `<thead><tr><th class="lft">Model</th><th class="lft">Variant</th><th class="lft">Colour</th><th>In hand</th><th>Value</th><th>Sold 30d</th><th>Days of cover</th><th class="lft">SKU</th></tr></thead>
+    <tbody>${d.models.filter(r => r.skus.length).map(r => `<tr class="grp"><td colspan="8"><span class="grp-lab">${esc(r.name)}<small>${r.skus.length} line${r.skus.length === 1 ? '' : 's'} · ${full(r.stock)} in hand · ${STATUS[r.status][0]}</small></span></td></tr>`
+      + r.skus.map(x => { const pace = x.s30 != null ? x.s30 / 30 : null;
+        return `<tr><td class="lft">${esc(r.name)}</td><td class="lft">${esc(x.variant || '–')}</td><td class="lft"><span class="cv-dot" style="background:${colorOf(x.color)}"></span>${esc(x.color)}</td><td><b>${full(x.qty)}</b></td><td>${compact(x.value)}</td>
+          <td>${x.s30 != null ? full(x.s30) : '–'}</td><td>${pace ? (x.qty / pace).toFixed(1) + ' d' : x.s30 === 0 && x.qty ? '<span class="nx-badge mute">no sales</span>' : '–'}</td><td class="lft">${esc(x.sku || '')}</td></tr>`; }).join('')).join('')
+      || '<tr><td class="lft" colspan="8">No lines in the stock file.</td></tr>'}</tbody>`;
+  const cs = d.colors || [];
+  $('#colTable').innerHTML = `<thead><tr><th class="lft">Colour</th><th>Models</th><th>In hand</th><th>Share of stock</th><th>Value</th><th>Sold 30d</th></tr></thead>
+    <tbody>${cs.map(c => `<tr><td class="lft"><span class="cv-dot" style="background:${colorOf(c.color)}"></span>${esc(c.color)}</td><td>${c.models}</td><td><b>${full(c.stock)}</b></td><td>${c.share.toFixed(1)}%</td><td>${compact(c.value)}</td><td>${c.known ? full(c.s30) : '–'}</td></tr>`).join('') || '<tr><td class="lft" colspan="6">No colours found.</td></tr>'}</tbody>
+    ${cs.length ? `<tfoot><tr><td class="lft">Total</td><td></td><td>${full(cs.reduce((a, c) => a + c.stock, 0))}</td><td>100%</td><td>${compact(cs.reduce((a, c) => a + c.value, 0))}</td><td>${cs.some(c => c.known) ? full(cs.reduce((a, c) => a + c.s30, 0)) : '–'}</td></tr></tfoot>` : ''}`;
   // run-out timeline
   const tl = d.models.filter(r => r.stock > 0 && r.cover != null).sort((a, b) => a.cover - b.cover).slice(0, 24);
   const span = Math.max(st.cover * 2, 30);
@@ -13551,40 +15157,75 @@ function renderTable(){
   const d = data, q = st.q.trim().toLowerCase();
   const rows = d.models.filter(r => (!st.status || r.status === st.status) && (!q || r.name.toLowerCase().includes(q) || r.skus.some(x => (x.sku + ' ' + x.name).toLowerCase().includes(q))));
   $('#mNote').textContent = `${rows.length} model${rows.length === 1 ? '' : 's'} · tap a model for its variants`;
-  $('#mTable').innerHTML = `<thead><tr><th class="lft">Model</th><th>Status</th><th>Stock</th><th>Value</th><th>Sold 7d</th><th>Sold 30d</th><th>MTD</th><th>LMTD</th><th>Pace / day</th><th>Days of cover</th><th>Runs out</th><th>Order</th><th>Trend</th></tr></thead>
+  const fz = d.basis === 'fest';
+  $('#mTable').innerHTML = `<thead><tr><th class="lft">Model</th><th>Status</th><th>In hand</th><th>Value</th><th>Sold 7d</th><th>Sold 30d</th><th>MTD</th><th>LMTD</th>${fz ? '<th>Festival need<small>LY × trend</small></th>' : ''}<th>Pace / day<small>${esc((d.basis_label || '').split(':')[0])}</small></th><th>Norm<small>days</small></th><th>Norm qty</th><th>Gap<small>norm − in hand</small></th><th>Days of cover</th><th>Runs out</th><th>Order<small>incl. lead time</small></th><th>Trend</th></tr></thead>
     <tbody>${rows.map(r => `<tr class="m${st.open[r.name] ? ' open' : ''}" data-m="${esc(r.name)}"><td class="lft"><b>${esc(r.name)}</b><small>${esc(r.seg || (r.known ? '' : 'not in sales yet'))}</small></td><td>${badge(r.status)}</td><td><b>${full(r.stock)}</b></td><td>${compact(r.value)}</td>
-      <td>${full(r.s7)}</td><td>${full(r.s30)}</td><td>${full(r.mtd)}</td><td>${full(r.lmtd)}</td><td>${r.rate.toFixed(2)}</td><td>${covCell(r)}</td><td>${r.stock <= 0 ? '<b class="out-now">now</b>' : r.runout ? dlabel(r.runout) : '–'}</td><td>${r.need ? `<b>${full(r.need)}</b>` : '–'}</td><td>${r.s30 ? trend(r.trend) : '–'}</td></tr>`
-      + (st.open[r.name] ? r.skus.map(x => `<tr class="sku"><td class="lft" title="${esc(x.name)}">${esc(x.short || x.name)}${x.sku ? `<small>${esc(x.sku)}</small>` : ''}</td><td></td><td>${full(x.qty)}</td><td>${compact(x.value)}</td><td></td><td>${x.s30 != null ? full(x.s30) : ''}</td><td colspan="7" class="lft">${x.rate ? 'rate ' + compact(x.rate) : ''}</td></tr>`).join('') || '<tr class="sku"><td class="lft" colspan="13">Not in the stock file: none in stock.</td></tr>' : '')).join('')
-      || '<tr><td class="lft" colspan="13">No model matches.</td></tr>'}</tbody>`;
+      <td>${full(r.s7)}</td><td>${full(r.s30)}</td><td>${full(r.mtd)}</td><td>${full(r.lmtd)}</td>${fz ? `<td>${r.fest_q != null ? full(r.fest_q) : '–'}</td>` : ''}<td>${r.rate.toFixed(2)}</td>
+      <td>${r.norm}</td><td>${full(r.norm_qty)}</td><td>${r.gap > 0 ? `<span class="nx-badge bad">−${full(r.gap)}</span>` : r.gap < 0 ? `<span class="nx-badge good">+${full(-r.gap)}</span>` : '<span class="nx-badge mute">0</span>'}</td><td>${covCell(r)}</td><td>${r.stock <= 0 ? '<b class="out-now">now</b>' : r.runout ? dlabel(r.runout) : '–'}</td><td>${r.need ? `<b>${full(r.need)}</b>` : '–'}</td><td>${r.s30 ? trend(r.trend) : '–'}</td></tr>`
+      + (st.open[r.name] ? r.skus.map(x => `<tr class="sku"><td class="lft" title="${esc(x.name)}">${esc(x.short || x.name)}${x.sku ? `<small>${esc(x.sku)}</small>` : ''}</td><td></td><td>${full(x.qty)}</td><td>${compact(x.value)}</td><td></td><td>${x.s30 != null ? full(x.s30) : ''}</td><td colspan="${fz ? 11 : 10}" class="lft">${esc([x.variant, x.color].filter(v => v && v !== '–').join(' · '))}${x.rate ? ' · rate ' + compact(x.rate) : ''}</td></tr>`).join('') || `<tr class="sku"><td class="lft" colspan="${fz ? 18 : 17}">Not in the stock file: none in stock.</td></tr>` : '')).join('')
+      || `<tr><td class="lft" colspan="${fz ? 18 : 17}">No model matches.</td></tr>`}</tbody>`;
 }
 /* Share → Excel: every model and variant with raw numbers */
 window.APX = window.APX || {};
 window.APX['Model-wise Stock vs Sales'] = () => {
   const d = data; if (!d || d.empty || d.error) return null;
-  const head = ['Model', 'Segment', 'Status', 'Stock units', 'Stock value', 'Sold 7d', 'Sold 30d', 'MTD', 'LMTD', 'Pace per day', 'Days of cover', 'Runs out', 'Suggested order', 'Order value', 'Trend'];
-  const sk = ['Model', 'Variant', 'SKU', 'Stock units', 'Rate', 'Value', 'Sold 30d (SKU)'];
-  return { sheets: [{ name: 'Models', rows: [head, ...d.models.map(r => [r.name, r.seg, STATUS[r.status][0], r.stock, r.value, r.s7, r.s30, r.mtd, r.lmtd, r.rate, r.cover == null ? '' : r.cover, r.runout || '', r.need, r.need_v, r.trend])] },
-    { name: 'Variants', rows: [sk, ...d.models.flatMap(r => r.skus.map(x => [r.name, x.name, x.sku, x.qty, x.rate, x.value, x.s30 == null ? '' : x.s30]))] }] };
+  const head = ['Model', 'Segment', 'Status', 'In hand', 'Stock value', 'Sold 7d', 'Sold 30d', 'MTD', 'LMTD', 'Pace per day', 'Norm days', 'Norm qty', 'Gap (norm − in hand)', 'Days of cover', 'Runs out', 'Suggested order', 'Order value', 'Trend'];
+  const sk = ['Model', 'Line', 'Variant', 'Colour', 'SKU', 'In hand', 'Rate', 'Value', 'Sold 30d (SKU)'];
+  const rows = d.models.map(r => [r.name, r.seg, STATUS[r.status][0], r.stock, r.value, r.s7, r.s30, r.mtd, r.lmtd, r.rate, r.norm, r.norm_qty, r.gap, r.cover == null ? '' : r.cover, r.runout || '', r.need, r.need_v, r.trend]);
+  const sum = i => d.models.reduce((a, r) => a + (+rows[d.models.indexOf(r)][i] || 0), 0);
+  rows.push(['Total', '', '', sum(3), sum(4), sum(5), sum(6), sum(7), sum(8), Math.round(sum(9) * 100) / 100, '', sum(11), sum(12), '', '', sum(15), sum(16), '']);
+  return { sheets: [{ name: 'Models', rows: [head, ...rows] },
+    { name: 'Colour and variant', rows: [sk, ...d.models.flatMap(r => r.skus.map(x => [r.name, x.name, x.variant, x.color, x.sku, x.qty, x.rate, x.value, x.s30 == null ? '' : x.s30]))] },
+    { name: 'Colours', rows: [['Colour', 'Models', 'In hand', 'Share %', 'Value', 'Sold 30d'], ...(d.colors || []).map(c => [c.color, c.models, c.stock, c.share, c.value, c.known ? c.s30 : ''])] }] };
 };
-async function upload(file){
+function askStore(info){
+  return new Promise(resolve => {
+    const w = document.createElement('div'); w.className = 'stk-pick';
+    const short = x => String(x).replace(/^.*\(([^)]+)\)\s*$/, '$1');
+    w.innerHTML = `<form role="dialog" aria-modal="true" aria-labelledby="spT"><h3 id="spT">Which store is this stock for?</h3>
+      <p>The file's heading names <b>${esc(info.file_store)}</b>, but <b>${esc(info.page_store)}</b> is picked at the top. Nothing changes until you choose.</p>
+      <button type="button" class="primary" data-u="file">Save for ${esc(short(info.file_store))} and open it</button>
+      <button type="button" data-u="page">Save for ${esc(short(info.page_store))} (the picked store)</button>
+      <button type="button" data-u="">Cancel</button></form>`;
+    document.body.appendChild(w);
+    const done = v => { w.remove(); resolve(v); };
+    w.addEventListener('click', e => { const b = e.target.closest('[data-u]'); if (b) done(b.dataset.u); else if (e.target === w) done(''); });
+    setTimeout(() => w.querySelector('.primary').focus(), 30);
+  });
+}
+async function upload(file, use){
   if (!file) return;
   const msg = $('#upMsg'), lab = document.querySelector('.stk-up');
   if (file.size > 20 * 1024 * 1024) { msg.hidden = false; msg.className = 'stk-msg bad'; msg.textContent = 'That file is over 20 MB.'; return; }
-  const fd = new FormData(); fd.append('file', file); if (st.sel[0]) fd.append('store', st.sel[0]);
+  const fd = new FormData(); fd.append('file', file); if (st.sel[0] || (data && data.store)) fd.append('store', st.sel[0] || data.store);
+  if (use) fd.append('use', use);
   lab.classList.add('busy'); msg.hidden = false; msg.className = 'stk-msg'; msg.textContent = `Reading ${file.name}…`;
   try {
     const d = await getJSON('/api/stock', { method: 'POST', body: fd });
+    if (d.mismatch) {
+      lab.classList.remove('busy'); msg.hidden = true;
+      const u = await askStore(d);
+      if (u) return upload(file, u);
+      msg.hidden = false; msg.className = 'stk-msg'; msg.textContent = 'Upload cancelled; nothing was changed.'; return;
+    }
     if (d.error) { msg.className = 'stk-msg bad'; msg.textContent = d.error; return; }
-    data = d; st.sel = [d.store]; StorePicker.mount({ stores: d.stores, selected: [d.store], multi: false, noAll: true });
-    try { localStorage.setItem('ap-stores', JSON.stringify([d.store])); } catch (e) {}
+    if (use === 'file' || !st.sel[0]) { st.sel = [d.store]; try { localStorage.setItem('ap-stores', JSON.stringify([d.store])); } catch (e) {} }
     msg.className = 'stk-msg good'; msg.textContent = '✓ ' + (d.saved || 'Stock loaded.');
     await load();
   } catch (e) { msg.className = 'stk-msg bad'; msg.textContent = 'Could not upload: ' + (e.message || e); }
-  finally { lab.classList.remove('busy'); $('#stockFile').value = ''; }
+  finally { lab.classList.remove('busy'); if (!use || use) $('#stockFile').value = ''; }
 }
 $('#stockFile').addEventListener('change', e => upload(e.target.files[0]));
 document.addEventListener('click', async e => {
   const c = e.target.closest('[data-cover]'); if (c) { st.cover = +c.dataset.cover; load(); return; }
+  const bs = e.target.closest('[data-basis]'); if (bs) { st.basis = bs.dataset.basis; load(); return; }
+  const fs = e.target.closest('[data-fest]'); if (fs) { st.fest = fs.dataset.fest; load(); return; }
+  if (e.target.closest('#normSave')) {
+    const norms = {}; document.querySelectorAll('[data-norm]').forEach(i => { if (i.value) norms[i.dataset.norm] = +i.value; });
+    $('#normMsg').textContent = 'Saving…';
+    const r = await getJSON('/api/stock/norms', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ store: data.store, norms }) }).catch(() => ({ error: 'Could not reach the server.' }));
+    $('#normMsg').textContent = r.error || '✓ Saved'; if (!r.error) load(); return;
+  }
   const l = e.target.closest('[data-lead]'); if (l) { st.lead = +l.dataset.lead; load(); return; }
   const s = e.target.closest('[data-status]'); if (s) { st.status = s.dataset.status; save(); render(); return; }
   const m = e.target.closest('tr.m'); if (m) { st.open[m.dataset.m] = !st.open[m.dataset.m]; renderTable(); return; }
@@ -13710,7 +15351,7 @@ function render(){
   $('#saveBtn').disabled = !st.dirty;
   $('#copyBtn').disabled = !d.prev;
   const days = d.days;
-  $('#rTable').innerHTML = `<thead><tr><th class="lft">SPC</th>${days.map(x => `<th class="${x.busy ? 'busy' : ''}${x.date === d.today ? ' today' : ''}" title="Usual sales ${compact(x.exp_v)}">${x.label}${x.busy ? ' ★' : ''}<small>${x.num} ${x.mon}</small></th>`).join('')}<th>Offs</th><th>Hours</th></tr></thead>
+  $('#rTable').innerHTML = `<thead><tr><th class="lft">SPC</th>${days.map(x => `<th class="${x.busy ? 'busy' : ''}${x.date === d.today ? ' today' : ''}${x.tag && (x.tag.hol || x.tag.eve) ? ' hday' : ''}" title="Usual sales ${compact(x.exp_v)}${x.tag && window.APDAY ? ' · ' + APDAY.text(x.tag) : ''}">${x.label}${x.busy ? ' ★' : ''}<small>${x.num} ${x.mon}</small>${x.tag && x.tag.hol ? `<small>${esc(x.tag.hol)}</small>` : ''}</th>`).join('')}<th>Offs</th><th>Hours</th></tr></thead>
     <tbody>${st.spcs.map(n => { const row = st.grid[n] || [], info = d.spcs.find(x => x.name === n) || { q: 0 };
       return `<tr><td class="lft"><div class="rs-name"><button type="button" class="rs-x" data-del="${esc(n)}" aria-label="Remove ${esc(n)}" title="Remove from this week">×</button><span>${esc(n)}<small>${info.q ? full(info.q) + ' units in 45 days' : 'no recent sales'}</small></span></div></td>
         ${row.map((c, i) => { const s = codeOf(c); return `<td><button type="button" class="rs-cell${s ? '' : ' empty'}" style="--c:${s ? s.color : '#8e8e93'}" data-cell="${esc(n)}|${i}" title="${s ? esc(s.name) + (s.start ? ' ' + s.start + '–' + s.end : '') : 'Not set'} · tap to change">${s ? esc(s.code) : '·'}</button></td>`; }).join('')}
@@ -13721,7 +15362,7 @@ function render(){
   $('#cTable').innerHTML = `<thead><tr><th class="lft">Day</th>${st.shifts.filter(s => work.includes(s.code) || s.start).map(s => `<th>${esc(s.name)}</th>`).join('')}<th>Off / leave</th><th>On duty</th><th>Usual sales</th><th>Sales per SPC</th></tr></thead>
     <tbody>${days.map((x, i) => { const codes = st.spcs.map(n => (st.grid[n] || [])[i] || ''); const on = codes.filter(c => (codeOf(c) || {}).start).length, off = codes.filter(c => c === 'WO' || c === 'L').length;
       const thin = st.spcs.length && on < Math.min(2, st.spcs.length);
-      return `<tr><td class="lft"><b>${x.label} ${x.num} ${x.mon}</b>${x.busy ? ' <span class="nx-badge warn">busy</span>' : ''}</td>${st.shifts.filter(s => work.includes(s.code) || s.start).map(s => `<td>${codes.filter(c => c === s.code).length || '–'}</td>`).join('')}
+      return `<tr class="${window.APDAY ? APDAY.cls(x.tag) : ''}"><td class="lft"><b>${x.label} ${x.num} ${x.mon}</b>${x.busy ? ' <span class="nx-badge warn">busy</span>' : ''}${window.APDAY ? APDAY.chips(x.tag, { noWd: true }) : ''}</td>${st.shifts.filter(s => work.includes(s.code) || s.start).map(s => `<td>${codes.filter(c => c === s.code).length || '–'}</td>`).join('')}
         <td>${off || '–'}</td><td class="${thin ? 'warn-cell' : ''}">${on}${thin ? ' ⚠︎' : ''}</td><td>${compact(x.exp_v)}</td><td>${on ? compact(x.exp_v / on) : '–'}</td></tr>`; }).join('')}</tbody>`;
   $('#updated').textContent = d.updated ? 'Sales updated ' + d.updated : '';
   if (window.addExportButtons) window.addExportButtons();
@@ -13783,6 +15424,31 @@ const stepWeek = async k => { if (!data || data.error) return; const d0 = new Da
 $('#prevBtn').addEventListener('click', () => stepWeek(-1));
 $('#nextBtn').addEventListener('click', () => stepWeek(1));
 window.addEventListener('beforeunload', e => { if (st.dirty) { e.preventDefault(); e.returnValue = ''; } });
+/* holidays and festivals: the built-in list, with changes saved for everyone (admin passcode) */
+const H = { year: String(new Date().getFullYear()), data: null };
+async function loadHol(){ H.data = await getJSON('/api/holidays').catch(() => ({ items: [], years: [] })); paintHol(); }
+function paintHol(){
+  const d = H.data || { items: [], years: [] };
+  if (!d.years.includes(H.year) && d.years.length) H.year = d.years.includes(String(new Date().getFullYear())) ? String(new Date().getFullYear()) : d.years[d.years.length - 1];
+  $('#hYears').innerHTML = d.years.map(y => `<button type="button" data-hy="${y}" class="${y === H.year ? 'on' : ''}">${y}</button>`).join('');
+  const rows = d.items.filter(x => x.date.startsWith(H.year));
+  $('#hTable').innerHTML = `<thead><tr><th class="lft">Date</th><th class="lft">Day</th><th class="lft">Name</th><th class="lft">Kind</th><th></th></tr></thead>
+    <tbody>${rows.map(x => { const dt = new Date(x.date + 'T00:00:00'); return `<tr><td class="lft">${dt.getDate()} ${dt.toLocaleString('en-GB', { month: 'short' })}</td><td class="lft">${dt.toLocaleString('en-GB', { weekday: 'short' })}</td>
+      <td class="lft"><b>${esc(x.name)}</b></td><td class="lft"><i class="dt ${x.kind === 'fest' ? 'fest' : 'hol'}">${x.kind === 'fest' ? 'Festival' : 'Holiday'}</i></td>
+      <td><button type="button" class="rs-x" data-hdel="${x.date}" aria-label="Remove ${esc(x.name)}" title="Remove">×</button></td></tr>`; }).join('') || '<tr><td class="lft" colspan="5">No holidays in this year.</td></tr>'}</tbody>`;
+}
+async function saveHol(body){
+  $('#hState').textContent = 'Saving…';
+  const r = await getJSON('/api/holidays', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).catch(() => ({ error: 'Could not reach the server.' }));
+  if (r.error) { $('#hState').textContent = r.error; return; }
+  H.data = r; $('#hState').textContent = '✓ Saved. Every page now marks these days.'; paintHol();
+}
+document.addEventListener('click', e => {
+  const y = e.target.closest('[data-hy]'); if (y) { H.year = y.dataset.hy; paintHol(); return; }
+  const del = e.target.closest('[data-hdel]'); if (del && confirm('Remove this day from the calendar?')) saveHol({ remove: [del.dataset.hdel] });
+});
+$('#hForm').addEventListener('submit', e => { e.preventDefault(); saveHol({ add: [{ date: $('#hDate').value, name: $('#hName').value, kind: $('#hKind').value }] }); $('#hName').value = ''; });
+loadHol();
 window.APU.onScrollTop();
 load();
 })();
@@ -13834,7 +15500,7 @@ function form(c){
     </div>
     <div><div class="pop-cap" style="margin:0 0 6px">Models (tap to remove)</div><div class="cp-picked" id="fPicked"></div></div>
     <div class="cp-quick"><button type="button" data-days="5">5-day drive from start</button><button type="button" data-days="7">7 days</button><button type="button" data-days="15">15 days</button><button type="button" data-mult="1">Units only (value × 1)</button></div>
-    <div><div class="pop-cap" style="margin:0 0 6px">Stores (none ticked = all stores)</div><div class="sp-search" style="margin:0 0 8px;padding:0;position:static"><input type="search" id="fStoreSearch" placeholder="Search ${data.stores.length} stores…" aria-label="Search stores"></div><div class="cp-stores" id="fStores" style="max-height:200px;overflow-y:auto;padding:4px;border-radius:12px;background:var(--fill)">${data.stores.map(s => `<button type="button" data-store="${esc(s)}" class="${edit.stores.includes(s) ? 'on' : ''}">${esc(s)}</button>`).join('')}</div></div>
+    <div><div class="pop-cap" style="margin:0 0 6px">Stores (none ticked = all stores)</div><div class="cp-stores" id="fStores">${data.stores.map(s => `<button type="button" data-store="${esc(s)}" class="${edit.stores.includes(s) ? 'on' : ''}">${esc(s)}</button>`).join('')}</div></div>
     <label>Note<textarea id="fNote" maxlength="140" placeholder="Optional: the scheme's terms">${esc(edit.note || '')}</textarea></label>
     <p class="cp-preview" id="fPrev"></p>
     <div class="cp-btns"><button type="button" id="fCancel">Cancel</button><button type="submit">Save campaign</button></div>`;
@@ -13869,7 +15535,7 @@ $('#form').addEventListener('click', e => {
 });
 $('#form').addEventListener('keydown', e => { if (e.key === 'Enter' && e.target.id === 'fModel') { e.preventDefault(); addModel(); } });
 $('#form').addEventListener('change', e => { if (e.target.id === 'fModel') addModel(); else paintForm(); });
-$('#form').addEventListener('input', e => { if (e.target.id === 'fStoreSearch') { const q = e.target.value.trim().toLowerCase(); document.querySelectorAll('#fStores [data-store]').forEach(b => { b.hidden = !!q && !b.dataset.store.toLowerCase().includes(q); }); } if (['fStart', 'fEnd', 'fUm', 'fVm'].includes(e.target.id)) paintForm(); });
+$('#form').addEventListener('input', e => { if (['fStart', 'fEnd', 'fUm', 'fVm'].includes(e.target.id)) paintForm(); });
 $('#form').addEventListener('submit', async e => {
   e.preventDefault();
   if ($('#fModel').value.trim()) addModel();
@@ -13896,11 +15562,246 @@ load();
 """
 
 
+PRICES_HTML = """<!doctype html>
+<html lang="en"><head><title>Price & Offers</title>""" + PAGE_HEAD + """
+<script src="/assets/pr.js?v={{ asset_v }}" defer></script>
+</head><body>""" + STORE_TOP + """
+<main class="wrap pr" id="wrap">
+  <section class="ch-panel" aria-label="Price lists and offers">
+    <div class="ch-group" style="--g:#1d8a5a">
+      <span class="gi"><svg viewBox="0 0 24 24"><path d="M3.5 12.5l8-8h8v8l-8 8z"/><circle cx="15.5" cy="8.5" r="1.6"/></svg></span>
+      <div class="gb"><div class="gl">Price list</div>
+        <div class="stk-file">
+          <label class="stk-up"><input type="file" id="priceFile" accept=".xlsx,.xls,.csv,.pdf,application/pdf,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,text/csv">
+            <svg viewBox="0 0 24 24"><path d="M12 15V4.5M7.5 9L12 4.5 16.5 9"/><path d="M4.5 15v3.5A1.5 1.5 0 006 20h12a1.5 1.5 0 001.5-1.5V15"/></svg><span>Upload price list</span></label>
+          <label class="pr-date" title="Leave empty to take the date from the file name (e.g. price_15.10.2026.xlsx), else today">Prices from<input type="date" id="priceDate"></label>
+        </div>
+        <div class="stk-info" id="listInfo">Excel (.xlsx, .xls, .csv) or PDF with a model name and DP / MOP / MRP (offer or cashback columns are read too).</div>
+        <div class="chips pr-lists" id="listChips"></div>
+        <p class="stk-msg" id="upMsg" role="status" hidden></p>
+      </div>
+    </div>
+    <div class="ch-group" style="--g:#ff9f0a">
+      <span class="gi"><svg viewBox="0 0 24 24"><path d="M12 3l2.2 5.2L19.5 9l-4 3.7 1.2 5.6L12 15.6 7.3 18.3l1.2-5.6-4-3.7 5.3-.8z"/></svg></span>
+      <div class="gb"><div class="gl">Offers</div>
+        <p class="stk-info">Model-wise or segment-wise offers, all in one place: cashback, bank offers, exchange bonus, discounts, EMI and gifts.</p>
+        <button type="button" class="pill-btn" id="newOffer" style="margin-top:8px">Add offer</button>
+      </div>
+    </div>
+  </section>
+  <p class="err" id="err" hidden></p>
+  <form class="card cp-form" id="offerForm" hidden autocomplete="off"></form>
+  <div class="sec-head"><h2>Insights</h2><span class="sub-note">price and offer effects on sales</span></div>
+  <section class="card"><ul class="stk-act" id="ins"></ul></section>
+  <div class="sec-head"><h2>Price Changes &amp; Impact</h2><span class="sub-note" id="chNote"></span></div>
+  <div class="stk-tools"><input type="search" id="q" placeholder="Search model" aria-label="Search models"><div class="chips" id="segChips" style="margin:0"></div></div>
+  <section class="card table-card"><div class="tscroll"><table class="cmp" id="chTable"></table></div></section>
+  <div class="sec-head"><h2>Offers &amp; Impact</h2><span class="sub-note" id="ofNote"></span></div>
+  <section class="card table-card"><div class="tscroll"><table class="cmp" id="ofTable"></table></div></section>
+  <div class="sec-head"><h2>Price &amp; ASP Trend</h2><span class="sub-note" id="trNote">price-list price against the ASP actually sold, week by week (last 12 weeks; the last one is this week to date)</span></div>
+  <section class="card table-card"><div class="tscroll"><table class="cmp" id="trTable"></table></div></section>
+  <p class="foot" id="updated"></p>
+</main>
+</body></html>"""
+
+PR_CSS = r'''
+.pr-date{display:inline-flex;align-items:center;gap:8px;font-size:12.5px;font-weight:600;color:var(--label2)}
+.pr-date input{height:36px;padding:0 10px;border:0;border-radius:10px;background:var(--fill);color:var(--label);font:inherit}
+.pr-lists{margin:8px 0 0}
+.pr-lists button small{opacity:.6;margin-left:4px}
+.pr-lists button .x{margin-left:6px;opacity:.55}
+.spark{display:block}
+.spark path{fill:none;stroke:var(--blue);stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.spark .pl{stroke:#ff9f0a;stroke-dasharray:3 3}
+.spark circle{fill:var(--blue)}
+.pr-scope{display:flex;gap:6px}
+.pr-scope button{height:32px;padding:0 14px;border:0;border-radius:16px;background:var(--fill);color:var(--label);font:inherit;font-weight:600;cursor:pointer}
+.pr-scope button.on{background:color-mix(in srgb,var(--blue) 15%,transparent);color:var(--blue)}
+.cp-form select{height:38px;padding:0 10px;border:0;border-radius:11px;background:var(--fill);color:var(--label);font:inherit;font-size:15px}
+.cmp td .pr-acts{display:flex;flex-direction:row;gap:6px;justify-content:flex-end}
+.pr-acts button{height:26px;padding:0 10px;border:0;border-radius:13px;background:var(--fill);color:var(--label);font:inherit;font-size:12px;font-weight:600;cursor:pointer}
+.pr-acts button.danger{color:var(--down)}
+'''
+
+PR_JS = r"""
+(function(){
+const { esc, compact, full, ls, dlabel, getJSON } = window.APU;
+const $ = s => document.querySelector(s);
+const STATE = { live: ['Live', 'good'], upcoming: ['Upcoming', 'info'], ended: ['Ended', 'mute'] };
+const st = { sel: StorePicker.saved(), seg: '', q: '' };
+let data = null, edit = null, ctrl = null;
+const iso = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+const inr = v => (v == null ? '–' : '₹' + Math.round(v).toLocaleString('en-IN'));
+const pc = (x, d = 1) => (x == null || !isFinite(x) ? '–' : `${x > 0 ? '+' : ''}${x.toFixed(d)}%`);
+const chip = x => (x == null ? '<span class="gc">–</span>' : `<span class="gc ${x > 0.5 ? 'up' : x < -0.5 ? 'down' : ''}">${x >= 0 ? '↑' : '↓'}${Math.abs(x).toFixed(1)}%</span>`);
+async function load(){
+  if (ctrl) ctrl.abort();
+  const mine = ctrl = new AbortController();
+  $('#wrap').classList.add('loading');
+  const q = new URLSearchParams(); st.sel.forEach(s => q.append('store', s));
+  try { data = await getJSON('/api/prices?' + q, { signal: mine.signal }); if (!data.error) st.sel = data.scope || []; render(); }
+  catch (e) { if (e.name !== 'AbortError') { data = { error: 'Could not reach the server. Please try again.' }; render(); } }
+  finally { if (mine === ctrl) $('#wrap').classList.remove('loading'); }
+}
+function spark(pts, plan){
+  const W = 120, H = 30, vals = pts.map(p => p).filter(v => v != null);
+  if (vals.length < 2 && !(plan || []).length) return '–';
+  const all = vals.concat((plan || []).filter(v => v != null)), lo = Math.min(...all), hi = Math.max(...all), sp = hi - lo || 1;
+  const X = i => 2 + i / Math.max(1, pts.length - 1) * (W - 4), Y = v => H - 3 - (v - lo) / sp * (H - 6);
+  let dpath = '', on = false; pts.forEach((v, i) => { if (v == null) { on = false; return; } dpath += (on ? 'L' : 'M') + X(i).toFixed(1) + ',' + Y(v).toFixed(1); on = true; });
+  const pl = (plan || []).length ? `<path class="pl" d="M2,${Y(plan[plan.length - 1]).toFixed(1)}L${W - 2},${Y(plan[plan.length - 1]).toFixed(1)}"/>` : '';
+  const last = [...pts].reverse().findIndex(v => v != null), li = last >= 0 ? pts.length - 1 - last : -1;
+  return `<svg class="spark" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img">${pl}<path d="${dpath}"/>${li >= 0 ? `<circle cx="${X(li)}" cy="${Y(pts[li])}" r="2.4"/>` : ''}</svg>`;
+}
+function render(){
+  const d = data;
+  if (d.stores) StorePicker.mount({ stores: d.stores, selected: d.scope, onChange: sel => { st.sel = sel; load(); } });
+  $('#err').hidden = !d.error; if (d.error) { $('#err').textContent = d.error; return; }
+  $('#title').textContent = d.store_label;
+  $('#navLabel').textContent = d.latest ? 'Prices from ' + dlabel(d.latest.date) : 'Price & Offers';
+  $('#priceDate').max = d.today;
+  $('#listInfo').innerHTML = d.latest ? `Latest: <b>${esc(d.latest.file)}</b> · prices from <b>${dlabel(d.latest.date)}</b>${d.prev ? ` · compared with ${dlabel(d.prev.date)}` : ' · upload the next list to see price changes'}` :
+    'No price list yet. Excel (.xlsx, .xls, .csv) or PDF with a model name and DP / MOP / MRP (offer or cashback columns are read too).';
+  $('#listChips').innerHTML = d.lists.map(L => `<button type="button" title="${esc(L.file)} · uploaded ${esc(L.uploaded)}">${dlabel(L.date)}<small>${L.n}</small><span class="x" data-ldel="${L.id}" aria-label="Remove this list" title="Remove">✕</span></button>`).join('');
+  $('#ins').innerHTML = d.insights.map(x => `<li class="tone-${x.tone}"><span>${x.text}</span></li>`).join('') ||
+    `<li class="tone-info"><span>${d.lists.length < 2 ? 'Upload at least two price lists (each with its date) to see price changes against sales. ' : 'No price change between the last two lists. '}Add offers to see their effect.</span></li>`;
+  const segs = [''].concat(d.segments);
+  $('#segChips').innerHTML = segs.map(x => `<button type="button" data-seg="${esc(x)}" class="${st.seg === x ? 'on' : ''}">${x ? esc(x) : 'All'}</button>`).join('');
+  renderChanges();
+  // offers
+  $('#ofNote').textContent = `${d.offers.length} offer${d.offers.length === 1 ? '' : 's'} · during the offer vs the same number of days just before`;
+  $('#ofTable').innerHTML = `<thead><tr><th class="lft">Offer</th><th class="lft">Applies to</th><th>Type</th><th>Amount</th><th>Dates</th><th>State</th><th>Units / day<small>during</small></th><th>Units / day<small>before</small></th><th>Uplift</th><th>Units</th><th>Value</th><th>Est. cost</th><th></th></tr></thead>
+    <tbody>${d.offers.map((o, i) => `<tr><td class="lft"><b>${esc(o.name || o.kind)}</b>${o.note ? `<small>${esc(o.note)}</small>` : ''}</td>
+      <td class="lft">${o.scope === 'segment' ? 'Segment: ' : ''}${esc(o.targets.join(', '))}<small>${o.models.length} model${o.models.length === 1 ? '' : 's'}${o.stores.length ? ' · ' + o.stores.length + ' store' + (o.stores.length === 1 ? '' : 's') : ' · all stores'}</small></td>
+      <td>${esc(o.kind)}</td><td>${o.unit === 'pct' ? o.amount + '%' : inr(o.amount)}</td><td>${esc(o.range)}<small>${o.days} days</small></td><td><span class="nx-badge ${STATE[o.state][1]}">${STATE[o.state][0]}</span></td>
+      <td>${o.upd != null ? o.upd.toFixed(2) : '–'}</td><td>${o.pre_upd.toFixed(2)}</td><td>${chip(o.uplift)}</td><td>${full(o.units)}</td><td>${compact(o.value)}</td><td>${o.cost ? compact(o.cost) : '–'}</td>
+      <td><div class="pr-acts"><button type="button" data-oedit="${i}">Edit</button><button type="button" class="danger" data-odel="${i}">Delete</button></div></td></tr>`).join('')
+      || '<tr><td class="lft" colspan="13">No offers yet. Tap <b>Add offer</b> to record one, model-wise or segment-wise.</td></tr>'}</tbody>`;
+  // price and ASP trend
+  const names = d.rows.length ? d.rows.map(r => r.name) : Object.keys(d.trend).sort();
+  $('#trTable').innerHTML = `<thead><tr><th class="lft">Model</th><th>Price now<small>list DP</small></th><th>ASP · 12 weeks<small>sold, — list price</small></th><th>Latest ASP</th><th>Units · 12 weeks</th><th>Units last 4 weeks</th></tr></thead>
+    <tbody>${names.filter(n => d.trend[n]).map(n => { const r = d.rows.find(x => x.name === n), t = d.trend[n], asp = t.map(x => x[1]), q = t.map(x => x[0]);
+      const la = [...asp].reverse().find(v => v != null);
+      return `<tr><td class="lft"><b>${esc(n)}</b></td><td>${r ? inr(r.dp || r.mop || r.mrp) : '–'}</td><td>${spark(asp, r ? [r.dp || r.mop || r.mrp] : [])}</td><td>${la ? inr(la) : '–'}</td><td>${spark(q)}</td><td>${full(q.slice(-4).reduce((a, x) => a + x, 0))}</td></tr>`; }).join('') || '<tr><td class="lft" colspan="6">No sales in the last 12 weeks.</td></tr>'}</tbody>`;
+  $('#updated').textContent = `${d.updated ? 'Sales updated ' + d.updated + ' · ' : ''}sales to ${dlabel(d.dmax)}`;
+  if (window.addExportButtons) window.addExportButtons();
+}
+function renderChanges(){
+  const d = data, q = st.q.trim().toLowerCase();
+  const rows = d.rows.filter(r => (!st.seg || r.seg === st.seg) && (!q || r.name.toLowerCase().includes(q)));
+  rows.sort((a, b) => Math.abs(b.chg_pct || 0) - Math.abs(a.chg_pct || 0) || b.sold30 - a.sold30);
+  $('#chNote').textContent = d.prev ? `${dlabel(d.prev.date)} → ${dlabel(d.latest.date)} · units a day 14 days before vs after the new prices` : 'one price list so far';
+  $('#chTable').innerHTML = `<thead><tr><th class="lft">Model</th><th class="lft">Segment</th><th>DP now</th><th>MOP</th><th>MRP</th><th>Offer</th><th>Before</th><th>Change</th><th>Change %</th><th>Units / day<small>before</small></th><th>Units / day<small>after</small></th><th>Effect on units</th><th>ASP<small>before → after</small></th><th>Sold 30d</th></tr></thead>
+    <tbody>${rows.map(r => `<tr><td class="lft"><b>${esc(r.name)}</b><small>${r.variants} variant${r.variants === 1 ? '' : 's'}${r.dp_hi && r.dp_hi !== r.dp ? ' · up to ' + inr(r.dp_hi) : ''}</small></td><td class="lft">${esc(r.seg || '–')}</td>
+      <td><b>${inr(r.dp)}</b></td><td>${inr(r.mop)}</td><td>${inr(r.mrp)}</td><td>${r.offer ? inr(r.offer) : '–'}</td><td>${inr(r.prev)}</td>
+      <td>${r.chg ? `<span class="pp ${r.chg < 0 ? 'up' : 'down'}">${r.chg > 0 ? '+' : '−'}${inr(Math.abs(r.chg)).replace('₹', '₹')}</span>` : '–'}</td><td>${pc(r.chg_pct)}</td>
+      <td>${r.before.upd != null ? r.before.upd.toFixed(2) : '–'}</td><td>${r.after.upd != null ? r.after.upd.toFixed(2) : '–'}<small>${r.after.days ? r.after.days + ' days' : ''}</small></td><td>${r.chg ? chip(r.uplift) : '–'}</td>
+      <td>${r.before.asp ? compact(r.before.asp) : '–'} → ${r.after.asp ? compact(r.after.asp) : '–'}</td><td>${full(r.sold30)}</td></tr>`).join('')
+      || `<tr><td class="lft" colspan="14">${d.lists.length ? 'No model matches.' : 'Upload a price list to start.'}</td></tr>`}</tbody>`;
+}
+/* Share → Excel: raw numbers */
+window.APX = window.APX || {};
+window.APX['Price Changes & Impact'] = () => data && !data.error ? { sheets: [{ name: 'Price changes', rows: [['Model', 'Segment', 'Variants', 'DP now', 'DP highest', 'MOP', 'MRP', 'Offer', 'DP before', 'Change', 'Change %', 'Units/day before', 'Units/day after', 'Effect on units %', 'ASP before', 'ASP after', 'Sold 30d'],
+  ...data.rows.map(r => [r.name, r.seg, r.variants, r.dp, r.dp_hi, r.mop, r.mrp, r.offer, r.prev, r.chg, r.chg_pct == null ? '' : Math.round(r.chg_pct * 100) / 100, r.before.upd, r.after.upd, r.uplift, r.before.asp, r.after.asp, r.sold30])] },
+  { name: 'Price history', rows: [['Model', 'Date', 'DP', 'MOP', 'MRP', 'Offer'], ...data.rows.flatMap(r => r.hist.map(h => [r.name, h.date, h.dp, h.mop, h.mrp, h.offer]))] }] } : null;
+window.APX['Offers & Impact'] = () => data && !data.error ? { sheets: [{ name: 'Offers', rows: [['Offer', 'Scope', 'Applies to', 'Models', 'Type', 'Amount', 'Unit', 'Start', 'End', 'State', 'Units/day during', 'Units/day before', 'Uplift %', 'Units', 'Value', 'Est. cost'],
+  ...data.offers.map(o => [o.name || o.kind, o.scope, o.targets.join(', '), o.models.join(', '), o.kind, o.amount, o.unit === 'pct' ? '%' : '₹', o.start, o.end, o.state, o.upd, o.pre_upd, o.uplift, o.units, o.value, o.cost])] }] } : null;
+async function upload(file){
+  if (!file) return;
+  const msg = $('#upMsg'), lab = document.querySelector('.stk-up');
+  const fd = new FormData(); fd.append('file', file); fd.append('date', $('#priceDate').value || ''); st.sel.forEach(s => fd.append('store', s));
+  lab.classList.add('busy'); msg.hidden = false; msg.className = 'stk-msg'; msg.textContent = `Reading ${file.name}…`;
+  try {
+    const d = await getJSON('/api/prices', { method: 'POST', body: fd });
+    if (d.error) { msg.className = 'stk-msg bad'; msg.textContent = d.error; return; }
+    data = d; render(); msg.className = 'stk-msg good'; msg.textContent = '✓ ' + (d.saved || 'Price list saved.');
+  } catch (e) { msg.className = 'stk-msg bad'; msg.textContent = 'Could not upload: ' + (e.message || e); }
+  finally { lab.classList.remove('busy'); $('#priceFile').value = ''; }
+}
+const cleanO = o => ({ id: o.id, name: o.name, scope: o.scope, targets: o.targets, kind: o.kind, amount: o.amount, unit: o.unit, start: o.start, end: o.end, stores: o.stores, note: o.note });
+async function saveOffers(list){
+  const d = await getJSON('/api/prices/offers', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ offers: list.map(cleanO) }) }).catch(() => ({ error: 'Could not reach the server.' }));
+  if (d.error) { $('#err').hidden = false; $('#err').textContent = d.error; return false; }
+  data = d; $('#err').hidden = true; render(); return true;
+}
+function form(o){
+  const t = data.today, e7 = new Date(t + 'T00:00:00'); e7.setDate(e7.getDate() + 6);
+  edit = o ? JSON.parse(JSON.stringify(o)) : { name: '', scope: 'model', targets: [], kind: 'Cashback', amount: '', unit: 'inr', start: t, end: iso(e7), stores: [], note: '' };
+  const f = $('#offerForm'); f.hidden = false;
+  f.innerHTML = `<h3>${o ? 'Edit offer' : 'New offer'}</h3>
+    <div class="pr-scope" role="group" aria-label="Offer applies to"><button type="button" data-scope="model">Model-wise</button><button type="button" data-scope="segment">Segment-wise</button></div>
+    <div class="cp-grid">
+      <label>Name<input type="text" id="oName" maxlength="60" placeholder="e.g. HDFC ₹5,000 cashback"></label>
+      <label id="oPickLab">Add a model<input type="search" id="oPick" list="oList" placeholder="Type, then Enter"><datalist id="oList"></datalist></label>
+      <label>Type<select id="oKind">${data.kinds.map(k => `<option>${esc(k)}</option>`).join('')}</select></label>
+      <label>Amount<input type="number" id="oAmt" min="0" step="any" inputmode="decimal" placeholder="e.g. 5000"></label>
+      <label>In<select id="oUnit"><option value="inr">₹ per unit</option><option value="pct">% of price</option></select></label>
+      <label>Start<input type="date" id="oStart" required></label>
+      <label>End<input type="date" id="oEnd" required></label>
+    </div>
+    <div><div class="pop-cap" style="margin:0 0 6px" id="oPickCap"></div><div class="cp-picked" id="oPicked"></div></div>
+    <div><div class="pop-cap" style="margin:0 0 6px">Stores (none ticked = all stores)</div><div class="cp-stores" id="oStores">${data.stores.map(s => `<button type="button" data-ostore="${esc(s)}">${esc(s)}</button>`).join('')}</div></div>
+    <label>Note<textarea id="oNote" maxlength="140" placeholder="Optional: terms of the offer"></textarea></label>
+    <div class="cp-btns"><button type="button" id="oCancel">Cancel</button><button type="submit">Save offer</button></div>`;
+  $('#oName').value = edit.name; $('#oKind').value = edit.kind; $('#oAmt').value = edit.amount; $('#oUnit').value = edit.unit;
+  $('#oStart').value = edit.start; $('#oEnd').value = edit.end; $('#oNote').value = edit.note || '';
+  paintForm(); f.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+function paintForm(){
+  document.querySelectorAll('[data-scope]').forEach(b => b.classList.toggle('on', b.dataset.scope === edit.scope));
+  const seg = edit.scope === 'segment', opts = seg ? data.segments : data.models;
+  $('#oPickLab').firstChild.textContent = seg ? 'Add a segment' : 'Add a model';
+  $('#oList').innerHTML = opts.map(x => `<option value="${esc(x)}"></option>`).join('');
+  $('#oPickCap').textContent = seg ? 'Segments (tap to remove)' : 'Models (tap to remove)';
+  $('#oPicked').innerHTML = edit.targets.map((x, i) => `<button type="button" data-ounpick="${i}">${esc(x)} ✕</button>`).join('') || `<span class="cp-preview">None yet: type a ${seg ? 'segment' : 'model'} above and press Enter.</span>`;
+  document.querySelectorAll('[data-ostore]').forEach(b => b.classList.toggle('on', edit.stores.includes(b.dataset.ostore)));
+}
+function addPick(){
+  const i = $('#oPick'), v = i.value.trim(); if (!v) return;
+  const opts = edit.scope === 'segment' ? data.segments : data.models;
+  const hit = opts.find(x => x.toLowerCase() === v.toLowerCase()) || (edit.scope === 'model' ? v : null);
+  if (hit && !edit.targets.includes(hit)) edit.targets.push(hit);
+  i.value = ''; paintForm();
+}
+$('#offerForm').addEventListener('click', e => {
+  const sc = e.target.closest('[data-scope]'); if (sc && sc.dataset.scope !== edit.scope) { edit.scope = sc.dataset.scope; edit.targets = []; paintForm(); return; }
+  const u = e.target.closest('[data-ounpick]'); if (u) { edit.targets.splice(+u.dataset.ounpick, 1); paintForm(); return; }
+  const sb = e.target.closest('[data-ostore]'); if (sb) { const x = sb.dataset.ostore, i = edit.stores.indexOf(x); if (i >= 0) edit.stores.splice(i, 1); else edit.stores.push(x); paintForm(); return; }
+  if (e.target.closest('#oCancel')) { $('#offerForm').hidden = true; edit = null; }
+});
+$('#offerForm').addEventListener('keydown', e => { if (e.key === 'Enter' && e.target.id === 'oPick') { e.preventDefault(); addPick(); } });
+$('#offerForm').addEventListener('change', e => { if (e.target.id === 'oPick') addPick(); });
+$('#offerForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  if ($('#oPick').value.trim()) addPick();
+  Object.assign(edit, { name: $('#oName').value.trim(), kind: $('#oKind').value, amount: +$('#oAmt').value || 0, unit: $('#oUnit').value, start: $('#oStart').value, end: $('#oEnd').value, note: $('#oNote').value.trim() });
+  if (!edit.targets.length) { $('#oPick').focus(); return; }
+  const list = data.offers.map(cleanO), i = edit.id ? list.findIndex(x => x.id === edit.id) : -1;
+  if (i >= 0) list[i] = cleanO(edit); else list.unshift(cleanO(edit));
+  if (await saveOffers(list)) { $('#offerForm').hidden = true; edit = null; }
+});
+$('#newOffer').addEventListener('click', () => { if (data && !data.error) form(null); });
+$('#priceFile').addEventListener('change', e => upload(e.target.files[0]));
+document.addEventListener('click', async e => {
+  const g = e.target.closest('[data-seg]'); if (g) { st.seg = g.dataset.seg; render(); return; }
+  const ed = e.target.closest('[data-oedit]'); if (ed) { form(data.offers[+ed.dataset.oedit]); return; }
+  const od = e.target.closest('[data-odel]'); if (od) { const o = data.offers[+od.dataset.odel]; if (confirm(`Delete the offer “${o.name || o.kind}”?`)) saveOffers(data.offers.filter(x => x !== o)); return; }
+  const ld = e.target.closest('[data-ldel]');
+  if (ld) { e.stopPropagation(); if (!confirm('Remove this price list?')) return; const r = await getJSON('/api/prices/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: ld.dataset.ldel }) }); if (r.error) alert(r.error); else load(); }
+});
+let qt = null;
+$('#q').addEventListener('input', e => { clearTimeout(qt); qt = setTimeout(() => { st.q = e.target.value; if (data && !data.error) renderChanges(); }, 120); });
+window.APU.onScrollTop();
+load();
+})();
+"""
+
+
 XP_JS = XP_JS + APU_JS
-OV_CSS = OV_CSS + TG_CSS + XP_CSS + CH_CSS + EOD_CSS + SPC_CSS + TABLE_CSS + NEW_CSS + NEXT_CSS
+OV_CSS = OV_CSS + TG_CSS + XP_CSS + CH_CSS + EOD_CSS + SPC_CSS + TABLE_CSS + NEW_CSS + NEXT_CSS + PR_CSS
 
 ASSET_VERSION = hashlib.md5((APP_CSS + APP_JS + OV_CSS + OV_JS + TG_JS + XP_JS + CH_JS + EOD_JS + SPC_JS + CMP_JS + ACT_JS
-                              + RV_JS + ZR_JS + STK_JS + RS_JS + CP_JS).encode()).hexdigest()[:8]
+                              + RV_JS + ZR_JS + STK_JS + RS_JS + CP_JS + PR_JS).encode()).hexdigest()[:8]
 
 if __name__ == "__main__":
     # debug mode shows a code console to anyone who can open the page, so it is opt-in (FLASK_DEBUG=1)
