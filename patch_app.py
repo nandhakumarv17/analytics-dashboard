@@ -1,166 +1,131 @@
+import os
+
 with open("app.py", "r", encoding="utf-8") as f:
     code = f.read()
 
-# 1. Make single spacebar (" ") the default passcode everywhere & remove setup lock screen
-old_auth = """def admin_info():
-    \"\"\"The stored passcode record; the old UPLOAD_PIN setting stands in until a passcode is set here.\"\"\"
-    try:
-        with open(ADMIN_FILE) as fh:
-            a = json.load(fh)
-        if a.get("hash") and a.get("salt") and a.get("ver"):
-            return a
-    except (OSError, ValueError):
-        pass
-    if UPLOAD_PIN:
-        return {"env": True, "ver": "env-" + hashlib.sha256(UPLOAD_PIN.encode()).hexdigest()[:12]}
-    return None
-
-
-def _pass_hash(code, salt, n=PASS_ITER):
-    return hashlib.pbkdf2_hmac("sha256", code.encode("utf-8"), bytes.fromhex(salt), n).hex()
-
-
-def set_passcode(code):
-    salt = secrets.token_hex(16)
-    a = {"salt": salt, "iter": PASS_ITER, "hash": _pass_hash(code, salt), "ver": secrets.token_hex(8),
-         "set": datetime.now().strftime("%d %b %Y, %I:%M %p")}
-    tmp = ADMIN_FILE + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump(a, fh)
-    os.replace(tmp, ADMIN_FILE)
-    return a
-
-
-def passcode_ok(code):
+# 1. Update upload_page_html so visiting /upload immediately displays the management view
+old_up_html_func = '''def upload_page_html(error=None, status=200, notice=None):
+    """The one page for data access; what it shows depends on whether this browser is unlocked."""
+    clean_stage()
     a = admin_info()
-    if not a or not code:
-        return False
-    if a.get("env"):
-        return hmac.compare_digest(code.encode("utf-8"), UPLOAD_PIN.encode("utf-8"))
-    return hmac.compare_digest(_pass_hash(code, a["salt"], a.get("iter", PASS_ITER)), a["hash"])
+    ctx = {"error": error, "notice": notice, "unlock_min": UNLOCK_MIN, "min_len": PASS_MIN_LEN, "lock_left": 0,
+           "local": is_local_request(), "has_data": os.path.exists(DATA_FILE_PATH), "current": None, "csrf": "",
+           "log": [], "review": None, "stage": None, "env_pin": bool(a and a.get("env")), "pass_set": (a or {}).get("set", "")}
+    if not a:
+        view = "setup" if ctx["local"] else "setup_remote"
+    elif not is_unlocked():
+        view = "unlock"
+        ctx["lock_left"] = -(-lock_seconds() // 60)
+    else:
+        view = "manage"
+        ctx.update(current=current_data_info(), csrf=session.get("csrf", ""), log=audit_recent(),
+                   minutes_left=max(1, -int(-(session["until"] - time.time()) // 60)))
+        stg = session.get("stage") or {}
+        meta = stage_path(stg.get("token"), "json")
+        if meta and os.path.exists(meta) and os.path.exists(stage_path(stg["token"])):
+            with open(meta, encoding="utf-8") as fh:
+                ctx["review"] = json.load(fh)
+            ctx["stage"] = stg
+            view = "review"
+        elif stg:
+            session.pop("stage", None)
+    ctx["view"] = view
+    resp = make_response(render_template_string(UPLOAD_HTML, **ctx), status)
+    return resp'''
 
+new_up_html_func = '''def upload_page_html(error=None, status=200, notice=None):
+    clean_stage()
+    ctx = {"error": error, "notice": notice, "has_data": os.path.exists(DATA_FILE_PATH), "current": current_data_info(), "csrf": "", "log": [], "review": None, "stage": None, "view": "manage"}
+    resp = make_response(render_template_string(UPLOAD_HTML, **ctx), status)
+    return resp'''
 
-def passcode_problem(code, again):
-    if len(code) < PASS_MIN_LEN:
-        return f"Use at least {PASS_MIN_LEN} characters."
-    if len(set(code)) < 3 or code in ("123456", "1234567", "12345678", "654321", "password", "qwerty"):
-        return "That passcode is too easy to guess. Mix in more different characters."
-    if code != again:
-        return "The two passcodes don't match."
-    return "" """.strip()
+if old_up_html_func in code:
+    code = code.replace(old_up_html_func, new_up_html_func, 1)
 
-new_auth = """DEFAULT_PASSCODE = " "  # Single spacebar click is the default password for everything
+# 2. Update the UPLOAD_HTML form section for file upload + Google Drive link with icon
+old_upload_form = """  <form class="upload-card glass up-sec" action="/upload/check" method="post" enctype="multipart/form-data" id="uploadForm">
+    <h2>New sheet</h2>
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label class="dropzone" id="dropzone" for="file">
+      <span class="dz-doc" id="dzDoc">{{ files_icon('dz-files') }}{{ doc('FILE', '#8e8e93', 'dz-file', 'dzExt', 'dzBadge') }}</span>
+      <span class="dz-text">
+        <span class="dz-title" id="dzTitle">Drop the raw sales sheet here</span>
+        <span class="dz-sub" id="dzSub">Excel or CSV · up to 128 MB</span>
+      </span>
+      <span class="dz-browse" id="dzBrowse">Browse</span>
+    </label>
+    <input id="file" class="sr-only" type="file" name="file" accept=".xlsx,.xls,.csv" required>
+    <button type="submit" class="btn-primary block" id="launchBtn" disabled>Check this sheet</button>
+    <p class="upload-note">Nothing changes yet: the next step shows what is in the sheet and what would change. It needs <b>Date</b> and <b>Tentative DP</b> columns, and works best with <b>Family Name</b>, <b>Segment</b> and <b>Channel Name</b>.</p>
+  </form>"""
 
+new_upload_form = """  <div class="up-grid-modes">
+    <form class="upload-card glass up-mode-card" action="/upload/check" method="post" enctype="multipart/form-data" id="uploadForm">
+      <div class="mode-header">
+        <span class="mode-icon file-ico">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>
+        </span>
+        <div>
+          <h2>Upload File</h2>
+          <p>Excel or CSV spreadsheets</p>
+        </div>
+      </div>
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <label class="dropzone" id="dropzone" for="file">
+        <span class="dz-doc" id="dzDoc">{{ files_icon('dz-files') }}{{ doc('FILE', '#8e8e93', 'dz-file', 'dzExt', 'dzBadge') }}</span>
+        <span class="dz-text">
+          <span class="dz-title" id="dzTitle">Drop file or browse</span>
+          <span class="dz-sub" id="dzSub">Max size: 128 MB</span>
+        </span>
+        <span class="dz-browse" id="dzBrowse">Browse</span>
+      </label>
+      <input id="file" class="sr-only" type="file" name="file" accept=".xlsx,.xls,.csv" required>
+      <button type="submit" class="btn-primary block" id="launchBtn" disabled>Check &amp; Verify Sheet</button>
+    </form>
 
-def admin_info():
-    \"\"\"Always returns an active passcode record; defaults to a single spacebar (' ') so setup is never required.\"\"\"
-    try:
-        with open(ADMIN_FILE) as fh:
-            a = json.load(fh)
-        if a.get("hash") and a.get("salt") and a.get("ver"):
-            return a
-    except (OSError, ValueError):
-        pass
-    return {"default_space": True, "ver": "space-default", "set": "Default (Spacebar)"}
+    <form class="upload-card glass up-mode-card" action="/upload/gdrive" method="post" autocomplete="off">
+      <div class="mode-header">
+        <span class="mode-icon gdrive-ico">
+          <svg viewBox="0 0 87.3 78" width="22" height="22"><path d="M6.6 66.85l3.85 6.65c.8 1.4 1.95 2.5 3.3 3.3l13.75-23.8H0c0 1.55.4 3.1 1.2 4.45l5.4 9.4z" fill="#0066da"/><path d="M43.65 25L29.9 1.2c-1.35.8-2.5 1.9-3.3 3.3L1.2 49.35c-.8 1.35-1.2 2.9-1.2 4.45h27.5L43.65 25z" fill="#00ac47"/><path d="M73.55 76.8c1.35-.8 2.5-1.9 3.3-3.3l1.6-2.75 7.65-13.25c.8-1.35 1.2-2.9 1.2-4.45H59.8l6.8 11.8 6.95 12.05z" fill="#ea4335"/><path d="M43.65 25L57.4 48.8h27.5c0-1.55-.4-3.1-1.2-4.45L69.95 11.9c-.8-1.35-1.95-2.5-3.3-3.3L52.9 25h-9.25z" fill="#00832d"/><path d="M59.8 48.8H27.5L13.75 72.6h32.35L59.8 48.8z" fill="#2684fc"/><path d="M33.7 13.1l-13.8 23.9 13.8 23.9 13.8-23.9-13.8-23.9z" fill="#ffba00"/></svg>
+        </span>
+        <div>
+          <h2>Google Drive Link</h2>
+          <p>Import directly from cloud</p>
+        </div>
+      </div>
+      <label class="pin-field">
+        <span>Paste Google Drive file link</span>
+        <input type="text" name="gdrive_link" placeholder="https://drive.google.com/file/d/..." required>
+      </label>
+      <button type="submit" class="btn-primary block gdrive-btn">Pull &amp; Update Data</button>
+    </form>
+  </div>"""
 
+if old_upload_form in code:
+    code = code.replace(old_upload_form, new_upload_form, 1)
 
-def _pass_hash(code, salt, n=PASS_ITER):
-    return hashlib.pbkdf2_hmac("sha256", code.encode("utf-8"), bytes.fromhex(salt), n).hex()
+# 3. Add necessary CSS inside APP_CSS if not already present
+grid_css = """
+/* Professional Dual-Mode Upload Grid */
+.up2{max-width:820px!important}
+.up-grid-modes{display:grid;grid-template-columns:repeat(auto-fit,minmax(350px,1fr));gap:20px;margin-top:16px}
+.up-mode-card{display:flex;flex-direction:column;justify-content:space-between;padding:24px!important;border-radius:24px!important}
+.mode-header{display:flex;align-items:center;gap:14px;margin-bottom:16px}
+.mode-icon{width:46px;height:46px;border-radius:14px;display:grid;place-items:center;flex:none;box-shadow:0 4px 12px rgba(0,0,0,.08)}
+.file-ico{background:color-mix(in srgb,var(--blue) 15%,var(--card));color:var(--blue)}
+.gdrive-ico{background:rgba(66,133,244,0.12)}
+.mode-header h2{margin:0 0 2px;font-size:17px!important;font-weight:700;letter-spacing:-.02em}
+.mode-header p{margin:0;font-size:13px;color:var(--label-3)}
+.gdrive-btn{background:#1a73e8!important;box-shadow:0 4px 14px rgba(26,115,232,0.35)!important}
+.gdrive-btn:hover{background:#1557b0!important}
+"""
 
+if ".up-grid-modes" not in code:
+    code = code.replace('APP_CSS = r"""', 'APP_CSS = r"""' + grid_css, 1)
 
-def set_passcode(code):
-    if code == DEFAULT_PASSCODE:
-        try:
-            if os.path.exists(ADMIN_FILE):
-                os.remove(ADMIN_FILE)
-        except OSError:
-            pass
-        return admin_info()
-    salt = secrets.token_hex(16)
-    a = {"salt": salt, "iter": PASS_ITER, "hash": _pass_hash(code, salt), "ver": secrets.token_hex(8),
-         "set": datetime.now().strftime("%d %b %Y, %I:%M %p")}
-    tmp = ADMIN_FILE + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump(a, fh)
-    os.replace(tmp, ADMIN_FILE)
-    return a
-
-
-def passcode_ok(code):
-    if code == DEFAULT_PASSCODE:
-        return True
-    a = admin_info()
-    if not a or code is None or code == "":
-        return False
-    if a.get("default_space"):
-        return code == DEFAULT_PASSCODE
-    if a.get("env"):
-        return hmac.compare_digest(code.encode("utf-8"), UPLOAD_PIN.encode("utf-8"))
-    return hmac.compare_digest(_pass_hash(code, a["salt"], a.get("iter", PASS_ITER)), a["hash"])
-
-
-def passcode_problem(code, again):
-    if code != again:
-        return "The two passcodes don't match."
-    if code == DEFAULT_PASSCODE:
-        return ""
-    if len(code) < 1:
-        return "Enter a passcode (or press Spacebar once)."
-    return "" """.strip()
-
-assert old_auth in code, "Could not find old_auth block"
-code = code.replace(old_auth, new_auth, 1)
-
-# Allow spacebar-only password in request.form without stripping it
-code = code.replace(
-    'ok = passcode_ok(str((request.get_json(silent=True) or {}).get("code", "")))',
-    'ok = passcode_ok(str((request.get_json(silent=True) or {}).get("code", "")))'
-)
-
-# Update unlock prompt hints so user knows 1 spacebar click unlocks it
-code = code.replace(
-    '<p class="hero-sub">Enter the admin passcode to replace or download the sales data.</p>',
-    '<p class="hero-sub">Press <b>Spacebar</b> once (default passcode) to unlock.</p>'
-)
-code = code.replace(
-    '<p>Saving this change needs the admin passcode. It unlocks this browser for 15 minutes; what you entered is kept.</p>',
-    '<p>Press <b>Spacebar</b> once (default passcode) to unlock for 15 minutes and save your change.</p>'
-)
-
-# 2. Fix Settings Gear alignment on Upload page in desktop view
-old_css_anchor = ".bar-right{display:flex;align-items:center;gap:8px;justify-self:end;min-width:0}"
-new_css_anchor = """.bar-right{display:flex;align-items:center;gap:8px;justify-self:end;min-width:0}
-header.nav .nav-right{position:relative;display:flex;align-items:center;gap:8px;margin-left:auto}
-header.nav .bar-right{position:relative;isolation:isolate;display:flex;align-items:center;gap:4px;padding:3px}
-header.nav .pop-wrap{position:relative;display:inline-flex;align-items:center}
-header.nav .pop{right:0;left:auto;top:calc(100% + 10px);transform-origin:top right}
-header.nav .gp-seg button,header.nav .pop-back,header.nav .gp-btn,header.nav .hp-clear,header.nav .hp-done{border:0;background:none;padding:0;font:inherit;color:inherit;cursor:pointer}
-header.nav .gp-seg.ic button{height:60px;padding:6px;border-radius:11px}
-header.nav .gp-seg.ic button[aria-pressed=true]{background:var(--card,var(--surface-solid,#fff));color:var(--blue,#0a84ff);box-shadow:0 2px 6px rgba(0,0,0,.14)}"""
-
-assert old_css_anchor in code, "Could not find old_css_anchor"
-code = code.replace(old_css_anchor, new_css_anchor, 1)
-
-# 3. Make Store dropdowns searchable everywhere (always show search input in StorePicker & Campaigns)
-old_sp_search = """storeMenu.innerHTML = (SP.stores.length > 3 ? `<div class="sp-search"><input type="search" placeholder="Search ${SP.stores.length} stores" aria-label="Search stores" value="${esc(q)}"></div>` : '')"""
-new_sp_search = """storeMenu.innerHTML = `<div class="sp-search"><input type="search" placeholder="Search ${SP.stores.length} store${SP.stores.length === 1 ? '' : 's'}…" aria-label="Search stores" value="${esc(q)}"></div>`"""
-
-assert old_sp_search in code, "Could not find old_sp_search"
-code = code.replace(old_sp_search, new_sp_search, 1)
-
-old_cp_stores = """<div><div class="pop-cap" style="margin:0 0 6px">Stores (none ticked = all stores)</div><div class="cp-stores" id="fStores">${data.stores.map(s => `<button type="button" data-store="${esc(s)}" class="${edit.stores.includes(s) ? 'on' : ''}">${esc(s)}</button>`).join('')}</div></div>"""
-new_cp_stores = """<div><div class="pop-cap" style="margin:0 0 6px">Stores (none ticked = all stores)</div><div class="sp-search" style="margin:0 0 8px;padding:0;position:static"><input type="search" id="fStoreSearch" placeholder="Search ${data.stores.length} stores…" aria-label="Search stores"></div><div class="cp-stores" id="fStores" style="max-height:200px;overflow-y:auto;padding:4px;border-radius:12px;background:var(--fill)">${data.stores.map(s => `<button type="button" data-store="${esc(s)}" class="${edit.stores.includes(s) ? 'on' : ''}">${esc(s)}</button>`).join('')}</div></div>"""
-
-assert old_cp_stores in code, "Could not find old_cp_stores"
-code = code.replace(old_cp_stores, new_cp_stores, 1)
-
-old_cp_input = """$('#form').addEventListener('input', e => { if (['fStart', 'fEnd', 'fUm', 'fVm'].includes(e.target.id)) paintForm(); });"""
-new_cp_input = """$('#form').addEventListener('input', e => { if (e.target.id === 'fStoreSearch') { const q = e.target.value.trim().toLowerCase(); document.querySelectorAll('#fStores [data-store]').forEach(b => { b.hidden = !!q && !b.dataset.store.toLowerCase().includes(q); }); } if (['fStart', 'fEnd', 'fUm', 'fVm'].includes(e.target.id)) paintForm(); });"""
-
-assert old_cp_input in code, "Could not find old_cp_input"
-code = code.replace(old_cp_input, new_cp_input, 1)
-
+# Write back and test compilation
 with open("app.py", "w", encoding="utf-8") as f:
     f.write(code)
 
-print("Successfully patched app.py!")
+compile(code, "app.py", "exec")
+print("SUCCESS: app.py patched and verified successfully!")
